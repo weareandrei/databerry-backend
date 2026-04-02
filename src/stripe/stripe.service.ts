@@ -29,7 +29,7 @@ export class StripeService {
     const params = new URLSearchParams({
       response_type: 'code',
       client_id: clientId,
-      scope: 'read_only',
+      scope: 'read_write',
       redirect_uri: redirectUri,
       state,
     });
