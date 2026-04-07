@@ -17,7 +17,7 @@ export class CalendlyService {
 
   private readonly clientId = process.env.CALENDLY_CLIENT_ID!;
   private readonly clientSecret = process.env.CALENDLY_CLIENT_SECRET!;
-  private readonly redirectUri = process.env.CALENDLY_REDIRECT_URI!;
+  private readonly redirectUri = `${process.env.WEBHOOK_BASE_URL ?? 'http://localhost:3001'}/calendly/oauth/callback`;
   private readonly frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3000';
   private readonly baseApi = 'https://api.calendly.com';
   private readonly authBase = 'https://auth.calendly.com';
