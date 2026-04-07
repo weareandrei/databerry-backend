@@ -50,6 +50,30 @@ export class ConnectionsController {
     return this.connectionsService.getPosthogEventDefinitions(id, req.authUser.id);
   }
 
+  @Get(':id/webhook-keys')
+  getWebhookKeys(@Param('id') id: string, @Req() req: any) {
+    return this.connectionsService.getWebhookKeys(id, req.authUser.id);
+  }
+
+  @Post(':id/webhook-keys')
+  createWebhookKey(
+    @Param('id') id: string,
+    @Body() body: { name: string },
+    @Req() req: any,
+  ) {
+    return this.connectionsService.createWebhookKey(id, body.name, req.authUser.id);
+  }
+
+  @Delete(':id/webhook-keys/:keyId')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  revokeWebhookKey(
+    @Param('id') id: string,
+    @Param('keyId') keyId: string,
+    @Req() req: any,
+  ) {
+    return this.connectionsService.revokeWebhookKey(id, keyId, req.authUser.id);
+  }
+
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   remove(@Param('id') id: string, @Req() req: any) {

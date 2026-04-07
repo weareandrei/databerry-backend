@@ -6,6 +6,7 @@ export interface CreateViewDto {
   folderId: string;
   connectionId: string;
   connectionType: string;
+  type: string;
   name: string;
   config?: Record<string, unknown>;
 }
@@ -19,9 +20,9 @@ export class ViewsService {
     private readonly posthogService: PosthogService,
   ) {}
 
-  async getViewsByFolder(folderId: string, userId: string) {
+  async getViewsByFolder(folderId: string, userId: string, date?: string) {
     this.logger.log(
-      `\n  ► getViewsByFolder\n  folderId : ${folderId}\n  userId   : ${userId}`,
+      `\n  ► getViewsByFolder\n  folderId : ${folderId}\n  userId   : ${userId}\n  date     : ${date ?? 'today (latest)'}`,
     );
 
     const { data, error } = await this.supabaseService
@@ -33,7 +34,7 @@ export class ViewsService {
       .order('created_at', { ascending: true });
 
     if (error) throw new Error(error.message);
-    return data.map(this.toCamel);
+    return data.map((row) => this.toCamel(row, date));
   }
 
   async createView(dto: CreateViewDto, userId: string) {
@@ -57,6 +58,7 @@ export class ViewsService {
           folder_id: dto.folderId,
           connection_id: dto.connectionId,
           connection_type: dto.connectionType,
+          type: dto.type,
           name: dto.name,
           config: dto.config ?? {},
           is_pinned: false,
@@ -106,6 +108,7 @@ export class ViewsService {
         folder_id: dto.folderId,
         connection_id: dto.connectionId,
         connection_type: dto.connectionType,
+        type: dto.type,
         name: dto.name,
         config: dto.config ?? {},
         is_pinned: false,
@@ -170,21 +173,38 @@ export class ViewsService {
     }
   }
 
-  private toCamel(row: Record<string, unknown>) {
+  private toCamel(row: Record<string, unknown>, date?: string) {
     const values = (row.views_values as { value: string; created_at: string }[] | null) ?? [];
-    const latestValue = values.sort(
-      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-    )[0]?.value ?? null;
+    const viewType = (row.type as string) ?? 'daily_counter';
+
+    let displayValue: string | null = null;
+
+    if (viewType === 'webhook_append') {
+      // Count entries for the target date (today if no date specified)
+      const targetDate = date ?? new Date().toISOString().split('T')[0];
+      const count = values.filter((v) => v.created_at === targetDate).length;
+      displayValue = count > 0 ? String(count) : null;
+    } else if (date) {
+      // Historical: exact date match
+      const match = values.find((v) => v.created_at === date);
+      displayValue = match?.value ?? null;
+    } else {
+      // Today: latest value by date
+      const sorted = [...values].sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      );
+      displayValue = sorted[0]?.value ?? null;
+    }
 
     return {
       id: row.id,
       folderId: row.folder_id,
       connectionId: row.connection_id,
       connectionType: row.connection_type,
-      type: row.type ?? 'daily_counter',
+      type: viewType,
       name: row.name,
       config: row.config ?? {},
-      value: latestValue,
+      value: displayValue,
       isPinned: row.is_pinned ?? false,
       userId: row.user_id,
       createdAt: row.created_at,

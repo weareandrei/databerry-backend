@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { createHash, randomBytes } from 'crypto';
 import { SupabaseService } from '../supabase/supabase.service';
 import { PosthogService } from '../posthog/posthog.service';
 
@@ -23,7 +24,7 @@ export class ConnectionsService {
     const { data, error } = await this.supabaseService
       .getClient()
       .from('connections')
-      .select('*')
+      .select('*, connections_webhook(webhook_id)')
       .eq('user_id', userId)
       .order('created_at', { ascending: true });
 
@@ -35,7 +36,7 @@ export class ConnectionsService {
     const { data, error } = await this.supabaseService
       .getClient()
       .from('connections')
-      .select('*')
+      .select('*, connections_webhook(webhook_id)')
       .eq('id', connectionId)
       .eq('user_id', userId)
       .single();
@@ -57,11 +58,12 @@ export class ConnectionsService {
     if (error) throw new Error(error.message);
 
     // 2. Insert type-specific config table
-    if (dto.config) {
-      await this.insertTypeConfig(dto.type, data.id, dto.config, client);
+    if (dto.config || dto.type === 'webhook') {
+      await this.insertTypeConfig(dto.type, data.id, dto.config ?? {}, client);
     }
 
-    return this.toCamel(data);
+    // Re-fetch with join so webhookId is included in the response
+    return this.getConnectionById(data.id as string, userId);
   }
 
   async updateConnection(connectionId: string, dto: UpdateConnectionDto, userId: string) {
@@ -93,6 +95,65 @@ export class ConnectionsService {
     return this.posthogService.getEventDefinitions(connectionId, userId);
   }
 
+  async createWebhookKey(connectionId: string, name: string, userId: string) {
+    // Verify connection belongs to user
+    await this.getConnectionById(connectionId, userId);
+
+    const rawKey = 'kwh_' + randomBytes(16).toString('hex');
+    const keyHash = createHash('sha256').update(rawKey).digest('hex');
+    const keyPrefix = rawKey.slice(0, 12);
+
+    const { data, error } = await this.supabaseService
+      .getClient()
+      .from('connections_webhook_keys')
+      .insert({ connection_id: connectionId, name, key_hash: keyHash, key_prefix: keyPrefix })
+      .select()
+      .single();
+
+    if (error) throw new Error(error.message);
+
+    return {
+      id: data.id,
+      name: data.name,
+      keyPrefix: data.key_prefix,
+      createdAt: data.created_at,
+      key: rawKey, // returned ONCE only
+    };
+  }
+
+  async getWebhookKeys(connectionId: string, userId: string) {
+    await this.getConnectionById(connectionId, userId);
+
+    const { data, error } = await this.supabaseService
+      .getClient()
+      .from('connections_webhook_keys')
+      .select('id, name, key_prefix, revoked_at, created_at')
+      .eq('connection_id', connectionId)
+      .order('created_at', { ascending: true });
+
+    if (error) throw new Error(error.message);
+    return data.map((row) => ({
+      id: row.id,
+      name: row.name,
+      keyPrefix: row.key_prefix,
+      revokedAt: row.revoked_at,
+      createdAt: row.created_at,
+    }));
+  }
+
+  async revokeWebhookKey(connectionId: string, keyId: string, userId: string) {
+    await this.getConnectionById(connectionId, userId);
+
+    const { error } = await this.supabaseService
+      .getClient()
+      .from('connections_webhook_keys')
+      .update({ revoked_at: new Date().toISOString() })
+      .eq('id', keyId)
+      .eq('connection_id', connectionId);
+
+    if (error) throw new Error(error.message);
+  }
+
   private async insertTypeConfig(
     type: string,
     connectionId: string,
@@ -107,17 +168,31 @@ export class ConnectionsService {
         host: config.host ?? 'https://app.posthog.com',
       });
       if (error) throw new Error(error.message);
+    } else if (type === 'webhook') {
+      const { error } = await client.from('connections_webhook').insert({
+        connection_id: connectionId,
+      });
+      if (error) throw new Error(error.message);
+    } else if (type === 'stripe_manual') {
+      const { error } = await client.from('connections_stripe_manual').insert({
+        connection_id: connectionId,
+        api_key: config.apiKey,
+      });
+      if (error) throw new Error(error.message);
+    } else if (type === 'calendly') {
+      // Credentials are inserted directly by CalendlyService.handleOAuthCallback — no-op here
     }
-    // Future: stripe, sentry, github, etc.
   }
 
   private toCamel(row: Record<string, unknown>) {
+    const webhookRows = row.connections_webhook as { webhook_id: string }[] | null;
     return {
       id: row.id,
       name: row.name,
       type: row.type,
       userId: row.user_id,
       createdAt: row.created_at,
+      webhookId: webhookRows?.[0]?.webhook_id ?? null,
     };
   }
 }

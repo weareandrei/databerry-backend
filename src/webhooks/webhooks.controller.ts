@@ -48,4 +48,16 @@ export class WebhooksController {
     this.webhooksService.handleStripeEvent(rawBody, sig).catch(() => {});
     return { ok: true };
   }
+
+  @Post('custom/:webhookId')
+  @HttpCode(HttpStatus.OK)
+  async handleCustomWebhook(
+    @Param('webhookId') webhookId: string,
+    @Headers('x-api-key') apiKey: string,
+    @Body() body: Record<string, unknown>,
+  ) {
+    if (!apiKey) throw new BadRequestException('Missing X-API-Key header');
+    await this.webhooksService.handleCustomWebhook(webhookId, apiKey, body);
+    return { ok: true };
+  }
 }

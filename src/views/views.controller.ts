@@ -21,8 +21,12 @@ export class ViewsController {
   constructor(private readonly viewsService: ViewsService) {}
 
   @Get()
-  getByFolder(@Query('folderId') folderId: string, @Req() req: any) {
-    return this.viewsService.getViewsByFolder(folderId, req.authUser.id);
+  getByFolder(
+    @Query('folderId') folderId: string,
+    @Query('date') date: string | undefined,
+    @Req() req: any,
+  ) {
+    return this.viewsService.getViewsByFolder(folderId, req.authUser.id, date);
   }
 
   @Post()
