@@ -1,6 +1,6 @@
-import { Controller, Get, Query, Req, UseGuards } from '@nestjs/common';
-import { SupabaseAuthGuard } from '../auth/supabase-auth.guard';
-import { StripeManualService } from './stripe-manual.service';
+import { Controller, Get, Query, Req, UseGuards } from '@nestjs/common'
+import { SupabaseAuthGuard } from '../auth/supabase-auth.guard'
+import { StripeManualService } from './stripe-manual.service'
 
 @UseGuards(SupabaseAuthGuard)
 @Controller('stripe-manual')
@@ -17,8 +17,8 @@ export class StripeManualController {
       connectionId,
       viewType,
       req.authUser.id,
-    );
-    return { value };
+    )
+    return { value }
   }
 
   @Get('chart-data')
@@ -31,7 +31,7 @@ export class StripeManualController {
       connectionId,
       viewType,
       req.authUser.id,
-    );
-    return { points };
+    )
+    return { points }
   }
 }

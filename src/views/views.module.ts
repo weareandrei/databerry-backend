@@ -1,8 +1,8 @@
-import { Module } from '@nestjs/common';
-import { ViewsController } from './views.controller';
-import { ViewsService } from './views.service';
-import { SupabaseModule } from '../supabase/supabase.module';
-import { PosthogModule } from '../posthog/posthog.module';
+import { Module } from '@nestjs/common'
+import { ViewsController } from './views.controller'
+import { ViewsService } from './views.service'
+import { SupabaseModule } from '../supabase/supabase.module'
+import { PosthogModule } from '../posthog/posthog.module'
 
 @Module({
   imports: [SupabaseModule, PosthogModule],

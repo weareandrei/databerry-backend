@@ -1,14 +1,7 @@
-import {
-  Controller,
-  Get,
-  Query,
-  Req,
-  Res,
-  UseGuards,
-} from '@nestjs/common';
-import type { Response } from 'express';
-import { SupabaseAuthGuard } from '../auth/supabase-auth.guard';
-import { StripeService } from './stripe.service';
+import { Controller, Get, Query, Req, Res, UseGuards } from '@nestjs/common'
+import type { Response } from 'express'
+import { SupabaseAuthGuard } from '../auth/supabase-auth.guard'
+import { StripeService } from './stripe.service'
 
 @Controller('stripe')
 export class StripeController {
@@ -21,8 +14,8 @@ export class StripeController {
   @Get('oauth/start')
   @UseGuards(SupabaseAuthGuard)
   startOAuth(@Req() req: any): { url: string } {
-    const url = this.stripeService.getOAuthUrl(req.authUser.id);
-    return { url };
+    const url = this.stripeService.getOAuthUrl(req.authUser.id)
+    return { url }
   }
 
   /**
@@ -36,17 +29,17 @@ export class StripeController {
     @Query('error') oauthError: string | undefined,
     @Res() res: Response,
   ) {
-    const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3000';
+    const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3000'
 
     if (oauthError) {
-      return res.redirect(`${frontendUrl}/connections?stripe=error&reason=${oauthError}`);
+      return res.redirect(`${frontendUrl}/connections?stripe=error&reason=${oauthError}`)
     }
 
     try {
-      await this.stripeService.handleOAuthCallback(code, state);
-      return res.redirect(`${frontendUrl}/connections?stripe=connected`);
+      await this.stripeService.handleOAuthCallback(code, state)
+      return res.redirect(`${frontendUrl}/connections?stripe=connected`)
     } catch {
-      return res.redirect(`${frontendUrl}/connections?stripe=error`);
+      return res.redirect(`${frontendUrl}/connections?stripe=error`)
     }
   }
 }

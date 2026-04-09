@@ -1,6 +1,6 @@
-import { Module } from '@nestjs/common';
-import { PosthogService } from './posthog.service';
-import { SupabaseModule } from '../supabase/supabase.module';
+import { Module } from '@nestjs/common'
+import { PosthogService } from './posthog.service'
+import { SupabaseModule } from '../supabase/supabase.module'
 
 @Module({
   imports: [SupabaseModule],

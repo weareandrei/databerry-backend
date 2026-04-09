@@ -1,6 +1,6 @@
-import { Controller, Get, Query, Req, Res, UseGuards } from '@nestjs/common';
-import { SupabaseAuthGuard } from '../auth/supabase-auth.guard';
-import { CalendlyService } from './calendly.service';
+import { Controller, Get, Query, Req, Res, UseGuards } from '@nestjs/common'
+import { SupabaseAuthGuard } from '../auth/supabase-auth.guard'
+import { CalendlyService } from './calendly.service'
 
 @Controller('calendly')
 export class CalendlyController {
@@ -9,19 +9,15 @@ export class CalendlyController {
   @UseGuards(SupabaseAuthGuard)
   @Get('oauth/start')
   async oauthStart(@Req() req: { authUser: { id: string } }) {
-    const url = await this.calendlyService.getOAuthUrl(req.authUser.id);
-    return { url };
+    const url = await this.calendlyService.getOAuthUrl(req.authUser.id)
+    return { url }
   }
 
   // No guard — this is called by Calendly's redirect (no Bearer token)
   @Get('oauth/callback')
-  async oauthCallback(
-    @Query('code') code: string,
-    @Query('state') state: string,
-    @Res() res: any,
-  ) {
-    const redirectUrl = await this.calendlyService.handleOAuthCallback(code, state);
-    res.redirect(redirectUrl);
+  async oauthCallback(@Query('code') code: string, @Query('state') state: string, @Res() res: any) {
+    const redirectUrl = await this.calendlyService.handleOAuthCallback(code, state)
+    res.redirect(redirectUrl)
   }
 
   @UseGuards(SupabaseAuthGuard)
@@ -31,8 +27,8 @@ export class CalendlyController {
     @Query('viewType') viewType: string,
     @Req() req: { authUser: { id: string } },
   ) {
-    const value = await this.calendlyService.fetchLiveValue(connectionId, viewType, req.authUser.id);
-    return { value };
+    const value = await this.calendlyService.fetchLiveValue(connectionId, viewType, req.authUser.id)
+    return { value }
   }
 
   @UseGuards(SupabaseAuthGuard)
@@ -41,7 +37,7 @@ export class CalendlyController {
     @Query('connectionId') connectionId: string,
     @Req() req: { authUser: { id: string } },
   ) {
-    const meetings = await this.calendlyService.fetchMeetingsList(connectionId, req.authUser.id);
-    return { meetings };
+    const meetings = await this.calendlyService.fetchMeetingsList(connectionId, req.authUser.id)
+    return { meetings }
   }
 }

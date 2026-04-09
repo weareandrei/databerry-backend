@@ -1,14 +1,14 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
-import { SupabaseService } from '../supabase/supabase.service';
+import { Injectable, NotFoundException } from '@nestjs/common'
+import { SupabaseService } from '../supabase/supabase.service'
 
 export interface CreateFolderDto {
-  name: string;
-  parentId: string | null;
+  name: string
+  parentId: string | null
 }
 
 export interface UpdateFolderDto {
-  name?: string;
-  color?: string;
+  name?: string
+  color?: string
 }
 
 @Injectable()
@@ -21,10 +21,10 @@ export class FoldersService {
       .from('folders')
       .select('*')
       .eq('user_id', userId)
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: true })
 
-    if (error) throw new Error(error.message);
-    return data.map(this.toCamel);
+    if (error) throw new Error(error.message)
+    return data.map(this.toCamel)
   }
 
   async getFolderById(folderId: string, userId: string) {
@@ -34,10 +34,10 @@ export class FoldersService {
       .select('*')
       .eq('id', folderId)
       .eq('user_id', userId)
-      .single();
+      .single()
 
-    if (error || !data) throw new NotFoundException('Folder not found');
-    return this.toCamel(data);
+    if (error || !data) throw new NotFoundException('Folder not found')
+    return this.toCamel(data)
   }
 
   async createFolder(dto: CreateFolderDto, userId: string) {
@@ -50,10 +50,10 @@ export class FoldersService {
         user_id: userId,
       })
       .select()
-      .single();
+      .single()
 
-    if (error) throw new Error(error.message);
-    return this.toCamel(data);
+    if (error) throw new Error(error.message)
+    return this.toCamel(data)
   }
 
   async updateFolder(folderId: string, dto: UpdateFolderDto, userId: string) {
@@ -64,10 +64,10 @@ export class FoldersService {
       .eq('id', folderId)
       .eq('user_id', userId)
       .select()
-      .single();
+      .single()
 
-    if (error || !data) throw new NotFoundException('Folder not found');
-    return this.toCamel(data);
+    if (error || !data) throw new NotFoundException('Folder not found')
+    return this.toCamel(data)
   }
 
   async deleteFolder(folderId: string, userId: string) {
@@ -76,9 +76,9 @@ export class FoldersService {
       .from('folders')
       .delete()
       .eq('id', folderId)
-      .eq('user_id', userId);
+      .eq('user_id', userId)
 
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(error.message)
   }
 
   private toCamel(row: Record<string, unknown>) {
@@ -90,6 +90,6 @@ export class FoldersService {
       color: row.color ?? undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
-    };
+    }
   }
 }

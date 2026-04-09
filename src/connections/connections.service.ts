@@ -1,16 +1,16 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
-import { createHash, randomBytes } from 'crypto';
-import { SupabaseService } from '../supabase/supabase.service';
-import { PosthogService } from '../posthog/posthog.service';
+import { Injectable, NotFoundException } from '@nestjs/common'
+import { createHash, randomBytes } from 'crypto'
+import { SupabaseService } from '../supabase/supabase.service'
+import { PosthogService } from '../posthog/posthog.service'
 
 export interface CreateConnectionDto {
-  name: string;
-  type: string;
-  config?: Record<string, unknown>; // type-specific credentials (e.g. apiKey, projectId)
+  name: string
+  type: string
+  config?: Record<string, unknown> // type-specific credentials (e.g. apiKey, projectId)
 }
 
 export interface UpdateConnectionDto {
-  name?: string;
+  name?: string
 }
 
 @Injectable()
@@ -26,10 +26,10 @@ export class ConnectionsService {
       .from('connections')
       .select('*, connections_webhook(webhook_id)')
       .eq('user_id', userId)
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: true })
 
-    if (error) throw new Error(error.message);
-    return data.map(this.toCamel);
+    if (error) throw new Error(error.message)
+    return data.map(this.toCamel)
   }
 
   async getConnectionById(connectionId: string, userId: string) {
@@ -39,31 +39,31 @@ export class ConnectionsService {
       .select('*, connections_webhook(webhook_id)')
       .eq('id', connectionId)
       .eq('user_id', userId)
-      .single();
+      .single()
 
-    if (error || !data) throw new NotFoundException('Connection not found');
-    return this.toCamel(data);
+    if (error || !data) throw new NotFoundException('Connection not found')
+    return this.toCamel(data)
   }
 
   async createConnection(dto: CreateConnectionDto, userId: string) {
-    const client = this.supabaseService.getClient();
+    const client = this.supabaseService.getClient()
 
     // 1. Insert base connection record
     const { data, error } = await client
       .from('connections')
       .insert({ name: dto.name, type: dto.type, user_id: userId })
       .select()
-      .single();
+      .single()
 
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(error.message)
 
     // 2. Insert type-specific config table
     if (dto.config || dto.type === 'webhook') {
-      await this.insertTypeConfig(dto.type, data.id, dto.config ?? {}, client);
+      await this.insertTypeConfig(dto.type, data.id, dto.config ?? {}, client)
     }
 
     // Re-fetch with join so webhookId is included in the response
-    return this.getConnectionById(data.id as string, userId);
+    return this.getConnectionById(data.id as string, userId)
   }
 
   async updateConnection(connectionId: string, dto: UpdateConnectionDto, userId: string) {
@@ -74,10 +74,10 @@ export class ConnectionsService {
       .eq('id', connectionId)
       .eq('user_id', userId)
       .select()
-      .single();
+      .single()
 
-    if (error || !data) throw new NotFoundException('Connection not found');
-    return this.toCamel(data);
+    if (error || !data) throw new NotFoundException('Connection not found')
+    return this.toCamel(data)
   }
 
   async deleteConnection(connectionId: string, userId: string) {
@@ -86,31 +86,31 @@ export class ConnectionsService {
       .from('connections')
       .delete()
       .eq('id', connectionId)
-      .eq('user_id', userId);
+      .eq('user_id', userId)
 
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(error.message)
   }
 
   async getPosthogEventDefinitions(connectionId: string, userId: string) {
-    return this.posthogService.getEventDefinitions(connectionId, userId);
+    return this.posthogService.getEventDefinitions(connectionId, userId)
   }
 
   async createWebhookKey(connectionId: string, name: string, userId: string) {
     // Verify connection belongs to user
-    await this.getConnectionById(connectionId, userId);
+    await this.getConnectionById(connectionId, userId)
 
-    const rawKey = 'kwh_' + randomBytes(16).toString('hex');
-    const keyHash = createHash('sha256').update(rawKey).digest('hex');
-    const keyPrefix = rawKey.slice(0, 12);
+    const rawKey = 'kwh_' + randomBytes(16).toString('hex')
+    const keyHash = createHash('sha256').update(rawKey).digest('hex')
+    const keyPrefix = rawKey.slice(0, 12)
 
     const { data, error } = await this.supabaseService
       .getClient()
       .from('connections_webhook_keys')
       .insert({ connection_id: connectionId, name, key_hash: keyHash, key_prefix: keyPrefix })
       .select()
-      .single();
+      .single()
 
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(error.message)
 
     return {
       id: data.id,
@@ -118,40 +118,40 @@ export class ConnectionsService {
       keyPrefix: data.key_prefix,
       createdAt: data.created_at,
       key: rawKey, // returned ONCE only
-    };
+    }
   }
 
   async getWebhookKeys(connectionId: string, userId: string) {
-    await this.getConnectionById(connectionId, userId);
+    await this.getConnectionById(connectionId, userId)
 
     const { data, error } = await this.supabaseService
       .getClient()
       .from('connections_webhook_keys')
       .select('id, name, key_prefix, revoked_at, created_at')
       .eq('connection_id', connectionId)
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: true })
 
-    if (error) throw new Error(error.message);
-    return data.map((row) => ({
+    if (error) throw new Error(error.message)
+    return data.map(row => ({
       id: row.id,
       name: row.name,
       keyPrefix: row.key_prefix,
       revokedAt: row.revoked_at,
       createdAt: row.created_at,
-    }));
+    }))
   }
 
   async revokeWebhookKey(connectionId: string, keyId: string, userId: string) {
-    await this.getConnectionById(connectionId, userId);
+    await this.getConnectionById(connectionId, userId)
 
     const { error } = await this.supabaseService
       .getClient()
       .from('connections_webhook_keys')
       .update({ revoked_at: new Date().toISOString() })
       .eq('id', keyId)
-      .eq('connection_id', connectionId);
+      .eq('connection_id', connectionId)
 
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(error.message)
   }
 
   private async insertTypeConfig(
@@ -166,26 +166,26 @@ export class ConnectionsService {
         api_key: config.apiKey,
         project_id: config.projectId,
         host: config.host ?? 'https://app.posthog.com',
-      });
-      if (error) throw new Error(error.message);
+      })
+      if (error) throw new Error(error.message)
     } else if (type === 'webhook') {
       const { error } = await client.from('connections_webhook').insert({
         connection_id: connectionId,
-      });
-      if (error) throw new Error(error.message);
+      })
+      if (error) throw new Error(error.message)
     } else if (type === 'stripe_manual') {
       const { error } = await client.from('connections_stripe_manual').insert({
         connection_id: connectionId,
         api_key: config.apiKey,
-      });
-      if (error) throw new Error(error.message);
+      })
+      if (error) throw new Error(error.message)
     } else if (type === 'calendly') {
       // Credentials are inserted directly by CalendlyService.handleOAuthCallback — no-op here
     }
   }
 
   private toCamel(row: Record<string, unknown>) {
-    const webhookRows = row.connections_webhook as { webhook_id: string }[] | null;
+    const webhookRows = row.connections_webhook as { webhook_id: string }[] | null
     return {
       id: row.id,
       name: row.name,
@@ -193,6 +193,6 @@ export class ConnectionsService {
       userId: row.user_id,
       createdAt: row.created_at,
       webhookId: webhookRows?.[0]?.webhook_id ?? null,
-    };
+    }
   }
 }
