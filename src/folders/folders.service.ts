@@ -4,6 +4,7 @@ import { SupabaseService } from '../supabase/supabase.service'
 export interface CreateFolderDto {
   name: string
   parentId: string | null
+  projectId: string
 }
 
 export interface UpdateFolderDto {
@@ -47,6 +48,7 @@ export class FoldersService {
       .insert({
         name: dto.name,
         parent_id: dto.parentId ?? null,
+        project_id: dto.projectId,
         user_id: userId,
       })
       .select()
@@ -86,6 +88,7 @@ export class FoldersService {
       id: row.id,
       name: row.name,
       parentId: row.parent_id ?? null,
+      projectId: row.project_id,
       userId: row.user_id,
       color: row.color ?? undefined,
       createdAt: row.created_at,

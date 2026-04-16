@@ -3,7 +3,8 @@ import { SupabaseService } from '../supabase/supabase.service'
 import { PosthogService } from '../posthog/posthog.service'
 
 export interface CreateViewDto {
-  folderId: string
+  projectId: string
+  folderId?: string
   connectionId: string
   connectionType: string
   type: string
@@ -20,9 +21,9 @@ export class ViewsService {
     private readonly posthogService: PosthogService,
   ) {}
 
-  async getViewsByFolder(folderId: string, userId: string, date?: string) {
+  async getViewsByFolder(folderId: string, userId: string, dateFrom?: string, dateTo?: string) {
     this.logger.log(
-      `\n  ► getViewsByFolder\n  folderId : ${folderId}\n  userId   : ${userId}\n  date     : ${date ?? 'today (latest)'}`,
+      `\n  ► getViewsByFolder\n  folderId : ${folderId}\n  userId   : ${userId}\n  dateFrom : ${dateFrom ?? 'none'}\n  dateTo   : ${dateTo ?? 'none'}`,
     )
 
     const { data, error } = await this.supabaseService
@@ -34,36 +35,89 @@ export class ViewsService {
       .order('created_at', { ascending: true })
 
     if (error) throw new Error(error.message)
-    return data.map(row => this.toCamel(row, date))
+    return data.map(row => this.toCamel(row, dateFrom, dateTo))
+  }
+
+  async getViewsByProject(projectId: string, userId: string, dateFrom?: string, dateTo?: string) {
+    this.logger.log(
+      `\n  ► getViewsByProject\n  projectId : ${projectId}\n  userId    : ${userId}\n  dateFrom  : ${dateFrom ?? 'none'}\n  dateTo    : ${dateTo ?? 'none'}`,
+    )
+
+    const { data, error } = await this.supabaseService
+      .getClient()
+      .from('views')
+      .select('*, views_values(value, created_at)')
+      .eq('project_id', projectId)
+      .is('folder_id', null)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: true })
+
+    if (error) throw new Error(error.message)
+    return data.map(row => this.toCamel(row, dateFrom, dateTo))
+  }
+
+  async getPinnedViews(userId: string) {
+    this.logger.log(`\n  ► getPinnedViews\n  userId : ${userId}`)
+
+    const { data, error } = await this.supabaseService
+      .getClient()
+      .from('views')
+      .select('*, views_values(value, created_at)')
+      .eq('user_id', userId)
+      .eq('is_pinned', true)
+      .order('created_at', { ascending: true })
+
+    if (error) throw new Error(error.message)
+    return data.map(row => this.toCamel(row))
+  }
+
+  async pinView(viewId: string, userId: string) {
+    const { error } = await this.supabaseService
+      .getClient()
+      .from('views')
+      .update({ is_pinned: true })
+      .eq('id', viewId)
+      .eq('user_id', userId)
+
+    if (error) throw new Error(error.message)
+  }
+
+  async unpinView(viewId: string, userId: string) {
+    const { error } = await this.supabaseService
+      .getClient()
+      .from('views')
+      .update({ is_pinned: false })
+      .eq('id', viewId)
+      .eq('user_id', userId)
+
+    if (error) throw new Error(error.message)
   }
 
   async createView(dto: CreateViewDto, userId: string) {
     this.logger.log(
-      `\n  ► createView\n  folderId       : ${dto.folderId}\n  connectionId   : ${dto.connectionId}\n  connectionType : ${dto.connectionType}\n  name           : ${dto.name}`,
+      `\n  ► createView\n  projectId      : ${dto.projectId}\n  folderId       : ${dto.folderId ?? 'none (project root)'}\n  connectionId   : ${dto.connectionId}\n  connectionType : ${dto.connectionType}\n  name           : ${dto.name}`,
     )
 
+    const baseInsert = {
+      project_id: dto.projectId,
+      folder_id: dto.folderId ?? null,
+      connection_id: dto.connectionId,
+      connection_type: dto.connectionType,
+      type: dto.type,
+      name: dto.name,
+      config: dto.config ?? {},
+      is_pinned: false,
+      user_id: userId,
+    }
+
     // For PostHog views: create Hog Function first — if it fails, abort
-    let hogFunctionId: string | null = null
     if (dto.connectionType === 'posthog') {
       const eventName = (dto.config?.eventName as string) ?? dto.name
 
-      // We need a placeholder viewId for the webhook URL — we'll use a temp UUID
-      // and update it after the view is created. Instead, create view first with
-      // a two-step approach: reserve the row, register, then confirm.
-      // Simplest: create view, register Hog Function, rollback view if it fails.
       const { data: tempView, error: tempError } = await this.supabaseService
         .getClient()
         .from('views')
-        .insert({
-          folder_id: dto.folderId,
-          connection_id: dto.connectionId,
-          connection_type: dto.connectionType,
-          type: dto.type,
-          name: dto.name,
-          config: dto.config ?? {},
-          is_pinned: false,
-          user_id: userId,
-        })
+        .insert(baseInsert)
         .select()
         .single()
 
@@ -72,14 +126,13 @@ export class ViewsService {
         throw new Error(tempError.message)
       }
 
-      hogFunctionId = await this.posthogService.createHogFunction(
+      const hogFunctionId = await this.posthogService.createHogFunction(
         dto.connectionId,
         tempView.id as string,
         eventName,
       )
 
       if (!hogFunctionId) {
-        // Roll back the view
         await this.supabaseService.getClient().from('views').delete().eq('id', tempView.id)
         this.logger.error(`  ✗ Hog Function creation failed — view rolled back`)
         throw new Error(
@@ -87,7 +140,6 @@ export class ViewsService {
         )
       }
 
-      // Store hogFunctionId in config
       await this.supabaseService
         .getClient()
         .from('views')
@@ -98,20 +150,11 @@ export class ViewsService {
       return this.toCamel({ ...tempView, config: { ...(dto.config ?? {}), hogFunctionId } })
     }
 
-    // Non-PostHog views — just create directly
+    // Non-PostHog views — create directly
     const { data, error } = await this.supabaseService
       .getClient()
       .from('views')
-      .insert({
-        folder_id: dto.folderId,
-        connection_id: dto.connectionId,
-        connection_type: dto.connectionType,
-        type: dto.type,
-        name: dto.name,
-        config: dto.config ?? {},
-        is_pinned: false,
-        user_id: userId,
-      })
+      .insert(baseInsert)
       .select()
       .single()
 
@@ -127,7 +170,6 @@ export class ViewsService {
   async deleteView(viewId: string, userId: string) {
     this.logger.log(`\n  ► deleteView\n  viewId : ${viewId}\n  userId : ${userId}`)
 
-    // Fetch view first to get hogFunctionId from config before deleting
     const { data: view } = await this.supabaseService
       .getClient()
       .from('views')
@@ -150,14 +192,12 @@ export class ViewsService {
 
     this.logger.log(`  ✓ view deleted`)
 
-    // Clean up Hog Function in PostHog (non-blocking)
     if (
       view?.connection_type === 'posthog' &&
       view?.connection_id &&
       (view.config as Record<string, unknown>)?.hogFunctionId
     ) {
       const hogFunctionId = (view.config as Record<string, unknown>).hogFunctionId as string
-
       this.posthogService
         .deleteHogFunction(view.connection_id as string, hogFunctionId)
         .catch(err => {
@@ -166,32 +206,49 @@ export class ViewsService {
     }
   }
 
-  private toCamel(row: Record<string, unknown>, date?: string) {
+  private aggregateValues(
+    values: { value: string; created_at: string }[],
+    viewType: string,
+    dateFrom?: string,
+    dateTo?: string,
+  ): string | null {
+    // Filter to the requested date range.
+    // created_at may be a full ISO timestamp — slice to the date part for comparison.
+    let filtered = values
+    if (dateFrom) filtered = filtered.filter(v => v.created_at.slice(0, 10) >= dateFrom)
+    if (dateTo)   filtered = filtered.filter(v => v.created_at.slice(0, 10) <= dateTo)
+
+    // Special case: webhook_append (PostHog) — count records in range; 0 when none
+    if (viewType === 'webhook_append') {
+      return String(filtered.length)
+    }
+
+    if (filtered.length === 0) return '0'
+
+    // Gauge types → return the latest value in range (no sum)
+    const isGauge = viewType.includes('gauge') || viewType.includes('mrr')
+    if (isGauge) {
+      const sorted = [...filtered].sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      )
+      return sorted[0].value
+    }
+
+    // Counter / revenue / everything else → SUM
+    const total = filtered.reduce((acc, v) => acc + (parseFloat(v.value) || 0), 0)
+    return String(total)
+  }
+
+  private toCamel(row: Record<string, unknown>, dateFrom?: string, dateTo?: string) {
     const values = (row.views_values as { value: string; created_at: string }[] | null) ?? []
     const viewType = (row.type as string) ?? 'daily_counter'
 
-    let displayValue: string | null = null
-
-    if (viewType === 'webhook_append') {
-      // Count entries for the target date (today if no date specified)
-      const targetDate = date ?? new Date().toISOString().split('T')[0]
-      const count = values.filter(v => v.created_at === targetDate).length
-      displayValue = count > 0 ? String(count) : null
-    } else if (date) {
-      // Historical: exact date match
-      const match = values.find(v => v.created_at === date)
-      displayValue = match?.value ?? null
-    } else {
-      // Today: latest value by date
-      const sorted = [...values].sort(
-        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-      )
-      displayValue = sorted[0]?.value ?? null
-    }
+    const displayValue = this.aggregateValues(values, viewType, dateFrom, dateTo)
 
     return {
       id: row.id,
-      folderId: row.folder_id,
+      projectId: row.project_id,
+      folderId: row.folder_id ?? null,
       connectionId: row.connection_id,
       connectionType: row.connection_type,
       type: viewType,

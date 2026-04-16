@@ -20,18 +20,46 @@ import type { CreateViewDto } from './views.service'
 export class ViewsController {
   constructor(private readonly viewsService: ViewsService) {}
 
+  @Get('pinned')
+  getPinned(@Req() req: any) {
+    return this.viewsService.getPinnedViews(req.authUser.id)
+  }
+
   @Get()
-  getByFolder(
-    @Query('folderId') folderId: string,
+  getViews(
+    @Query('folderId') folderId: string | undefined,
+    @Query('projectId') projectId: string | undefined,
     @Query('date') date: string | undefined,
+    @Query('dateFrom') dateFrom: string | undefined,
+    @Query('dateTo') dateTo: string | undefined,
     @Req() req: any,
   ) {
-    return this.viewsService.getViewsByFolder(folderId, req.authUser.id, date)
+    // Resolve date range: explicit dateFrom/dateTo take priority;
+    // legacy `date` param maps to single-day range for backward compat
+    const from = dateFrom ?? date
+    const to   = dateTo ?? date
+
+    if (projectId) {
+      return this.viewsService.getViewsByProject(projectId, req.authUser.id, from, to)
+    }
+    return this.viewsService.getViewsByFolder(folderId!, req.authUser.id, from, to)
   }
 
   @Post()
   create(@Body() dto: CreateViewDto, @Req() req: any) {
     return this.viewsService.createView(dto, req.authUser.id)
+  }
+
+  @Post(':id/pin')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  pin(@Param('id') id: string, @Req() req: any) {
+    return this.viewsService.pinView(id, req.authUser.id)
+  }
+
+  @Post(':id/unpin')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  unpin(@Param('id') id: string, @Req() req: any) {
+    return this.viewsService.unpinView(id, req.authUser.id)
   }
 
   @Delete(':id')

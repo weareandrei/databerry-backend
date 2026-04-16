@@ -5,7 +5,9 @@ export interface PosthogEventDefinition {
   id: string
   name: string
   volume_30_day: number | null
+  computed_volume: number
   last_seen_at: string | null
+  last_url: string | null
 }
 
 @Injectable()
@@ -180,7 +182,47 @@ if (res.status >= 400) {
 
     const json = (await res.json()) as { results: PosthogEventDefinition[] }
     this.logger.log(`  ✓ received ${json.results.length} event definitions`)
-    return json.results
+
+    // ── Fetch recent events to compute 30d volume and extract last URL ────────
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
+    const eventsUrl = `${ph.host}/api/projects/${ph.projectId}/events/?limit=1000&after=${thirtyDaysAgo}`
+
+    let eventStats: Map<string, { count: number; lastUrl: string | null }> = new Map()
+
+    try {
+      const eventsRes = await fetch(eventsUrl, {
+        headers: { Authorization: `Bearer ${ph.apiKey}` },
+      })
+      if (eventsRes.ok) {
+        const eventsJson = (await eventsRes.json()) as {
+          results: Array<{
+            event: string
+            properties: Record<string, unknown>
+          }>
+        }
+        // Events are returned newest-first; first occurrence of each name = most recent
+        for (const ev of eventsJson.results) {
+          const existing = eventStats.get(ev.event)
+          if (!existing) {
+            eventStats.set(ev.event, {
+              count: 1,
+              lastUrl: (ev.properties['$current_url'] as string | undefined) ?? null,
+            })
+          } else {
+            existing.count++
+          }
+        }
+        this.logger.log(`  ✓ fetched ${eventsJson.results.length} recent events for stats`)
+      }
+    } catch (e) {
+      this.logger.warn(`  ⚠ events stats fetch failed — computed_volume will be 0\n  ${e}`)
+    }
+
+    return json.results.map(def => ({
+      ...def,
+      computed_volume: eventStats.get(def.name)?.count ?? 0,
+      last_url: eventStats.get(def.name)?.lastUrl ?? null,
+    }))
   }
 
   // ── Private Helpers ────────────────────────────────────────────────────────

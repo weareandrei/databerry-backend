@@ -10,10 +10,12 @@ import { WebhooksModule } from './webhooks/webhooks.module'
 import { StripeModule } from './stripe/stripe.module'
 import { StripeManualModule } from './stripe-manual/stripe-manual.module'
 import { CalendlyModule } from './calendly/calendly.module'
+import { ProjectsModule } from './projects/projects.module'
 
 @Module({
   imports: [
     SupabaseModule,
+    ProjectsModule,
     FoldersModule,
     ConnectionsModule,
     AccountsModule,
