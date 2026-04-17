@@ -1,6 +1,7 @@
 import { Controller, Get, Query, Req, UseGuards } from '@nestjs/common'
 import { SupabaseAuthGuard } from '../auth/supabase-auth.guard'
 import { StripeManualService } from './stripe-manual.service'
+import type { AuthenticatedRequest } from '../common/types'
 
 @UseGuards(SupabaseAuthGuard)
 @Controller('stripe-manual')
@@ -11,7 +12,7 @@ export class StripeManualController {
   async getLiveValue(
     @Query('connectionId') connectionId: string,
     @Query('viewType') viewType: string,
-    @Req() req: { authUser: { id: string } },
+    @Req() req: AuthenticatedRequest,
   ) {
     const value = await this.stripeManualService.fetchLiveValue(
       connectionId,
@@ -25,7 +26,7 @@ export class StripeManualController {
   async getChartData(
     @Query('connectionId') connectionId: string,
     @Query('viewType') viewType: string,
-    @Req() req: { authUser: { id: string } },
+    @Req() req: AuthenticatedRequest,
   ) {
     const points = await this.stripeManualService.fetchChartData(
       connectionId,

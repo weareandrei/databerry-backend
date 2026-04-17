@@ -1,6 +1,7 @@
 import { Injectable, Logger, NotFoundException, UnauthorizedException } from '@nestjs/common'
 import { createHash, randomBytes } from 'crypto'
 import { SupabaseService } from '../supabase/supabase.service'
+import { ViewsService } from '../views/views.service'
 
 export interface CalendlyMeeting {
   startTime: string
@@ -22,7 +23,10 @@ export class CalendlyService {
   private readonly baseApi = 'https://api.calendly.com'
   private readonly authBase = 'https://auth.calendly.com'
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly viewsService: ViewsService,
+  ) {}
 
   // ── OAuth ─────────────────────────────────────────────────────────────────
 
@@ -198,7 +202,7 @@ export class CalendlyService {
     const events = await this.getTodayEvents(token, userUri)
     const count = String(events.length)
 
-    await this.upsertValue(connectionId, viewType, count)
+    await this.viewsService.upsertValue(connectionId, viewType, count)
     this.logger.log(`calendly_meetings_today → ${count}`)
     return count
   }
@@ -299,34 +303,4 @@ export class CalendlyService {
     return data.collection
   }
 
-  private async upsertValue(connectionId: string, viewType: string, value: string): Promise<void> {
-    const client = this.supabaseService.getClient()
-    const today = new Date().toISOString().split('T')[0]
-
-    const { data: view } = await client
-      .from('views')
-      .select('id')
-      .eq('connection_id', connectionId)
-      .eq('type', viewType)
-      .maybeSingle()
-
-    if (!view) return
-
-    const viewId = view.id as string
-    const { data: existing } = await client
-      .from('views_values')
-      .select('id')
-      .eq('view_id', viewId)
-      .eq('created_at', today)
-      .maybeSingle()
-
-    if (existing) {
-      await client
-        .from('views_values')
-        .update({ value, updated_at: new Date().toISOString() })
-        .eq('id', existing.id)
-    } else {
-      await client.from('views_values').insert({ view_id: viewId, value, created_at: today })
-    }
-  }
 }

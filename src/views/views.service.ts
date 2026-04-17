@@ -206,6 +206,41 @@ export class ViewsService {
     }
   }
 
+  // Shared by StripeManualService, CalendlyService, GoogleAnalyticsService
+  async upsertValue(connectionId: string, viewType: string, value: string): Promise<void> {
+    const client = this.supabaseService.getClient()
+    const today  = new Date().toISOString().split('T')[0]
+
+    const { data: view } = await client
+      .from('views')
+      .select('id')
+      .eq('connection_id', connectionId)
+      .eq('type', viewType)
+      .maybeSingle()
+
+    if (!view) {
+      this.logger.warn(`  ⚠ No view found for connectionId=${connectionId} type=${viewType}`)
+      return
+    }
+
+    const viewId = view.id as string
+    const { data: existing } = await client
+      .from('views_values')
+      .select('id')
+      .eq('view_id', viewId)
+      .eq('created_at', today)
+      .maybeSingle()
+
+    if (existing) {
+      await client
+        .from('views_values')
+        .update({ value, updated_at: new Date().toISOString() })
+        .eq('id', existing.id)
+    } else {
+      await client.from('views_values').insert({ view_id: viewId, value, created_at: today })
+    }
+  }
+
   private aggregateValues(
     values: { value: string; created_at: string }[],
     viewType: string,
@@ -226,7 +261,7 @@ export class ViewsService {
     if (filtered.length === 0) return '0'
 
     // Gauge types → return the latest value in range (no sum)
-    const isGauge = viewType.includes('gauge') || viewType.includes('mrr')
+    const isGauge = viewType.includes('gauge') || viewType.includes('mrr') || viewType === 'ga_active_users'
     if (isGauge) {
       const sorted = [...filtered].sort(
         (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),

@@ -1,6 +1,7 @@
 import { Controller, Get, Query, Req, Res, UseGuards } from '@nestjs/common'
 import { SupabaseAuthGuard } from '../auth/supabase-auth.guard'
 import { CalendlyService } from './calendly.service'
+import type { AuthenticatedRequest } from '../common/types'
 
 @Controller('calendly')
 export class CalendlyController {
@@ -8,7 +9,7 @@ export class CalendlyController {
 
   @UseGuards(SupabaseAuthGuard)
   @Get('oauth/start')
-  async oauthStart(@Req() req: { authUser: { id: string } }) {
+  async oauthStart(@Req() req: AuthenticatedRequest) {
     const url = await this.calendlyService.getOAuthUrl(req.authUser.id)
     return { url }
   }
@@ -25,7 +26,7 @@ export class CalendlyController {
   async getLiveValue(
     @Query('connectionId') connectionId: string,
     @Query('viewType') viewType: string,
-    @Req() req: { authUser: { id: string } },
+    @Req() req: AuthenticatedRequest,
   ) {
     const value = await this.calendlyService.fetchLiveValue(connectionId, viewType, req.authUser.id)
     return { value }
@@ -35,7 +36,7 @@ export class CalendlyController {
   @Get('meetings-list')
   async getMeetingsList(
     @Query('connectionId') connectionId: string,
-    @Req() req: { authUser: { id: string } },
+    @Req() req: AuthenticatedRequest,
   ) {
     const meetings = await this.calendlyService.fetchMeetingsList(connectionId, req.authUser.id)
     return { meetings }

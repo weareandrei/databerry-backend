@@ -14,6 +14,7 @@ import {
 import { SupabaseAuthGuard } from '../auth/supabase-auth.guard'
 import { ViewsService } from './views.service'
 import type { CreateViewDto } from './views.service'
+import type { AuthenticatedRequest } from '../common/types'
 
 @Controller('views')
 @UseGuards(SupabaseAuthGuard)
@@ -21,7 +22,7 @@ export class ViewsController {
   constructor(private readonly viewsService: ViewsService) {}
 
   @Get('pinned')
-  getPinned(@Req() req: any) {
+  getPinned(@Req() req: AuthenticatedRequest) {
     return this.viewsService.getPinnedViews(req.authUser.id)
   }
 
@@ -32,7 +33,7 @@ export class ViewsController {
     @Query('date') date: string | undefined,
     @Query('dateFrom') dateFrom: string | undefined,
     @Query('dateTo') dateTo: string | undefined,
-    @Req() req: any,
+    @Req() req: AuthenticatedRequest,
   ) {
     // Resolve date range: explicit dateFrom/dateTo take priority;
     // legacy `date` param maps to single-day range for backward compat
@@ -46,25 +47,25 @@ export class ViewsController {
   }
 
   @Post()
-  create(@Body() dto: CreateViewDto, @Req() req: any) {
+  create(@Body() dto: CreateViewDto, @Req() req: AuthenticatedRequest) {
     return this.viewsService.createView(dto, req.authUser.id)
   }
 
   @Post(':id/pin')
   @HttpCode(HttpStatus.NO_CONTENT)
-  pin(@Param('id') id: string, @Req() req: any) {
+  pin(@Param('id') id: string, @Req() req: AuthenticatedRequest) {
     return this.viewsService.pinView(id, req.authUser.id)
   }
 
   @Post(':id/unpin')
   @HttpCode(HttpStatus.NO_CONTENT)
-  unpin(@Param('id') id: string, @Req() req: any) {
+  unpin(@Param('id') id: string, @Req() req: AuthenticatedRequest) {
     return this.viewsService.unpinView(id, req.authUser.id)
   }
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  remove(@Param('id') id: string, @Req() req: any) {
+  remove(@Param('id') id: string, @Req() req: AuthenticatedRequest) {
     return this.viewsService.deleteView(id, req.authUser.id)
   }
 }

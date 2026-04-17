@@ -8,5 +8,6 @@ import { PosthogModule } from '../posthog/posthog.module'
   imports: [SupabaseModule, PosthogModule],
   controllers: [ViewsController],
   providers: [ViewsService],
+  exports: [ViewsService],
 })
 export class ViewsModule {}

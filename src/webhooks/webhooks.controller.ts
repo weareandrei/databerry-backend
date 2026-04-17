@@ -1,5 +1,6 @@
 import {
   Controller,
+  Logger,
   Post,
   Param,
   Body,
@@ -11,9 +12,11 @@ import {
 } from '@nestjs/common'
 import { WebhooksService } from './webhooks.service'
 
-// This controller has NO auth guard — PostHog calls it directly
+// This controller has NO auth guard — PostHog and Stripe call it directly
 @Controller('webhooks')
 export class WebhooksController {
+  private readonly logger = new Logger(WebhooksController.name)
+
   constructor(private readonly webhooksService: WebhooksService) {}
 
   @Post('posthog/:connectionId/:viewId')
@@ -32,7 +35,8 @@ export class WebhooksController {
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n')
 
     // Fire-and-forget — PostHog expects a fast 200 back
-    this.webhooksService.handlePosthogEvent(connectionId, viewId, payload).catch(() => {})
+    this.webhooksService.handlePosthogEvent(connectionId, viewId, payload)
+      .catch(err => this.logger.error('handlePosthogEvent failed', err?.message))
     return { ok: true }
   }
 
@@ -42,7 +46,8 @@ export class WebhooksController {
     if (!sig) throw new BadRequestException('Missing stripe-signature header')
 
     // Fire-and-forget — Stripe expects a fast 200 back
-    this.webhooksService.handleStripeEvent(rawBody, sig).catch(() => {})
+    this.webhooksService.handleStripeEvent(rawBody, sig)
+      .catch(err => this.logger.error('handleStripeEvent failed', err?.message))
     return { ok: true }
   }
 

@@ -1,7 +1,6 @@
 import { Module } from '@nestjs/common'
-import { AppController } from './app.controller'
-import { AppService } from './app.service'
 import { SupabaseModule } from './supabase/supabase.module'
+import { ProjectsModule } from './projects/projects.module'
 import { FoldersModule } from './folders/folders.module'
 import { ConnectionsModule } from './connections/connections.module'
 import { AccountsModule } from './accounts/accounts.module'
@@ -10,7 +9,7 @@ import { WebhooksModule } from './webhooks/webhooks.module'
 import { StripeModule } from './stripe/stripe.module'
 import { StripeManualModule } from './stripe-manual/stripe-manual.module'
 import { CalendlyModule } from './calendly/calendly.module'
-import { ProjectsModule } from './projects/projects.module'
+import { GoogleAnalyticsModule } from './google-analytics/google-analytics.module'
 
 @Module({
   imports: [
@@ -24,8 +23,7 @@ import { ProjectsModule } from './projects/projects.module'
     StripeModule,
     StripeManualModule,
     CalendlyModule,
+    GoogleAnalyticsModule,
   ],
-  controllers: [AppController],
-  providers: [AppService],
 })
 export class AppModule {}

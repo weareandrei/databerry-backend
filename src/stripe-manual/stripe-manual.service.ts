@@ -1,5 +1,6 @@
 import { Injectable, Logger, NotFoundException, UnauthorizedException } from '@nestjs/common'
 import { SupabaseService } from '../supabase/supabase.service'
+import { ViewsService } from '../views/views.service'
 
 export interface ChartPoint {
   label: string
@@ -11,11 +12,19 @@ type StripeGetter = (
   params?: Record<string, string>,
 ) => Promise<Record<string, unknown>>
 
+interface StripeChargePage {
+  data: { id: string; status: string; amount: number; created: number }[]
+  has_more: boolean
+}
+
 @Injectable()
 export class StripeManualService {
   private readonly logger = new Logger(StripeManualService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly viewsService: ViewsService,
+  ) {}
 
   // ── Public ────────────────────────────────────────────────────────────────
 
@@ -24,7 +33,7 @@ export class StripeManualService {
     const apiKey = await this.getApiKey(connectionId, userId)
     const get = this.makeStripeGetter(apiKey)
     const value = await this.computeLiveValue(get, viewType)
-    await this.upsertValue(connectionId, viewType, value)
+    await this.viewsService.upsertValue(connectionId, viewType, value)
     this.logger.log(`  ✓ fetchLiveValue → ${value}`)
     return value
   }
@@ -126,10 +135,7 @@ export class StripeManualService {
       }
       if (startingAfter) params['starting_after'] = startingAfter
 
-      const data = (await get('charges', params)) as {
-        data: { id: string; status: string; amount: number }[]
-        has_more: boolean
-      }
+      const data = (await get('charges', params)) as unknown as StripeChargePage
 
       for (const c of data.data) {
         if (c.status === 'succeeded') total += c.amount
@@ -160,10 +166,7 @@ export class StripeManualService {
       }
       if (startingAfter) params['starting_after'] = startingAfter
 
-      const data = (await get('charges', params)) as {
-        data: { id: string; status: string; amount: number; created: number }[]
-        has_more: boolean
-      }
+      const data = (await get('charges', params)) as unknown as StripeChargePage
 
       for (const c of data.data) {
         all.push({ created: c.created, amount: c.amount, status: c.status })
@@ -237,39 +240,4 @@ export class StripeManualService {
     })
   }
 
-  // ── Persistence ────────────────────────────────────────────────────────────
-
-  private async upsertValue(connectionId: string, viewType: string, value: string): Promise<void> {
-    const client = this.supabaseService.getClient()
-    const today = new Date().toISOString().split('T')[0]
-
-    const { data: view } = await client
-      .from('views')
-      .select('id')
-      .eq('connection_id', connectionId)
-      .eq('type', viewType)
-      .maybeSingle()
-
-    if (!view) {
-      this.logger.warn(`  ⚠ No view found for connectionId=${connectionId} type=${viewType}`)
-      return
-    }
-
-    const viewId = view.id as string
-    const { data: existing } = await client
-      .from('views_values')
-      .select('id')
-      .eq('view_id', viewId)
-      .eq('created_at', today)
-      .maybeSingle()
-
-    if (existing) {
-      await client
-        .from('views_values')
-        .update({ value, updated_at: new Date().toISOString() })
-        .eq('id', existing.id)
-    } else {
-      await client.from('views_values').insert({ view_id: viewId, value, created_at: today })
-    }
-  }
 }
