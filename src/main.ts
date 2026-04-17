@@ -16,19 +16,7 @@ async function bootstrap() {
 
   const port = process.env.PORT ?? 3001
   await app.listen(port)
-  console.log(`\n  Backend running on port ${port}`)
-
-  // If no WEBHOOK_BASE_URL set, tunnel via ngrok for local dev
-  if (!process.env.WEBHOOK_BASE_URL && process.env.NGROK_AUTHTOKEN) {
-    const ngrok = await import('@ngrok/ngrok')
-    const listener = await ngrok.connect({
-      addr: Number(port),
-      authtoken: process.env.NGROK_AUTHTOKEN,
-    })
-    process.env.WEBHOOK_BASE_URL = listener.url() ?? undefined
-    console.log(`  Ngrok tunnel established: ${process.env.WEBHOOK_BASE_URL}`)
-    console.log(`  WEBHOOK_BASE_URL set automatically\n`)
-  }
+  console.log(`\n  Backend running on port ${port}\n`)
 }
 
 bootstrap()
