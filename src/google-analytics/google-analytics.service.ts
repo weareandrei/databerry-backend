@@ -20,7 +20,6 @@ export class GoogleAnalyticsService {
 
   private readonly clientId     = process.env.GA_CLIENT_ID!
   private readonly clientSecret = process.env.GA_CLIENT_SECRET!
-  private readonly redirectUri  = `${process.env.WEBHOOK_BASE_URL ?? 'http://localhost:3001'}/google-analytics/oauth/callback`
   private readonly frontendUrl  = process.env.FRONTEND_URL ?? 'http://localhost:3000'
 
   constructor(
@@ -30,7 +29,7 @@ export class GoogleAnalyticsService {
 
   // ── OAuth ─────────────────────────────────────────────────────────────────
 
-  async getOAuthUrl(userId: string): Promise<string> {
+  async getOAuthUrl(userId: string, redirectUri: string): Promise<string> {
     const state = randomBytes(16).toString('hex')
     await this.supabaseService.getClient()
       .from('google_analytics_oauth_state')
@@ -38,7 +37,7 @@ export class GoogleAnalyticsService {
 
     const url = new URL(AUTH_URL)
     url.searchParams.set('client_id',     this.clientId)
-    url.searchParams.set('redirect_uri',  this.redirectUri)
+    url.searchParams.set('redirect_uri',  redirectUri)
     url.searchParams.set('response_type', 'code')
     url.searchParams.set('scope',         'https://www.googleapis.com/auth/analytics.readonly')
     url.searchParams.set('access_type',   'offline')
@@ -47,7 +46,7 @@ export class GoogleAnalyticsService {
     return url.toString()
   }
 
-  async handleOAuthCallback(code: string, state: string): Promise<string> {
+  async handleOAuthCallback(code: string, state: string, redirectUri: string): Promise<string> {
     const client = this.supabaseService.getClient()
 
     const { data: stateRow } = await client
@@ -69,7 +68,7 @@ export class GoogleAnalyticsService {
           code,
           client_id:     this.clientId,
           client_secret: this.clientSecret,
-          redirect_uri:  this.redirectUri,
+          redirect_uri:  redirectUri,
           grant_type:    'authorization_code',
         }),
       })

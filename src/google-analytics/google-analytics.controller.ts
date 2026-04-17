@@ -2,6 +2,18 @@ import { Body, Controller, Get, Patch, Query, Req, Res, UseGuards } from '@nestj
 import { SupabaseAuthGuard } from '../auth/supabase-auth.guard'
 import { GoogleAnalyticsService } from './google-analytics.service'
 import type { AuthenticatedRequest } from '../common/types'
+import type { Request } from 'express'
+
+/** Derive the backend's own public base URL from request headers.
+ *  Works on any host: local dev, Railway, Render, etc. */
+function backendBaseUrl(req: Request): string {
+  const proto = (req.headers['x-forwarded-proto'] as string | undefined)
+    ?? (req.hostname === 'localhost' ? 'http' : 'https')
+  const host = (req.headers['x-forwarded-host'] as string | undefined)
+    ?? req.headers['host']
+    ?? 'localhost:3001'
+  return `${proto}://${host}`
+}
 
 @Controller('google-analytics')
 export class GoogleAnalyticsController {
@@ -9,8 +21,9 @@ export class GoogleAnalyticsController {
 
   @UseGuards(SupabaseAuthGuard)
   @Get('oauth/start')
-  async oauthStart(@Req() req: AuthenticatedRequest) {
-    const url = await this.gaService.getOAuthUrl(req.authUser.id)
+  async oauthStart(@Req() req: AuthenticatedRequest & Request) {
+    const redirectUri = `${backendBaseUrl(req)}/google-analytics/oauth/callback`
+    const url = await this.gaService.getOAuthUrl(req.authUser.id, redirectUri)
     return { url }
   }
 
@@ -19,9 +32,11 @@ export class GoogleAnalyticsController {
   async oauthCallback(
     @Query('code') code: string,
     @Query('state') state: string,
+    @Req() req: Request,
     @Res() res: any,
   ) {
-    const redirectUrl = await this.gaService.handleOAuthCallback(code, state)
+    const redirectUri = `${backendBaseUrl(req)}/google-analytics/oauth/callback`
+    const redirectUrl = await this.gaService.handleOAuthCallback(code, state, redirectUri)
     res.redirect(redirectUrl)
   }
 
