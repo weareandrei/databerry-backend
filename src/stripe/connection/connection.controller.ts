@@ -1,27 +1,20 @@
 import { Controller, Get, Query, Req, Res, UseGuards } from '@nestjs/common'
 import type { Response } from 'express'
-import { SupabaseAuthGuard } from '../auth/supabase-auth.guard'
-import { StripeService } from './stripe.service'
+import { SupabaseAuthGuard } from '../../auth/supabase-auth.guard'
+import { StripeOAuthService } from './oauth'
 
 @Controller('stripe')
-export class StripeController {
-  constructor(private readonly stripeService: StripeService) {}
+export class StripeConnectionController {
+  constructor(private readonly stripeOAuthService: StripeOAuthService) {}
 
-  /**
-   * Protected — frontend calls this with auth header to get the OAuth URL.
-   * Returns { url } so the frontend can redirect the browser there.
-   */
+  /** Protected — frontend calls this to get the Stripe Connect OAuth URL. */
   @Get('oauth/start')
   @UseGuards(SupabaseAuthGuard)
   startOAuth(@Req() req: any): { url: string } {
-    const url = this.stripeService.getOAuthUrl(req.authUser.id)
-    return { url }
+    return { url: this.stripeOAuthService.getOAuthUrl(req.authUser.id) }
   }
 
-  /**
-   * Public — Stripe redirects the browser here after the user authorises.
-   * No auth guard: we read userId from the `state` query param.
-   */
+  /** Public — Stripe redirects here after the user authorises. */
   @Get('oauth/callback')
   async handleCallback(
     @Query('code') code: string,
@@ -36,7 +29,7 @@ export class StripeController {
     }
 
     try {
-      await this.stripeService.handleOAuthCallback(code, state)
+      await this.stripeOAuthService.handleOAuthCallback(code, state)
       return res.redirect(`${frontendUrl}/connections?stripe=connected`)
     } catch {
       return res.redirect(`${frontendUrl}/connections?stripe=error`)

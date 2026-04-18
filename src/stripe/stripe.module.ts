@@ -1,12 +1,9 @@
 import { Module } from '@nestjs/common'
-import { StripeService } from './stripe.service'
-import { StripeController } from './stripe.controller'
-import { SupabaseModule } from '../supabase/supabase.module'
+import { StripeConnectionModule } from './connection/connection.module'
+import { StripeWebhookModule } from './webhook/webhook.module'
+import { StripeViewsModule } from './views/views.module'
 
 @Module({
-  imports: [SupabaseModule],
-  providers: [StripeService],
-  controllers: [StripeController],
-  exports: [StripeService],
+  imports: [StripeConnectionModule, StripeWebhookModule, StripeViewsModule],
 })
 export class StripeModule {}

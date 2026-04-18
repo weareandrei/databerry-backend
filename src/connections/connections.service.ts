@@ -1,7 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common'
 import { createHash, randomBytes } from 'crypto'
 import { SupabaseService } from '../supabase/supabase.service'
-import { PosthogService } from '../posthog/posthog.service'
+import { PosthogCredentialsService } from '../posthog/connection/credentials'
 
 export interface CreateConnectionDto {
   name: string
@@ -17,7 +17,7 @@ export interface UpdateConnectionDto {
 export class ConnectionsService {
   constructor(
     private readonly supabaseService: SupabaseService,
-    private readonly posthogService: PosthogService,
+    private readonly posthogCredentialsService: PosthogCredentialsService,
   ) {}
 
   async getConnections(userId: string) {
@@ -92,7 +92,7 @@ export class ConnectionsService {
   }
 
   async getPosthogEventDefinitions(connectionId: string, userId: string) {
-    return this.posthogService.getEventDefinitions(connectionId, userId)
+    return this.posthogCredentialsService.getEventDefinitions(connectionId, userId)
   }
 
   async createWebhookKey(connectionId: string, name: string, userId: string) {

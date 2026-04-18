@@ -1,11 +1,13 @@
 import { Module } from '@nestjs/common'
 import { WebhooksController } from './webhooks.controller'
-import { WebhooksService } from './webhooks.service'
+import { CustomWebhookService } from './custom-webhook.service'
 import { SupabaseModule } from '../supabase/supabase.module'
+import { StripeWebhookModule } from '../stripe/webhook/webhook.module'
+import { PosthogWebhookModule } from '../posthog/webhook/webhook.module'
 
 @Module({
-  imports: [SupabaseModule],
+  imports: [SupabaseModule, StripeWebhookModule, PosthogWebhookModule],
   controllers: [WebhooksController],
-  providers: [WebhooksService],
+  providers: [CustomWebhookService],
 })
 export class WebhooksModule {}

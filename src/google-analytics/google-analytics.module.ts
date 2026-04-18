@@ -1,12 +1,8 @@
 import { Module } from '@nestjs/common'
-import { SupabaseModule } from '../supabase/supabase.module'
-import { ViewsModule } from '../views/views.module'
-import { GoogleAnalyticsService } from './google-analytics.service'
-import { GoogleAnalyticsController } from './google-analytics.controller'
+import { GoogleAnalyticsConnectionModule } from './connection/connection.module'
+import { GoogleAnalyticsViewsModule } from './views/views.module'
 
 @Module({
-  imports: [SupabaseModule, ViewsModule],
-  providers: [GoogleAnalyticsService],
-  controllers: [GoogleAnalyticsController],
+  imports: [GoogleAnalyticsConnectionModule, GoogleAnalyticsViewsModule],
 })
 export class GoogleAnalyticsModule {}

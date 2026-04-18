@@ -4,15 +4,13 @@ import {
   BadRequestException,
   InternalServerErrorException,
 } from '@nestjs/common'
-import { SupabaseService } from '../supabase/supabase.service'
+import { SupabaseService } from '../../supabase/supabase.service'
 
 @Injectable()
-export class StripeService {
-  private readonly logger = new Logger(StripeService.name)
+export class StripeOAuthService {
+  private readonly logger = new Logger(StripeOAuthService.name)
 
   constructor(private readonly supabaseService: SupabaseService) {}
-
-  // ── OAuth ────────────────────────────────────────────────────────────────
 
   getOAuthUrl(userId: string): string {
     const clientId = process.env.STRIPE_CLIENT_ID
@@ -21,8 +19,6 @@ export class StripeService {
     const backendUrl =
       process.env.WEBHOOK_BASE_URL ?? `http://localhost:${process.env.PORT ?? 3008}`
     const redirectUri = `${backendUrl}/stripe/oauth/callback`
-
-    // Encode userId in state so we know who to create the connection for
     const state = Buffer.from(userId).toString('base64')
 
     const params = new URLSearchParams({
@@ -33,15 +29,11 @@ export class StripeService {
       state,
     })
 
-    const url = `https://connect.stripe.com/oauth/authorize?${params.toString()}`
-
     this.logger.log(`\n  ► getOAuthUrl\n  userId      : ${userId}\n  redirectUri : ${redirectUri}`)
-
-    return url
+    return `https://connect.stripe.com/oauth/authorize?${params.toString()}`
   }
 
   async handleOAuthCallback(code: string, state: string): Promise<void> {
-    // Decode userId from state
     let userId: string
     try {
       userId = Buffer.from(state, 'base64').toString('utf8')
@@ -51,7 +43,6 @@ export class StripeService {
 
     this.logger.log(`\n  ► handleOAuthCallback\n  userId : ${userId}`)
 
-    // Exchange code for access token
     const secretKey = process.env.STRIPE_SECRET_KEY
     if (!secretKey) throw new InternalServerErrorException('STRIPE_SECRET_KEY not set')
 
@@ -81,7 +72,6 @@ export class StripeService {
 
     const client = this.supabaseService.getClient()
 
-    // 1. Insert base connection
     const { data: connection, error: connError } = await client
       .from('connections')
       .insert({ name: 'Stripe', type: 'stripe', user_id: userId })
@@ -93,7 +83,6 @@ export class StripeService {
       throw new Error(connError.message)
     }
 
-    // 2. Insert stripe-specific record
     const { error: stripeError } = await client.from('connections_stripe').insert({
       connection_id: connection.id,
       stripe_account_id: stripeAccountId,
@@ -103,7 +92,6 @@ export class StripeService {
     })
 
     if (stripeError) {
-      // Rollback connection row
       await client.from('connections').delete().eq('id', connection.id)
       this.logger.error(`  ✗ Failed to insert connections_stripe\n  ${stripeError.message}`)
       throw new Error(stripeError.message)

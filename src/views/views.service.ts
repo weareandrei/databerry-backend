@@ -1,6 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { SupabaseService } from '../supabase/supabase.service'
-import { PosthogService } from '../posthog/posthog.service'
+import { PosthogLifecycleService } from '../posthog/lifecycle/hog-function'
 
 export interface CreateViewDto {
   projectId: string
@@ -18,7 +18,7 @@ export class ViewsService {
 
   constructor(
     private readonly supabaseService: SupabaseService,
-    private readonly posthogService: PosthogService,
+    private readonly posthogLifecycleService: PosthogLifecycleService,
   ) {}
 
   async getViewsByFolder(folderId: string, userId: string, dateFrom?: string, dateTo?: string) {
@@ -126,7 +126,7 @@ export class ViewsService {
         throw new Error(tempError.message)
       }
 
-      const hogFunctionId = await this.posthogService.createHogFunction(
+      const hogFunctionId = await this.posthogLifecycleService.createHogFunction(
         dto.connectionId,
         tempView.id as string,
         eventName,
@@ -198,7 +198,7 @@ export class ViewsService {
       (view.config as Record<string, unknown>)?.hogFunctionId
     ) {
       const hogFunctionId = (view.config as Record<string, unknown>).hogFunctionId as string
-      this.posthogService
+      this.posthogLifecycleService
         .deleteHogFunction(view.connection_id as string, hogFunctionId)
         .catch(err => {
           this.logger.error(`  ✗ deleteHogFunction failed silently\n  ${err.message}`)

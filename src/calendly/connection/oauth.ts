@@ -1,34 +1,19 @@
 import { Injectable, Logger, NotFoundException, UnauthorizedException } from '@nestjs/common'
 import { createHash, randomBytes } from 'crypto'
-import { SupabaseService } from '../supabase/supabase.service'
-import { ViewsService } from '../views/views.service'
-
-export interface CalendlyMeeting {
-  startTime: string
-  endTime: string
-  name: string
-  bookingUri: string
-  invitees: { name: string; email: string }[]
-  description: string | null
-}
+import { SupabaseService } from '../../supabase/supabase.service'
 
 @Injectable()
-export class CalendlyService {
-  private readonly logger = new Logger(CalendlyService.name)
+export class CalendlyOAuthService {
+  private readonly logger = new Logger(CalendlyOAuthService.name)
 
-  private readonly clientId = process.env.CALENDLY_CLIENT_ID!
-  private readonly clientSecret = process.env.CALENDLY_CLIENT_SECRET!
-  private readonly redirectUri = `${process.env.WEBHOOK_BASE_URL ?? 'http://localhost:3001'}/calendly/oauth/callback`
-  private readonly frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3000'
-  private readonly baseApi = 'https://api.calendly.com'
-  private readonly authBase = 'https://auth.calendly.com'
+  readonly clientId = process.env.CALENDLY_CLIENT_ID!
+  readonly clientSecret = process.env.CALENDLY_CLIENT_SECRET!
+  readonly redirectUri = `${process.env.WEBHOOK_BASE_URL ?? 'http://localhost:3001'}/calendly/oauth/callback`
+  readonly frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3000'
+  readonly baseApi = 'https://api.calendly.com'
+  readonly authBase = 'https://auth.calendly.com'
 
-  constructor(
-    private readonly supabaseService: SupabaseService,
-    private readonly viewsService: ViewsService,
-  ) {}
-
-  // ── OAuth ─────────────────────────────────────────────────────────────────
+  constructor(private readonly supabaseService: SupabaseService) {}
 
   async getOAuthUrl(userId: string): Promise<string> {
     const codeVerifier = randomBytes(32).toString('base64url')
@@ -70,7 +55,6 @@ export class CalendlyService {
     const codeVerifier = stateRow.code_verifier as string
 
     try {
-      // Exchange code for tokens
       const tokenRes = await fetch(`${this.authBase}/oauth/token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -98,7 +82,6 @@ export class CalendlyService {
 
       const expiresAt = new Date(Date.now() + tokens.expires_in * 1000).toISOString()
 
-      // Get user info
       const meRes = await fetch(`${this.baseApi}/users/me`, {
         headers: { Authorization: `Bearer ${tokens.access_token}` },
       })
@@ -108,7 +91,6 @@ export class CalendlyService {
         resource: { uri: string; current_organization: string }
       }
 
-      // Create base connection record
       const { data: conn, error: connErr } = await client
         .from('connections')
         .insert({ name: 'Calendly', type: 'calendly', user_id: userId })
@@ -117,7 +99,6 @@ export class CalendlyService {
 
       if (connErr) throw new Error('Failed to create connection: ' + connErr.message)
 
-      // Store credentials
       const { error: credErr } = await client.from('connections_calendly').insert({
         connection_id: conn.id,
         access_token: tokens.access_token,
@@ -132,14 +113,11 @@ export class CalendlyService {
       this.logger.log(`Calendly connected for user ${userId}`)
       return `${this.frontendUrl}/hub/connections?calendly=connected`
     } finally {
-      // Always clean up state row
       await client.from('calendly_oauth_state').delete().eq('state', state)
     }
   }
 
-  // ── Token management ──────────────────────────────────────────────────────
-
-  private async ensureFreshToken(connectionId: string): Promise<string> {
+  async ensureFreshToken(connectionId: string): Promise<string> {
     const client = this.supabaseService.getClient()
 
     const { data } = await client
@@ -192,79 +170,7 @@ export class CalendlyService {
     return tokens.access_token
   }
 
-  // ── Data fetching ─────────────────────────────────────────────────────────
-
-  async fetchLiveValue(connectionId: string, viewType: string, userId: string): Promise<string> {
-    await this.verifyOwnership(connectionId, userId)
-    const token = await this.ensureFreshToken(connectionId)
-    const userUri = await this.getUserUri(connectionId)
-
-    const events = await this.getTodayEvents(token, userUri)
-    const count = String(events.length)
-
-    await this.viewsService.upsertValue(connectionId, viewType, count)
-    this.logger.log(`calendly_meetings_today → ${count}`)
-    return count
-  }
-
-  async fetchMeetingsList(connectionId: string, userId: string): Promise<CalendlyMeeting[]> {
-    await this.verifyOwnership(connectionId, userId)
-    const token = await this.ensureFreshToken(connectionId)
-    const userUri = await this.getUserUri(connectionId)
-
-    const events = await this.getTodayEvents(token, userUri)
-    const meetings: CalendlyMeeting[] = []
-
-    for (const event of events) {
-      const uri = event.uri as string
-      const uuid = uri.split('/').pop()!
-
-      let invitees: { name: string; email: string }[] = []
-      try {
-        const inviteesRes = await fetch(`${this.baseApi}/scheduled_events/${uuid}/invitees`, {
-          headers: { Authorization: `Bearer ${token}` },
-        })
-        if (inviteesRes.ok) {
-          const inviteesData = (await inviteesRes.json()) as {
-            collection: { name: string; email: string }[]
-          }
-          invitees = inviteesData.collection.map(inv => ({
-            name: inv.name,
-            email: inv.email,
-          }))
-        }
-      } catch {
-        this.logger.warn(`Failed to fetch invitees for event ${uuid}`)
-      }
-
-      meetings.push({
-        startTime: event.start_time as string,
-        endTime: event.end_time as string,
-        name: event.name as string,
-        bookingUri: uri,
-        invitees,
-        description: (event.description ?? null) as string | null,
-      })
-    }
-
-    return meetings
-  }
-
-  // ── Private helpers ───────────────────────────────────────────────────────
-
-  private async verifyOwnership(connectionId: string, userId: string): Promise<void> {
-    const { data } = await this.supabaseService
-      .getClient()
-      .from('connections')
-      .select('id')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .maybeSingle()
-
-    if (!data) throw new NotFoundException('Connection not found')
-  }
-
-  private async getUserUri(connectionId: string): Promise<string> {
+  async getUserUri(connectionId: string): Promise<string> {
     const { data } = await this.supabaseService
       .getClient()
       .from('connections_calendly')
@@ -276,31 +182,15 @@ export class CalendlyService {
     return data.user_uri as string
   }
 
-  private async getTodayEvents(token: string, userUri: string): Promise<Record<string, unknown>[]> {
-    const now = new Date()
-    const todayStart = new Date(now)
-    todayStart.setUTCHours(0, 0, 0, 0)
-    const todayEnd = new Date(now)
-    todayEnd.setUTCHours(23, 59, 59, 999)
+  async verifyOwnership(connectionId: string, userId: string): Promise<void> {
+    const { data } = await this.supabaseService
+      .getClient()
+      .from('connections')
+      .select('id')
+      .eq('id', connectionId)
+      .eq('user_id', userId)
+      .maybeSingle()
 
-    const url = new URL(`${this.baseApi}/scheduled_events`)
-    url.searchParams.set('user', userUri)
-    url.searchParams.set('min_start_time', todayStart.toISOString())
-    url.searchParams.set('max_start_time', todayEnd.toISOString())
-    url.searchParams.set('status', 'active')
-    url.searchParams.set('count', '100')
-
-    const res = await fetch(url.toString(), {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      throw new Error('Calendly API error: ' + JSON.stringify(body))
-    }
-
-    const data = (await res.json()) as { collection: Record<string, unknown>[] }
-    return data.collection
+    if (!data) throw new NotFoundException('Connection not found')
   }
-
 }

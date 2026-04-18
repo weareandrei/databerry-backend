@@ -7,7 +7,6 @@ import { AccountsModule } from './accounts/accounts.module'
 import { ViewsModule } from './views/views.module'
 import { WebhooksModule } from './webhooks/webhooks.module'
 import { StripeModule } from './stripe/stripe.module'
-import { StripeManualModule } from './stripe-manual/stripe-manual.module'
 import { CalendlyModule } from './calendly/calendly.module'
 import { GoogleAnalyticsModule } from './google-analytics/google-analytics.module'
 
@@ -21,7 +20,6 @@ import { GoogleAnalyticsModule } from './google-analytics/google-analytics.modul
     ViewsModule,
     WebhooksModule,
     StripeModule,
-    StripeManualModule,
     CalendlyModule,
     GoogleAnalyticsModule,
   ],
