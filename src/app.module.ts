@@ -9,6 +9,7 @@ import { WebhooksModule } from './webhooks/webhooks.module'
 import { StripeModule } from './stripe/stripe.module'
 import { CalendlyModule } from './calendly/calendly.module'
 import { GoogleAnalyticsModule } from './google-analytics/google-analytics.module'
+import { VercelModule } from './vercel/vercel.module'
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { GoogleAnalyticsModule } from './google-analytics/google-analytics.modul
     StripeModule,
     CalendlyModule,
     GoogleAnalyticsModule,
+    VercelModule,
   ],
 })
 export class AppModule {}

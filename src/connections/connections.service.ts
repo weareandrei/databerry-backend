@@ -181,6 +181,14 @@ export class ConnectionsService {
       if (error) throw new Error(error.message)
     } else if (type === 'calendly') {
       // Credentials are inserted directly by CalendlyService.handleOAuthCallback — no-op here
+    } else if (type === 'vercel') {
+      const { error } = await client.from('connections_vercel').insert({
+        connection_id: connectionId,
+        api_token: config.apiToken,
+        project_id: config.projectId,
+        project_name: config.projectName,
+      })
+      if (error) throw new Error(error.message)
     }
   }
 
