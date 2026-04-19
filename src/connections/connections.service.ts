@@ -24,7 +24,7 @@ export class ConnectionsService {
     const { data, error } = await this.supabaseService
       .getClient()
       .from('connections')
-      .select('*, connections_webhook(webhook_id)')
+      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name)')
       .eq('user_id', userId)
       .order('created_at', { ascending: true })
 
@@ -36,7 +36,7 @@ export class ConnectionsService {
     const { data, error } = await this.supabaseService
       .getClient()
       .from('connections')
-      .select('*, connections_webhook(webhook_id)')
+      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name)')
       .eq('id', connectionId)
       .eq('user_id', userId)
       .single()
@@ -194,6 +194,7 @@ export class ConnectionsService {
 
   private toCamel(row: Record<string, unknown>) {
     const webhookRows = row.connections_webhook as { webhook_id: string }[] | null
+    const gaRows = row.connections_google_analytics as { property_id: string | null; property_name: string | null }[] | null
     return {
       id: row.id,
       name: row.name,
@@ -201,6 +202,8 @@ export class ConnectionsService {
       userId: row.user_id,
       createdAt: row.created_at,
       webhookId: webhookRows?.[0]?.webhook_id ?? null,
+      gaPropertyId: gaRows?.[0]?.property_id ?? null,
+      gaPropertyName: gaRows?.[0]?.property_name ?? null,
     }
   }
 }
