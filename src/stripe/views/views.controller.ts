@@ -12,12 +12,14 @@ export class StripeViewsController {
   async getLiveValue(
     @Query('connectionId') connectionId: string,
     @Query('viewType') viewType: string,
+    @Query('date') date: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     const value = await this.stripeViewsService.fetchLiveValue(
       connectionId,
       viewType,
       req.authUser.id,
+      date,
     )
     return { value }
   }

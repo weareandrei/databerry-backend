@@ -16,8 +16,9 @@ export class StripeViewsService {
     private readonly viewsService: ViewsService,
   ) {}
 
-  async fetchLiveValue(connectionId: string, viewType: string, userId: string): Promise<string> {
-    this.logger.log(`\n  ► fetchLiveValue  connectionId=${connectionId}  viewType=${viewType}`)
+  async fetchLiveValue(connectionId: string, viewType: string, userId: string, date?: string): Promise<string> {
+    const targetDate = date ?? new Date().toISOString().split('T')[0]
+    this.logger.log(`\n  ► fetchLiveValue  connectionId=${connectionId}  viewType=${viewType}  date=${targetDate}`)
     const apiKey = await getApiKey(connectionId, userId, this.supabaseService)
     const get = makeStripeGetter(apiKey)
 
@@ -25,13 +26,13 @@ export class StripeViewsService {
     switch (viewType) {
       case 'stripe_revenue_today':
       case 'stripe_gross_today':
-        value = await computeRevenueToday(get)
+        value = await computeRevenueToday(get, targetDate)
         break
       default:
         throw new NotFoundException(`Unknown live view type: ${viewType}`)
     }
 
-    await this.viewsService.upsertValue(connectionId, viewType, value)
+    await this.viewsService.upsertValue(connectionId, viewType, value, targetDate)
     this.logger.log(`  ✓ fetchLiveValue → ${value}`)
     return value
   }

@@ -12,8 +12,10 @@ export class GoogleAnalyticsViewsService {
     private readonly viewsService: ViewsService,
   ) {}
 
-  async fetchLiveValue(connectionId: string, viewType: string, userId: string): Promise<string> {
-    this.logger.log(`\n  ► fetchLiveValue  connectionId=${connectionId}  viewType=${viewType}`)
+  async fetchLiveValue(connectionId: string, viewType: string, userId: string, date?: string): Promise<string> {
+    const targetDate = date ?? new Date().toISOString().split('T')[0]
+    const isToday = targetDate === new Date().toISOString().split('T')[0]
+    this.logger.log(`\n  ► fetchLiveValue  connectionId=${connectionId}  viewType=${viewType}  date=${targetDate}`)
     await this.oauthService.verifyOwnership(connectionId, userId)
     const token = await this.oauthService.ensureFreshToken(connectionId)
     const propertyId = await this.oauthService.getPropertyId(connectionId)
@@ -21,13 +23,19 @@ export class GoogleAnalyticsViewsService {
     let value: string
 
     if (viewType === 'ga_active_users') {
-      value = await fetchRealtimeActiveUsers(token, propertyId)
+      if (!isToday) {
+        // Realtime API only works for the current moment — can't query past dates
+        this.logger.log(`  → ga_active_users requested for past date (${targetDate}) — returning 0`)
+        value = '0'
+      } else {
+        value = await fetchRealtimeActiveUsers(token, propertyId)
+      }
     } else {
       const metricName = metricForViewType(viewType)
-      value = await fetchTodayMetric(token, propertyId, metricName)
+      value = await fetchTodayMetric(token, propertyId, metricName, targetDate)
     }
 
-    await this.viewsService.upsertValue(connectionId, viewType, value)
+    await this.viewsService.upsertValue(connectionId, viewType, value, targetDate)
     this.logger.log(`  ✓ fetchLiveValue → ${value}`)
     return value
   }

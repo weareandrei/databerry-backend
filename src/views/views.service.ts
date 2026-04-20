@@ -206,12 +206,12 @@ export class ViewsService {
     }
   }
 
-  // Shared by StripeManualService, CalendlyService, GoogleAnalyticsService
-  // Upserts today's value for a view and clears needs_sync.
+  // Shared by StripeManualService, CalendlyService, GoogleAnalyticsService, PosthogViewsService
+  // Upserts the value for a view on the given date (defaults to today) and clears needs_sync.
   // Uses insert-then-update-on-conflict to be safe against concurrent calls.
-  async upsertValue(connectionId: string, viewType: string, value: string): Promise<void> {
+  async upsertValue(connectionId: string, viewType: string, value: string, date?: string): Promise<void> {
     const client = this.supabaseService.getClient()
-    const today  = new Date().toISOString().split('T')[0]
+    const targetDate = date ?? new Date().toISOString().split('T')[0]
 
     const { data: view } = await client
       .from('views')
@@ -228,7 +228,7 @@ export class ViewsService {
     const viewId = view.id as string
     const { error } = await client
       .from('views_values')
-      .insert({ view_id: viewId, value, created_at: today, needs_sync: false })
+      .insert({ view_id: viewId, value, created_at: targetDate, needs_sync: false })
 
     if (error?.code === '23505') {
       // Row already exists — update value and clear the sync flag
@@ -236,7 +236,7 @@ export class ViewsService {
         .from('views_values')
         .update({ value, updated_at: new Date().toISOString(), needs_sync: false })
         .eq('view_id', viewId)
-        .eq('created_at', today)
+        .eq('created_at', targetDate)
     }
   }
 

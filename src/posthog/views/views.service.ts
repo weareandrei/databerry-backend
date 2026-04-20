@@ -8,9 +8,10 @@ export class PosthogViewsService {
 
   constructor(private readonly supabaseService: SupabaseService) {}
 
-  async fetchLiveValue(connectionId: string, viewId: string, userId: string): Promise<string> {
+  async fetchLiveValue(connectionId: string, viewId: string, userId: string, date?: string): Promise<string> {
+    const targetDate = date ?? new Date().toISOString().split('T')[0]
     this.logger.log(
-      `\n  ► fetchLiveValue (posthog)\n  connectionId : ${connectionId}\n  viewId       : ${viewId}`,
+      `\n  ► fetchLiveValue (posthog)\n  connectionId : ${connectionId}\n  viewId       : ${viewId}\n  date         : ${targetDate}`,
     )
 
     const client = this.supabaseService.getClient()
@@ -47,9 +48,9 @@ export class PosthogViewsService {
     const ph = await getPosthogCredentials(connectionId, this.supabaseService)
     if (!ph) throw new NotFoundException('PostHog credentials not found')
 
-    // Query today's count via HogQL
+    // Query the target date's count via HogQL
     const safeEvent = eventName.replace(/'/g, "\\'")
-    const hogqlQuery = `SELECT count() FROM events WHERE event = '${safeEvent}' AND toDate(timestamp) = today()`
+    const hogqlQuery = `SELECT count() FROM events WHERE event = '${safeEvent}' AND toDate(timestamp) = toDate('${targetDate}')`
 
     this.logger.log(`  → querying PostHog HogQL: ${hogqlQuery}`)
 
@@ -74,19 +75,18 @@ export class PosthogViewsService {
 
     this.logger.log(`  ✓ today's count: ${value}`)
 
-    // Upsert today's value; clear needs_sync since we just fetched the real count.
+    // Upsert the value for the target date; clear needs_sync since we just fetched the real count.
     // Insert-on-conflict is safe against concurrent calls (unique constraint on view_id+created_at).
-    const today = new Date().toISOString().split('T')[0]
     const { error: insertErr } = await client
       .from('views_values')
-      .insert({ view_id: viewId, value, created_at: today, needs_sync: false })
+      .insert({ view_id: viewId, value, created_at: targetDate, needs_sync: false })
 
     if (insertErr?.code === '23505') {
       await client
         .from('views_values')
         .update({ value, updated_at: new Date().toISOString(), needs_sync: false })
         .eq('view_id', viewId)
-        .eq('created_at', today)
+        .eq('created_at', targetDate)
     }
 
     return value

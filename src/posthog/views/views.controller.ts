@@ -12,9 +12,10 @@ export class PosthogViewsController {
   async getLiveValue(
     @Query('connectionId') connectionId: string,
     @Query('viewId') viewId: string,
+    @Query('date') date: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
-    const value = await this.posthogViewsService.fetchLiveValue(connectionId, viewId, req.authUser.id)
+    const value = await this.posthogViewsService.fetchLiveValue(connectionId, viewId, req.authUser.id, date)
     return { value }
   }
 }
