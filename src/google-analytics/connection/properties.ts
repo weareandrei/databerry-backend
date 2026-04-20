@@ -26,12 +26,13 @@ export class GoogleAnalyticsPropertiesService {
     const prop = properties.find(p => p.id === propertyId)
     if (!prop) throw new NotFoundException(`Property ${propertyId} not found or not accessible`)
 
-    await this.supabaseService
+    const { error } = await this.supabaseService
       .getClient()
       .from('connections_google_analytics')
       .update({ property_id: propertyId, property_name: prop.displayName })
       .eq('connection_id', connectionId)
+    if (error) throw new Error(`Failed to save GA property: ${error.message}`)
 
-    this.logger.log(`Saved GA property ${propertyId} for connection ${connectionId}`)
+    this.logger.log(`Saved GA property ${propertyId} (${prop.displayName}) for connection ${connectionId}`)
   }
 }

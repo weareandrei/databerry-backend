@@ -193,17 +193,27 @@ export class ConnectionsService {
   }
 
   private toCamel(row: Record<string, unknown>) {
-    const webhookRows = row.connections_webhook as { webhook_id: string }[] | null
-    const gaRows = row.connections_google_analytics as { property_id: string | null; property_name: string | null }[] | null
+    // Supabase may return one-to-one embedded resources as a plain object (not array)
+    // when a unique constraint exists on the FK column. Handle both shapes defensively.
+    const webhookRaw = row.connections_webhook
+    const webhookRow = Array.isArray(webhookRaw)
+      ? (webhookRaw as { webhook_id: string }[])[0]
+      : (webhookRaw as { webhook_id: string } | null)
+
+    const gaRaw = row.connections_google_analytics
+    const gaRow = Array.isArray(gaRaw)
+      ? (gaRaw as { property_id: string | null; property_name: string | null }[])[0]
+      : (gaRaw as { property_id: string | null; property_name: string | null } | null)
+
     return {
       id: row.id,
       name: row.name,
       type: row.type,
       userId: row.user_id,
       createdAt: row.created_at,
-      webhookId: webhookRows?.[0]?.webhook_id ?? null,
-      gaPropertyId: gaRows?.[0]?.property_id ?? null,
-      gaPropertyName: gaRows?.[0]?.property_name ?? null,
+      webhookId: webhookRow?.webhook_id ?? null,
+      gaPropertyId: gaRow?.property_id ?? null,
+      gaPropertyName: gaRow?.property_name ?? null,
     }
   }
 }
