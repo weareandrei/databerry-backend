@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common'
+import { ScheduleModule } from '@nestjs/schedule'
 import { SupabaseModule } from './supabase/supabase.module'
 import { ProjectsModule } from './projects/projects.module'
 import { FoldersModule } from './folders/folders.module'
@@ -10,9 +11,11 @@ import { StripeModule } from './stripe/stripe.module'
 import { CalendlyModule } from './calendly/calendly.module'
 import { GoogleAnalyticsModule } from './google-analytics/google-analytics.module'
 import { VercelModule } from './vercel/vercel.module'
+import { SchedulerModule } from './scheduler/scheduler.module'
 
 @Module({
   imports: [
+    ScheduleModule.forRoot(),
     SupabaseModule,
     ProjectsModule,
     FoldersModule,
@@ -24,6 +27,7 @@ import { VercelModule } from './vercel/vercel.module'
     CalendlyModule,
     GoogleAnalyticsModule,
     VercelModule,
+    SchedulerModule,
   ],
 })
 export class AppModule {}

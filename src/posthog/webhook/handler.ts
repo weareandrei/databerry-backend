@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
+import { markNeedsSync } from '../../views/views-sync.helper'
 
 @Injectable()
 export class PosthogWebhookService {
@@ -19,6 +20,7 @@ export class PosthogWebhookService {
     )
 
     const client = this.supabaseService.getClient()
+    const today = new Date().toISOString().split('T')[0]
 
     const { data: view, error: viewError } = await client
       .from('views')
@@ -35,47 +37,10 @@ export class PosthogWebhookService {
     this.logger.log(`  → view type : ${viewType}`)
 
     if (viewType === 'daily_counter') {
-      await this.incrementDailyCounter(viewId, client)
+      await markNeedsSync(viewId, today, client)
+      this.logger.log(`  ✓ marked needs_sync for viewId=${viewId} date=${today}`)
     } else {
       this.logger.warn(`  ⚠ Unknown view type "${viewType}" — skipping`)
-    }
-  }
-
-  private async incrementDailyCounter(
-    viewId: string,
-    client: ReturnType<SupabaseService['getClient']>,
-  ): Promise<void> {
-    const today = new Date().toISOString().split('T')[0]
-
-    const { data: existing } = await client
-      .from('views_values')
-      .select('id, value')
-      .eq('view_id', viewId)
-      .eq('created_at', today)
-      .maybeSingle()
-
-    if (existing) {
-      const newValue = (parseInt(existing.value as string, 10) || 0) + 1
-      const { error } = await client
-        .from('views_values')
-        .update({ value: String(newValue), updated_at: new Date().toISOString() })
-        .eq('id', existing.id)
-
-      if (error) {
-        this.logger.error(`  ✗ Failed to update daily counter\n  ${error.message}`)
-        return
-      }
-      this.logger.log(`  ✓ daily counter updated → ${newValue}`)
-    } else {
-      const { error } = await client
-        .from('views_values')
-        .insert({ view_id: viewId, value: '1', created_at: today })
-
-      if (error) {
-        this.logger.error(`  ✗ Failed to create daily counter\n  ${error.message}`)
-        return
-      }
-      this.logger.log(`  ✓ daily counter created → 1`)
     }
   }
 }

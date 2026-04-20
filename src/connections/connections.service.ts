@@ -24,7 +24,7 @@ export class ConnectionsService {
     const { data, error } = await this.supabaseService
       .getClient()
       .from('connections')
-      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name)')
+      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name), connections_vercel(project_name)')
       .eq('user_id', userId)
       .order('created_at', { ascending: true })
 
@@ -36,7 +36,7 @@ export class ConnectionsService {
     const { data, error } = await this.supabaseService
       .getClient()
       .from('connections')
-      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name)')
+      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name), connections_vercel(project_name)')
       .eq('id', connectionId)
       .eq('user_id', userId)
       .single()
@@ -205,6 +205,11 @@ export class ConnectionsService {
       ? (gaRaw as { property_id: string | null; property_name: string | null }[])[0]
       : (gaRaw as { property_id: string | null; property_name: string | null } | null)
 
+    const vercelRaw = row.connections_vercel
+    const vercelRow = Array.isArray(vercelRaw)
+      ? (vercelRaw as { project_name: string | null }[])[0]
+      : (vercelRaw as { project_name: string | null } | null)
+
     return {
       id: row.id,
       name: row.name,
@@ -214,6 +219,7 @@ export class ConnectionsService {
       webhookId: webhookRow?.webhook_id ?? null,
       gaPropertyId: gaRow?.property_id ?? null,
       gaPropertyName: gaRow?.property_name ?? null,
+      vercelProjectName: vercelRow?.project_name ?? null,
     }
   }
 }

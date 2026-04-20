@@ -207,6 +207,8 @@ export class ViewsService {
   }
 
   // Shared by StripeManualService, CalendlyService, GoogleAnalyticsService
+  // Upserts today's value for a view and clears needs_sync.
+  // Uses insert-then-update-on-conflict to be safe against concurrent calls.
   async upsertValue(connectionId: string, viewType: string, value: string): Promise<void> {
     const client = this.supabaseService.getClient()
     const today  = new Date().toISOString().split('T')[0]
@@ -224,20 +226,17 @@ export class ViewsService {
     }
 
     const viewId = view.id as string
-    const { data: existing } = await client
+    const { error } = await client
       .from('views_values')
-      .select('id')
-      .eq('view_id', viewId)
-      .eq('created_at', today)
-      .maybeSingle()
+      .insert({ view_id: viewId, value, created_at: today, needs_sync: false })
 
-    if (existing) {
+    if (error?.code === '23505') {
+      // Row already exists — update value and clear the sync flag
       await client
         .from('views_values')
-        .update({ value, updated_at: new Date().toISOString() })
-        .eq('id', existing.id)
-    } else {
-      await client.from('views_values').insert({ view_id: viewId, value, created_at: today })
+        .update({ value, updated_at: new Date().toISOString(), needs_sync: false })
+        .eq('view_id', viewId)
+        .eq('created_at', today)
     }
   }
 
@@ -252,11 +251,6 @@ export class ViewsService {
     let filtered = values
     if (dateFrom) filtered = filtered.filter(v => v.created_at.slice(0, 10) >= dateFrom)
     if (dateTo)   filtered = filtered.filter(v => v.created_at.slice(0, 10) <= dateTo)
-
-    // Special case: webhook_append (PostHog) — count records in range; 0 when none
-    if (viewType === 'webhook_append') {
-      return String(filtered.length)
-    }
 
     if (filtered.length === 0) return '0'
 

@@ -59,9 +59,12 @@ export class CustomWebhookService {
       `\n  ► handleCustomWebhook\n  webhookId    : ${webhookId}\n  connectionId : ${connectionId}\n  views        : ${views.length}`,
     )
 
+    const today = new Date().toISOString().split('T')[0]
+
     for (const view of views as { id: string; type: string; config: Record<string, unknown> }[]) {
-      if (view.type === 'webhook_counter') {
-        await this.incrementDailyCounter(view.id, client)
+      if (view.type === 'webhook_counter' || view.type === 'webhook_append') {
+        // webhook_append now uses the same single-row-per-day counter pattern as webhook_counter
+        await this.incrementDailyCounter(view.id, today, client)
       } else if (view.type === 'webhook_gauge') {
         const field = (view.config?.field as string) ?? 'value'
         const raw = body[field]
@@ -71,55 +74,41 @@ export class CustomWebhookService {
           )
           continue
         }
-        await this.storeGaugeValue(view.id, String(raw), client)
-      } else if (view.type === 'webhook_append') {
-        const field = (view.config?.field as string) ?? 'value'
-        const raw = body[field]
-        if (raw == null) {
-          this.logger.warn(
-            `  ⚠ Field "${field}" not found in body — skipping append view ${view.id}`,
-          )
-          continue
-        }
-        await this.appendValue(view.id, String(raw), client)
+        await this.storeGaugeValue(view.id, String(raw), today, client)
       }
     }
   }
 
   private async incrementDailyCounter(
     viewId: string,
+    today: string,
     client: ReturnType<SupabaseService['getClient']>,
   ): Promise<void> {
-    const today = new Date().toISOString().split('T')[0]
-
-    const { data: existing } = await client
+    // Try to insert a new counter row. On conflict (row exists), increment instead.
+    const { error: insertError } = await client
       .from('views_values')
-      .select('id, value')
-      .eq('view_id', viewId)
-      .eq('created_at', today)
-      .maybeSingle()
+      .insert({ view_id: viewId, value: '1', created_at: today, needs_sync: false })
 
-    if (existing) {
-      const newValue = (parseInt(existing.value as string, 10) || 0) + 1
-      const { error } = await client
+    if (insertError?.code === '23505') {
+      // Row exists — fetch current value and increment
+      const { data: existing } = await client
         .from('views_values')
-        .update({ value: String(newValue), updated_at: new Date().toISOString() })
-        .eq('id', existing.id)
+        .select('id, value')
+        .eq('view_id', viewId)
+        .eq('created_at', today)
+        .maybeSingle()
 
-      if (error) {
-        this.logger.error(`  ✗ Failed to update daily counter\n  ${error.message}`)
-        return
+      if (existing) {
+        const newValue = (parseInt(existing.value as string, 10) || 0) + 1
+        await client
+          .from('views_values')
+          .update({ value: String(newValue), updated_at: new Date().toISOString() })
+          .eq('id', existing.id)
+        this.logger.log(`  ✓ daily counter incremented → ${newValue}`)
       }
-      this.logger.log(`  ✓ daily counter updated → ${newValue}`)
+    } else if (insertError) {
+      this.logger.error(`  ✗ Failed to create daily counter\n  ${insertError.message}`)
     } else {
-      const { error } = await client
-        .from('views_values')
-        .insert({ view_id: viewId, value: '1', created_at: today })
-
-      if (error) {
-        this.logger.error(`  ✗ Failed to create daily counter\n  ${error.message}`)
-        return
-      }
       this.logger.log(`  ✓ daily counter created → 1`)
     }
   }
@@ -127,36 +116,24 @@ export class CustomWebhookService {
   private async storeGaugeValue(
     viewId: string,
     value: string,
+    today: string,
     client: ReturnType<SupabaseService['getClient']>,
   ): Promise<void> {
-    const today = new Date().toISOString().split('T')[0]
-
-    const { data: existing } = await client
+    const { error: insertError } = await client
       .from('views_values')
-      .select('id')
-      .eq('view_id', viewId)
-      .eq('created_at', today)
-      .maybeSingle()
+      .insert({ view_id: viewId, value, created_at: today, needs_sync: false })
 
-    if (existing) {
+    if (insertError?.code === '23505') {
       await client
         .from('views_values')
         .update({ value, updated_at: new Date().toISOString() })
-        .eq('id', existing.id)
+        .eq('view_id', viewId)
+        .eq('created_at', today)
       this.logger.log(`  ✓ gauge updated → ${value}`)
+    } else if (insertError) {
+      this.logger.error(`  ✗ Failed to store gauge value\n  ${insertError.message}`)
     } else {
-      await client.from('views_values').insert({ view_id: viewId, value, created_at: today })
       this.logger.log(`  ✓ gauge created → ${value}`)
     }
-  }
-
-  private async appendValue(
-    viewId: string,
-    value: string,
-    client: ReturnType<SupabaseService['getClient']>,
-  ): Promise<void> {
-    const today = new Date().toISOString().split('T')[0]
-    await client.from('views_values').insert({ view_id: viewId, value, created_at: today })
-    this.logger.log(`  ✓ appended → ${value}`)
   }
 }

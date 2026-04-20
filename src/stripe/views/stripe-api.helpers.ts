@@ -62,8 +62,24 @@ export function makeStripeGetter(apiKey: string): StripeGetter {
   }
 }
 
-/** Paginates through Stripe charges from `createdGte` and returns the total sum in cents. */
-export async function sumCharges(get: StripeGetter, createdGte: number): Promise<string> {
+/** Fetches the Stripe manual API key for a connection without user ownership check (for internal/scheduler use). */
+export async function getApiKeyInternal(
+  connectionId: string,
+  supabaseService: SupabaseService,
+): Promise<string> {
+  const { data } = await supabaseService
+    .getClient()
+    .from('connections_stripe_manual')
+    .select('api_key')
+    .eq('connection_id', connectionId)
+    .maybeSingle()
+
+  if (!data) throw new Error('Stripe manual credentials not found')
+  return data.api_key as string
+}
+
+/** Paginates through Stripe charges from `createdGte` (optionally up to `createdLt`) and returns the total sum in cents. */
+export async function sumCharges(get: StripeGetter, createdGte: number, createdLt?: number): Promise<string> {
   let total = 0
   let hasMore = true
   let startingAfter: string | undefined
@@ -73,6 +89,7 @@ export async function sumCharges(get: StripeGetter, createdGte: number): Promise
       'created[gte]': String(createdGte),
       limit: '100',
     }
+    if (createdLt !== undefined) params['created[lt]'] = String(createdLt)
     if (startingAfter) params['starting_after'] = startingAfter
 
     const data = (await get('charges', params)) as unknown as StripeChargePage

@@ -74,22 +74,19 @@ export class PosthogViewsService {
 
     this.logger.log(`  ✓ today's count: ${value}`)
 
-    // Upsert into views_values for today
+    // Upsert today's value; clear needs_sync since we just fetched the real count.
+    // Insert-on-conflict is safe against concurrent calls (unique constraint on view_id+created_at).
     const today = new Date().toISOString().split('T')[0]
-    const { data: existing } = await client
+    const { error: insertErr } = await client
       .from('views_values')
-      .select('id')
-      .eq('view_id', viewId)
-      .eq('created_at', today)
-      .maybeSingle()
+      .insert({ view_id: viewId, value, created_at: today, needs_sync: false })
 
-    if (existing) {
+    if (insertErr?.code === '23505') {
       await client
         .from('views_values')
-        .update({ value, updated_at: new Date().toISOString() })
-        .eq('id', existing.id)
-    } else {
-      await client.from('views_values').insert({ view_id: viewId, value, created_at: today })
+        .update({ value, updated_at: new Date().toISOString(), needs_sync: false })
+        .eq('view_id', viewId)
+        .eq('created_at', today)
     }
 
     return value
