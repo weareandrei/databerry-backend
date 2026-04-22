@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common'
 import { SupabaseModule } from '../supabase/supabase.module'
 import { UserSettingsModule } from '../user-settings/user-settings.module'
+import { ProjectSettingsModule } from '../project-settings/project-settings.module'
 import { GoogleAnalyticsModule } from '../google-analytics/google-analytics.module'
 import { GoogleAnalyticsConnectionModule } from '../google-analytics/connection/connection.module'
 import { PosthogModule } from '../posthog/posthog.module'
@@ -12,6 +13,7 @@ import { ProjectOverviewService } from './project-overview.service'
   imports: [
     SupabaseModule,
     UserSettingsModule,
+    ProjectSettingsModule,
     GoogleAnalyticsModule,
     GoogleAnalyticsConnectionModule,
     PosthogModule,

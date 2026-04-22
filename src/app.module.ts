@@ -13,6 +13,7 @@ import { GoogleAnalyticsModule } from './google-analytics/google-analytics.modul
 import { VercelModule } from './vercel/vercel.module'
 import { SchedulerModule } from './scheduler/scheduler.module'
 import { UserSettingsModule } from './user-settings/user-settings.module'
+import { ProjectSettingsModule } from './project-settings/project-settings.module'
 import { ProjectOverviewModule } from './project-overview/project-overview.module'
 
 @Module({
@@ -31,6 +32,7 @@ import { ProjectOverviewModule } from './project-overview/project-overview.modul
     VercelModule,
     SchedulerModule,
     UserSettingsModule,
+    ProjectSettingsModule,
     ProjectOverviewModule,
   ],
 })

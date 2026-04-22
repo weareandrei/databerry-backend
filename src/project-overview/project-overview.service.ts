@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { SupabaseService } from '../supabase/supabase.service'
 import { UserSettingsService } from '../user-settings/user-settings.service'
+import { ProjectSettingsService } from '../project-settings/project-settings.service'
 import { GoogleAnalyticsOAuthService } from '../google-analytics/connection/oauth'
 import { getPosthogCredentials } from '../posthog/connection/credentials'
 import {
@@ -134,6 +135,7 @@ export class ProjectOverviewService {
   constructor(
     private readonly supabaseService: SupabaseService,
     private readonly userSettingsService: UserSettingsService,
+    private readonly projectSettingsService: ProjectSettingsService,
     private readonly gaOAuthService: GoogleAnalyticsOAuthService,
   ) {}
 
@@ -205,7 +207,7 @@ export class ProjectOverviewService {
     const gran = this.granularity(mode)
 
     const provider = await this.pickTrafficProvider(userId)
-    const settings = await this.userSettingsService.get(userId)
+    const projectSettings = await this.projectSettingsService.get(projectId, userId)
 
     // Accumulators keyed by bucket index
     const byBucketTotal: number[] = new Array(buckets.length).fill(0)
@@ -256,15 +258,15 @@ export class ProjectOverviewService {
         }
       }
     } else if (primaryMetric === 'conversions') {
-      if (!settings.conversionConnectionId || !settings.conversionEvent) {
+      if (!projectSettings.conversionConnectionId || !projectSettings.conversionEvent) {
         primaryUnavailable = true
       } else {
         try {
-          const ph = await getPosthogCredentials(settings.conversionConnectionId, this.supabaseService)
+          const ph = await getPosthogCredentials(projectSettings.conversionConnectionId, this.supabaseService)
           if (ph) {
             const rows = await fetchPosthogEventCountByBucket(
               ph,
-              settings.conversionEvent,
+              projectSettings.conversionEvent,
               dateFrom,
               dateTo,
               gran,
@@ -344,7 +346,7 @@ export class ProjectOverviewService {
         }
       }
     } else if (secondaryMetric === 'conversion_rate') {
-      if (!provider || !settings.conversionConnectionId || !settings.conversionEvent) {
+      if (!provider || !projectSettings.conversionConnectionId || !projectSettings.conversionEvent) {
         secondaryUnavailable = true
       } else {
         try {
@@ -373,12 +375,12 @@ export class ProjectOverviewService {
             }
           }
 
-          const ph = await getPosthogCredentials(settings.conversionConnectionId, this.supabaseService)
+          const ph = await getPosthogCredentials(projectSettings.conversionConnectionId, this.supabaseService)
           let conversionsByKey = new Map<string, number>()
           if (ph) {
             const rows = await fetchPosthogEventCountByBucket(
               ph,
-              settings.conversionEvent,
+              projectSettings.conversionEvent,
               dateFrom,
               dateTo,
               gran,

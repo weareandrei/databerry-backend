@@ -43,8 +43,9 @@ export class ProjectsService {
     if (error) throw new Error(error.message)
     const project = this.toCamel(data)
 
-    // Best-effort: auto-create the composite "Overview" view at the project root.
-    // A failure here must not prevent the project from being created.
+    // Best-effort: auto-create the composite "Overview" views at the project root.
+    // The overview is split into two independently-managed views: the chart and the
+    // sources panel. Both are created together, but can be removed independently.
     try {
       await this.viewsService.createView(
         {
@@ -59,7 +60,23 @@ export class ProjectsService {
         userId,
       )
     } catch (err) {
-      this.logger.warn(`Failed to auto-create overview view for project ${project.id}: ${String(err)}`)
+      this.logger.warn(`Failed to auto-create overview chart view for project ${project.id}: ${String(err)}`)
+    }
+    try {
+      await this.viewsService.createView(
+        {
+          projectId: project.id as string,
+          folderId: undefined,
+          connectionId: null,
+          connectionType: 'composite',
+          type: 'project_overview_sources',
+          name: 'Sources',
+          config: { sourcesLimit: 10 },
+        },
+        userId,
+      )
+    } catch (err) {
+      this.logger.warn(`Failed to auto-create overview sources view for project ${project.id}: ${String(err)}`)
     }
 
     return project

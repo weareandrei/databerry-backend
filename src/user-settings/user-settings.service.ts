@@ -3,15 +3,11 @@ import { SupabaseService } from '../supabase/supabase.service'
 
 export interface UpdateUserSettingsDto {
   preferredTrafficConnectionId?: string | null
-  conversionConnectionId?: string | null
-  conversionEvent?: string | null
 }
 
 export interface UserSettings {
   userId: string
   preferredTrafficConnectionId: string | null
-  conversionConnectionId: string | null
-  conversionEvent: string | null
 }
 
 @Injectable()
@@ -35,8 +31,6 @@ export class UserSettingsService {
       return {
         userId,
         preferredTrafficConnectionId: null,
-        conversionConnectionId: null,
-        conversionEvent: null,
       }
     }
 
@@ -50,9 +44,6 @@ export class UserSettingsService {
     }
     if (dto.preferredTrafficConnectionId !== undefined)
       patch.preferred_traffic_connection_id = dto.preferredTrafficConnectionId
-    if (dto.conversionConnectionId !== undefined)
-      patch.conversion_connection_id = dto.conversionConnectionId
-    if (dto.conversionEvent !== undefined) patch.conversion_event = dto.conversionEvent
 
     const { data, error } = await this.supabaseService
       .getClient()
@@ -70,8 +61,6 @@ export class UserSettingsService {
     return {
       userId: row.user_id as string,
       preferredTrafficConnectionId: (row.preferred_traffic_connection_id as string | null) ?? null,
-      conversionConnectionId: (row.conversion_connection_id as string | null) ?? null,
-      conversionEvent: (row.conversion_event as string | null) ?? null,
     }
   }
 }
