@@ -5,7 +5,7 @@ import { PosthogLifecycleService } from '../posthog/lifecycle/hog-function'
 export interface CreateViewDto {
   projectId: string
   folderId?: string
-  connectionId: string
+  connectionId?: string | null
   connectionType: string
   type: string
   name: string
@@ -101,7 +101,7 @@ export class ViewsService {
     const baseInsert = {
       project_id: dto.projectId,
       folder_id: dto.folderId ?? null,
-      connection_id: dto.connectionId,
+      connection_id: dto.connectionId ?? null,
       connection_type: dto.connectionType,
       type: dto.type,
       name: dto.name,
@@ -126,6 +126,9 @@ export class ViewsService {
         throw new Error(tempError.message)
       }
 
+      if (!dto.connectionId) {
+        throw new Error('PostHog views require a connectionId')
+      }
       const hogFunctionId = await this.posthogLifecycleService.createHogFunction(
         dto.connectionId,
         tempView.id as string,
@@ -164,6 +167,42 @@ export class ViewsService {
     }
 
     this.logger.log(`  ✓ view created  id: ${data.id}`)
+    return this.toCamel(data)
+  }
+
+  async updateView(
+    viewId: string,
+    dto: { config?: Record<string, unknown>; name?: string },
+    userId: string,
+  ) {
+    const patch: Record<string, unknown> = {}
+    if (dto.config !== undefined) patch.config = dto.config
+    if (dto.name !== undefined) patch.name = dto.name
+
+    if (Object.keys(patch).length === 0) {
+      // No-op — return current row
+      const { data } = await this.supabaseService
+        .getClient()
+        .from('views')
+        .select('*, views_values(value, created_at)')
+        .eq('id', viewId)
+        .eq('user_id', userId)
+        .single()
+      if (!data) throw new NotFoundException('View not found')
+      return this.toCamel(data)
+    }
+
+    const { data, error } = await this.supabaseService
+      .getClient()
+      .from('views')
+      .update(patch)
+      .eq('id', viewId)
+      .eq('user_id', userId)
+      .select('*, views_values(value, created_at)')
+      .single()
+
+    if (error || !data) throw new NotFoundException('View not found')
+    this.logger.log(`  ✓ view updated  id: ${viewId}`)
     return this.toCamel(data)
   }
 

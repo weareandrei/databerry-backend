@@ -1,6 +1,7 @@
 import {
   Controller,
   Get,
+  Patch,
   Post,
   Delete,
   Param,
@@ -49,6 +50,15 @@ export class ViewsController {
   @Post()
   create(@Body() dto: CreateViewDto, @Req() req: AuthenticatedRequest) {
     return this.viewsService.createView(dto, req.authUser.id)
+  }
+
+  @Patch(':id')
+  update(
+    @Param('id') id: string,
+    @Body() dto: { config?: Record<string, unknown>; name?: string },
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.viewsService.updateView(id, dto, req.authUser.id)
   }
 
   @Post(':id/pin')

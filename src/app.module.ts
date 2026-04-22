@@ -12,6 +12,8 @@ import { CalendlyModule } from './calendly/calendly.module'
 import { GoogleAnalyticsModule } from './google-analytics/google-analytics.module'
 import { VercelModule } from './vercel/vercel.module'
 import { SchedulerModule } from './scheduler/scheduler.module'
+import { UserSettingsModule } from './user-settings/user-settings.module'
+import { ProjectOverviewModule } from './project-overview/project-overview.module'
 
 @Module({
   imports: [
@@ -28,6 +30,8 @@ import { SchedulerModule } from './scheduler/scheduler.module'
     GoogleAnalyticsModule,
     VercelModule,
     SchedulerModule,
+    UserSettingsModule,
+    ProjectOverviewModule,
   ],
 })
 export class AppModule {}

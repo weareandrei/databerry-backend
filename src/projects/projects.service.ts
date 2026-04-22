@@ -1,5 +1,6 @@
-import { Injectable, NotFoundException } from '@nestjs/common'
+import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { SupabaseService } from '../supabase/supabase.service'
+import { ViewsService } from '../views/views.service'
 
 export interface CreateProjectDto {
   name: string
@@ -12,7 +13,12 @@ export interface UpdateProjectDto {
 
 @Injectable()
 export class ProjectsService {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  private readonly logger = new Logger(ProjectsService.name)
+
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly viewsService: ViewsService,
+  ) {}
 
   async getProjects(userId: string) {
     const { data, error } = await this.supabaseService
@@ -35,7 +41,28 @@ export class ProjectsService {
       .single()
 
     if (error) throw new Error(error.message)
-    return this.toCamel(data)
+    const project = this.toCamel(data)
+
+    // Best-effort: auto-create the composite "Overview" view at the project root.
+    // A failure here must not prevent the project from being created.
+    try {
+      await this.viewsService.createView(
+        {
+          projectId: project.id as string,
+          folderId: undefined,
+          connectionId: null,
+          connectionType: 'composite',
+          type: 'project_overview',
+          name: 'Overview',
+          config: { primaryMetric: 'visitors', secondaryMetric: null },
+        },
+        userId,
+      )
+    } catch (err) {
+      this.logger.warn(`Failed to auto-create overview view for project ${project.id}: ${String(err)}`)
+    }
+
+    return project
   }
 
   async updateProject(projectId: string, dto: UpdateProjectDto, userId: string) {
