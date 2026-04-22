@@ -12,10 +12,22 @@ export class GoogleAnalyticsViewsService {
     private readonly viewsService: ViewsService,
   ) {}
 
-  async fetchLiveValue(connectionId: string, viewType: string, userId: string, date?: string): Promise<string> {
-    const targetDate = date ?? new Date().toISOString().split('T')[0]
-    const isToday = targetDate === new Date().toISOString().split('T')[0]
-    this.logger.log(`\n  ► fetchLiveValue  connectionId=${connectionId}  viewType=${viewType}  date=${targetDate}`)
+  async fetchLiveValue(
+    connectionId: string,
+    viewType: string,
+    userId: string,
+    dateFrom?: string,
+    dateTo?: string,
+  ): Promise<{ value: string | null; unavailable?: boolean }> {
+    const todayStr = new Date().toISOString().split('T')[0]
+    const from = dateFrom ?? todayStr
+    const to = dateTo ?? from
+    const isToday = from === todayStr && to === todayStr
+    const isSingleDay = from === to
+
+    this.logger.log(
+      `\n  ► fetchLiveValue  connectionId=${connectionId}  viewType=${viewType}  dateFrom=${from}  dateTo=${to}`,
+    )
     await this.oauthService.verifyOwnership(connectionId, userId)
     const token = await this.oauthService.ensureFreshToken(connectionId)
     const propertyId = await this.oauthService.getPropertyId(connectionId)
@@ -24,19 +36,22 @@ export class GoogleAnalyticsViewsService {
 
     if (viewType === 'ga_active_users') {
       if (!isToday) {
-        // Realtime API only works for the current moment — can't query past dates
-        this.logger.log(`  → ga_active_users requested for past date (${targetDate}) — returning 0`)
-        value = '0'
-      } else {
-        value = await fetchRealtimeActiveUsers(token, propertyId)
+        // Realtime API only produces a current snapshot — no past-range equivalent.
+        this.logger.log(`  → ga_active_users requested for non-today range — unavailable`)
+        return { value: null, unavailable: true }
       }
+      value = await fetchRealtimeActiveUsers(token, propertyId)
     } else {
       const metricName = metricForViewType(viewType)
-      value = await fetchTodayMetric(token, propertyId, metricName, targetDate)
+      value = await fetchTodayMetric(token, propertyId, metricName, from, to)
     }
 
-    await this.viewsService.upsertValue(connectionId, viewType, value, targetDate)
+    // Only persist stored daily values for single-day queries.
+    if (isSingleDay) {
+      await this.viewsService.upsertValue(connectionId, viewType, value, from)
+    }
+
     this.logger.log(`  ✓ fetchLiveValue → ${value}`)
-    return value
+    return { value }
   }
 }

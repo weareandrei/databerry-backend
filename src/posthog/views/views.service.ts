@@ -8,10 +8,20 @@ export class PosthogViewsService {
 
   constructor(private readonly supabaseService: SupabaseService) {}
 
-  async fetchLiveValue(connectionId: string, viewId: string, userId: string, date?: string): Promise<string> {
-    const targetDate = date ?? new Date().toISOString().split('T')[0]
+  async fetchLiveValue(
+    connectionId: string,
+    viewId: string,
+    userId: string,
+    dateFrom?: string,
+    dateTo?: string,
+  ): Promise<{ value: string | null; unavailable?: boolean }> {
+    const todayStr = new Date().toISOString().split('T')[0]
+    const from = dateFrom ?? todayStr
+    const to = dateTo ?? from
+    const isSingleDay = from === to
+
     this.logger.log(
-      `\n  ► fetchLiveValue (posthog)\n  connectionId : ${connectionId}\n  viewId       : ${viewId}\n  date         : ${targetDate}`,
+      `\n  ► fetchLiveValue (posthog)\n  connectionId : ${connectionId}\n  viewId       : ${viewId}\n  dateFrom     : ${from}\n  dateTo       : ${to}`,
     )
 
     const client = this.supabaseService.getClient()
@@ -41,16 +51,17 @@ export class PosthogViewsService {
 
     if (!eventName) {
       this.logger.warn(`  ⚠ No eventName in view config — returning 0`)
-      return '0'
+      return { value: '0' }
     }
 
     // Get PostHog credentials
     const ph = await getPosthogCredentials(connectionId, this.supabaseService)
     if (!ph) throw new NotFoundException('PostHog credentials not found')
 
-    // Query the target date's count via HogQL
     const safeEvent = eventName.replace(/'/g, "\\'")
-    const hogqlQuery = `SELECT count() FROM events WHERE event = '${safeEvent}' AND toDate(timestamp) = toDate('${targetDate}')`
+    const safeFrom = from.replace(/'/g, '')
+    const safeTo = to.replace(/'/g, '')
+    const hogqlQuery = `SELECT count() FROM events WHERE event = '${safeEvent}' AND toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')`
 
     this.logger.log(`  → querying PostHog HogQL: ${hogqlQuery}`)
 
@@ -73,22 +84,23 @@ export class PosthogViewsService {
     const count = json.results?.[0]?.[0] ?? 0
     const value = String(count)
 
-    this.logger.log(`  ✓ today's count: ${value}`)
+    this.logger.log(`  ✓ range count: ${value}`)
 
-    // Upsert the value for the target date; clear needs_sync since we just fetched the real count.
-    // Insert-on-conflict is safe against concurrent calls (unique constraint on view_id+created_at).
-    const { error: insertErr } = await client
-      .from('views_values')
-      .insert({ view_id: viewId, value, created_at: targetDate, needs_sync: false })
-
-    if (insertErr?.code === '23505') {
-      await client
+    // Only persist to views_values for single-day queries (daily table).
+    if (isSingleDay) {
+      const { error: insertErr } = await client
         .from('views_values')
-        .update({ value, updated_at: new Date().toISOString(), needs_sync: false })
-        .eq('view_id', viewId)
-        .eq('created_at', targetDate)
+        .insert({ view_id: viewId, value, created_at: from, needs_sync: false })
+
+      if (insertErr?.code === '23505') {
+        await client
+          .from('views_values')
+          .update({ value, updated_at: new Date().toISOString(), needs_sync: false })
+          .eq('view_id', viewId)
+          .eq('created_at', from)
+      }
     }
 
-    return value
+    return { value }
   }
 }

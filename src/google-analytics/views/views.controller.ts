@@ -12,15 +12,16 @@ export class GoogleAnalyticsViewsController {
   async getLiveValue(
     @Query('connectionId') connectionId: string,
     @Query('viewType') viewType: string,
-    @Query('date') date: string | undefined,
+    @Query('dateFrom') dateFrom: string | undefined,
+    @Query('dateTo') dateTo: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
-    const value = await this.gaViewsService.fetchLiveValue(
+    return this.gaViewsService.fetchLiveValue(
       connectionId,
       viewType,
       req.authUser.id,
-      date,
+      dateFrom,
+      dateTo,
     )
-    return { value }
   }
 }

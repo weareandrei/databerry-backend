@@ -12,24 +12,31 @@ export class CalendlyViewsController {
   async getLiveValue(
     @Query('connectionId') connectionId: string,
     @Query('viewType') viewType: string,
+    @Query('dateFrom') dateFrom: string | undefined,
+    @Query('dateTo') dateTo: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
-    const value = await this.calendlyViewsService.fetchLiveValue(
+    return this.calendlyViewsService.fetchLiveValue(
       connectionId,
       viewType,
       req.authUser.id,
+      dateFrom,
+      dateTo,
     )
-    return { value }
   }
 
   @Get('meetings-list')
   async getMeetingsList(
     @Query('connectionId') connectionId: string,
+    @Query('dateFrom') dateFrom: string | undefined,
+    @Query('dateTo') dateTo: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     const meetings = await this.calendlyViewsService.fetchMeetingsList(
       connectionId,
       req.authUser.id,
+      dateFrom,
+      dateTo,
     )
     return { meetings }
   }

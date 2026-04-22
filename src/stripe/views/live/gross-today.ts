@@ -1,31 +1,51 @@
 import { fetchChargesSince } from '../stripe-api.helpers'
 import type { StripeGetter, ChartPoint } from '../stripe-api.helpers'
 
+const fmtHour = (h: number) => {
+  if (h === 0) return '12am'
+  if (h < 12) return `${h}am`
+  if (h === 12) return '12pm'
+  return `${h - 12}pm`
+}
+
 /**
- * stripe_gross_today
- * Builds an hourly chart of Stripe charges from midnight UTC to now.
- * Returns an array of { label: "1am", value: cents } points.
+ * Hourly chart of Stripe charges for a single UTC day.
+ * When `dateStr` is today, buckets stop at the current hour (same as the old stripe_gross_today behaviour);
+ * for past days, all 24 hours are returned.
  */
-export async function computeGrossToday(get: StripeGetter): Promise<ChartPoint[]> {
-  const now = new Date()
-  const todayUnix = Math.floor(new Date(now).setUTCHours(0, 0, 0, 0) / 1000)
-  const currentHour = new Date().getUTCHours()
+export async function computeHourlyGross(get: StripeGetter, dateStr?: string): Promise<ChartPoint[]> {
+  const todayStart = new Date()
+  todayStart.setUTCHours(0, 0, 0, 0)
+  const todayUnix = Math.floor(todayStart.getTime() / 1000)
 
-  const charges = await fetchChargesSince(get, todayUnix)
+  let dayStart: number
+  let isToday: boolean
+  if (!dateStr) {
+    dayStart = todayUnix
+    isToday = true
+  } else {
+    dayStart = Math.floor(new Date(dateStr + 'T00:00:00Z').getTime() / 1000)
+    isToday = dayStart === todayUnix
+  }
+  const dayEnd = dayStart + 86_400
 
-  const buckets: number[] = new Array(currentHour + 1).fill(0)
+  const charges = await fetchChargesSince(get, dayStart, dayEnd)
+
+  const hoursInBucket = isToday ? new Date().getUTCHours() + 1 : 24
+  const buckets: number[] = new Array(hoursInBucket).fill(0)
+
   for (const c of charges) {
     if (c.status !== 'succeeded') continue
     const hour = new Date(c.created * 1000).getUTCHours()
-    if (hour <= currentHour) buckets[hour] += c.amount
-  }
-
-  const fmtHour = (h: number) => {
-    if (h === 0) return '12am'
-    if (h < 12) return `${h}am`
-    if (h === 12) return '12pm'
-    return `${h - 12}pm`
+    if (hour < hoursInBucket) buckets[hour] += c.amount
   }
 
   return buckets.map((value, h) => ({ label: fmtHour(h), value }))
+}
+
+/**
+ * stripe_gross_today — back-compat wrapper: hourly chart for today in UTC.
+ */
+export async function computeGrossToday(get: StripeGetter): Promise<ChartPoint[]> {
+  return computeHourlyGross(get)
 }

@@ -12,28 +12,35 @@ export class StripeViewsController {
   async getLiveValue(
     @Query('connectionId') connectionId: string,
     @Query('viewType') viewType: string,
-    @Query('date') date: string | undefined,
+    @Query('dateFrom') dateFrom: string | undefined,
+    @Query('dateTo') dateTo: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
-    const value = await this.stripeViewsService.fetchLiveValue(
+    return this.stripeViewsService.fetchLiveValue(
       connectionId,
       viewType,
       req.authUser.id,
-      date,
+      dateFrom,
+      dateTo,
     )
-    return { value }
   }
 
   @Get('chart-data')
   async getChartData(
     @Query('connectionId') connectionId: string,
     @Query('viewType') viewType: string,
+    @Query('dateFrom') dateFrom: string | undefined,
+    @Query('dateTo') dateTo: string | undefined,
+    @Query('mode') mode: 'daily' | 'weekly' | 'monthly' | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     const points = await this.stripeViewsService.fetchChartData(
       connectionId,
       viewType,
       req.authUser.id,
+      dateFrom,
+      dateTo,
+      mode,
     )
     return { points }
   }

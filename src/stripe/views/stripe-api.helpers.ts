@@ -107,10 +107,11 @@ export async function sumCharges(get: StripeGetter, createdGte: number, createdL
   return String(total)
 }
 
-/** Paginates through Stripe charges from `createdGte` and returns the raw list. */
+/** Paginates through Stripe charges from `createdGte` (optionally up to `createdLt`) and returns the raw list. */
 export async function fetchChargesSince(
   get: StripeGetter,
   createdGte: number,
+  createdLt?: number,
 ): Promise<{ created: number; amount: number; status: string }[]> {
   const all: { created: number; amount: number; status: string }[] = []
   let hasMore = true
@@ -121,6 +122,7 @@ export async function fetchChargesSince(
       'created[gte]': String(createdGte),
       limit: '100',
     }
+    if (createdLt !== undefined) params['created[lt]'] = String(createdLt)
     if (startingAfter) params['starting_after'] = startingAfter
 
     const data = (await get('charges', params)) as unknown as StripeChargePage

@@ -46,14 +46,15 @@ export async function fetchRealtimeActiveUsers(
 
 /**
  * ga_users_today / ga_sessions_today / ga_pageviews_today
- * Returns the cumulative value for the given metric on a specific date via the Data API.
- * Accepts any YYYY-MM-DD date string or 'today'.
+ * Returns the cumulative value for the given metric on a date range via the Data API.
+ * Accepts any YYYY-MM-DD date strings or 'today'.
  */
 export async function fetchTodayMetric(
   token: string,
   propertyId: string,
   metricName: string,
-  date = 'today',
+  dateFrom = 'today',
+  dateTo = dateFrom,
 ): Promise<string> {
   const res = await fetch(`${DATA_BASE}/properties/${propertyId}:runReport`, {
     method: 'POST',
@@ -62,7 +63,7 @@ export async function fetchTodayMetric(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      dateRanges: [{ startDate: date, endDate: date }],
+      dateRanges: [{ startDate: dateFrom, endDate: dateTo }],
       metrics: [{ name: metricName }],
     }),
   })

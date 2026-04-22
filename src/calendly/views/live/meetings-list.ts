@@ -1,5 +1,5 @@
 import { Logger } from '@nestjs/common'
-import { getTodayEvents } from './meetings-today'
+import { getEventsInRange } from './meetings-today'
 
 const BASE_API = 'https://api.calendly.com'
 
@@ -14,14 +14,17 @@ export interface CalendlyMeeting {
 
 /**
  * calendly_meetings_list
- * Returns full meeting details (with invitees) for all active events today.
+ * Returns full meeting details (with invitees) for all active events in [dateFrom, dateTo].
+ * When both args are omitted, returns today's events (UTC).
  */
 export async function computeMeetingsList(
   token: string,
   userUri: string,
   logger: Logger,
+  dateFrom?: string,
+  dateTo?: string,
 ): Promise<CalendlyMeeting[]> {
-  const events = await getTodayEvents(token, userUri)
+  const events = await getEventsInRange(token, userUri, dateFrom, dateTo)
   const meetings: CalendlyMeeting[] = []
 
   for (const event of events) {
