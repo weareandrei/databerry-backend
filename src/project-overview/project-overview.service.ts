@@ -19,6 +19,7 @@ import {
   fetchPosthogEventCountByBucket,
   listPosthogEventNames,
 } from '../posthog/views/live/sources'
+import { fetchPosthogUsersList } from '../posthog/views/live/users'
 import { fetchStripeRevenueByBucket } from '../stripe/views/live/revenue-by-bucket'
 import { normalizeSource } from './source-normalization'
 
@@ -49,6 +50,30 @@ export interface OverviewChartResponse {
 
 export interface OverviewSourcesResponse {
   sources: { source: string; label: string; color: string; visitors: number; share: number }[]
+}
+
+export interface OverviewUser {
+  /** Opaque per-user identifier from the provider (PostHog `distinct_id`). */
+  pseudoId: string
+  /** Raw source (domain or sentinel). Normalised + reused for colour/label. */
+  source: string
+  label: string
+  color: string
+  /** Active span within the range, in seconds. */
+  sessionSec: number
+  /** ISO-8601 timestamp of the user's most recent pageview. */
+  lastSeen: string
+}
+
+export interface OverviewUsersResponse {
+  users: OverviewUser[]
+  /**
+   * `null` when no connection is configured, `'google_analytics'` when the
+   * project's traffic provider is GA (currently unsupported for per-user
+   * rollups — frontend renders a "switch to PostHog" empty state), or
+   * `'posthog'` when results are from PostHog.
+   */
+  provider: 'google_analytics' | 'posthog' | null
 }
 
 interface Bucket {
@@ -498,6 +523,58 @@ export class ProjectOverviewService {
       .slice(0, limit)
 
     return { sources: sorted }
+  }
+
+  /**
+   * Per-user breakdown for the Users tab. Happy path = PostHog: one HogQL
+   * query already aggregated at the person level. GA4 can expose similar
+   * data via the `userPseudoId` dimension but session-duration and
+   * first-source-per-user need non-trivial follow-up aggregations, so we
+   * defer that and surface an empty response with `provider: 'google_analytics'`
+   * so the frontend can show the right empty-state CTA.
+   */
+  async fetchUsers(
+    userId: string,
+    projectId: string,
+    dateFrom: string,
+    dateTo: string,
+    limit = 100,
+  ): Promise<OverviewUsersResponse> {
+    this.logger.log(
+      `\n  ► fetchUsers   projectId=${projectId} ${dateFrom}→${dateTo}  limit=${limit}`,
+    )
+
+    const provider = await this.pickTrafficProvider(userId, projectId)
+    if (!provider) return { users: [], provider: null }
+
+    // GA is deliberately unsupported in this pass — frontend renders a
+    // dedicated "requires PostHog" empty state instead of a generic one so
+    // the user understands why the tab is empty.
+    if (provider.type === 'google_analytics') {
+      return { users: [], provider: 'google_analytics' }
+    }
+
+    try {
+      const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+      if (!ph) return { users: [], provider: 'posthog' }
+
+      const rows = await fetchPosthogUsersList(ph, dateFrom, dateTo, limit, this.logger)
+      const users: OverviewUser[] = rows.map(r => {
+        const n = normalizeSource(r.source)
+        return {
+          pseudoId: r.pseudoId,
+          source: n.key,
+          label: n.label,
+          color: n.color,
+          sessionSec: r.sessionSec,
+          lastSeen: r.lastSeen,
+        }
+      })
+      return { users, provider: 'posthog' }
+    } catch (err) {
+      this.logger.warn(`fetchUsers PostHog error: ${String(err)}`)
+      return { users: [], provider: 'posthog' }
+    }
   }
 
   async listConversionEvents(

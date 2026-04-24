@@ -51,6 +51,24 @@ export class ProjectOverviewController {
     return this.service.fetchSources(req.authUser.id, projectId, dateFrom, dateTo, isNaN(n) ? 10 : n)
   }
 
+  @Get('users')
+  async users(
+    @Query('projectId') projectId: string,
+    @Query('dateFrom') dateFrom: string,
+    @Query('dateTo') dateTo: string,
+    @Query('limit') limit: string | undefined,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    const n = limit ? parseInt(limit, 10) : 100
+    return this.service.fetchUsers(
+      req.authUser.id,
+      projectId,
+      dateFrom,
+      dateTo,
+      isNaN(n) ? 100 : n,
+    )
+  }
+
   @Get('conversion-events')
   async conversionEvents(
     @Query('connectionId') connectionId: string,
