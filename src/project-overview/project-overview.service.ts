@@ -140,11 +140,21 @@ export class ProjectOverviewService {
   ) {}
 
   /**
-   * Decides which connection provides traffic/sources for a user.
-   * Priority: explicit user setting → first GA connection → first PostHog connection → null.
+   * Decides which connection provides traffic/sources for a user+project.
+   *
+   * Priority:
+   *   1. explicit user setting (only if eligible for this project — i.e.
+   *      scoped to it or Common)
+   *   2. GA connection for this project (project-specific > Common)
+   *   3. PostHog connection for this project (project-specific > Common)
+   *   4. null
+   *
+   * "Common" = `project_id IS NULL` — a connection shared across all of the
+   * user's projects. Project-specific connections beat Common.
    */
   private async pickTrafficProvider(
     userId: string,
+    projectId: string,
   ): Promise<
     | { type: 'google_analytics'; connectionId: string }
     | { type: 'posthog'; connectionId: string }
@@ -152,36 +162,36 @@ export class ProjectOverviewService {
   > {
     const settings = await this.userSettingsService.get(userId)
     const client = this.supabaseService.getClient()
+    const scopeFilter = `project_id.eq.${projectId},project_id.is.null`
 
     if (settings.preferredTrafficConnectionId) {
       const { data } = await client
         .from('connections')
-        .select('id, type')
+        .select('id, type, project_id')
         .eq('id', settings.preferredTrafficConnectionId)
         .eq('user_id', userId)
+        .or(scopeFilter)
         .maybeSingle()
       if (data && (data.type === 'google_analytics' || data.type === 'posthog')) {
         return { type: data.type as 'google_analytics' | 'posthog', connectionId: data.id as string }
       }
     }
 
-    const { data: ga } = await client
-      .from('connections')
-      .select('id')
-      .eq('user_id', userId)
-      .eq('type', 'google_analytics')
-      .limit(1)
-      .maybeSingle()
-    if (ga) return { type: 'google_analytics', connectionId: ga.id as string }
-
-    const { data: ph } = await client
-      .from('connections')
-      .select('id')
-      .eq('user_id', userId)
-      .eq('type', 'posthog')
-      .limit(1)
-      .maybeSingle()
-    if (ph) return { type: 'posthog', connectionId: ph.id as string }
+    // For each supported provider type, prefer a project-specific connection
+    // over Common. `.order(project_id desc, nullsFirst: false)` puts non-null
+    // (project-specific) rows first.
+    for (const type of ['google_analytics', 'posthog'] as const) {
+      const { data } = await client
+        .from('connections')
+        .select('id, project_id')
+        .eq('user_id', userId)
+        .eq('type', type)
+        .or(scopeFilter)
+        .order('project_id', { ascending: false, nullsFirst: false })
+        .limit(1)
+        .maybeSingle()
+      if (data) return { type, connectionId: data.id as string }
+    }
 
     return null
   }
@@ -206,7 +216,7 @@ export class ProjectOverviewService {
     const buckets = buildBuckets(mode, dateFrom, dateTo)
     const gran = this.granularity(mode)
 
-    const provider = await this.pickTrafficProvider(userId)
+    const provider = await this.pickTrafficProvider(userId, projectId)
     const projectSettings = await this.projectSettingsService.get(projectId, userId)
 
     // Accumulators keyed by bucket index
@@ -441,7 +451,7 @@ export class ProjectOverviewService {
       `\n  ► fetchSources  projectId=${projectId} ${dateFrom}→${dateTo}  limit=${limit}`,
     )
 
-    const provider = await this.pickTrafficProvider(userId)
+    const provider = await this.pickTrafficProvider(userId, projectId)
     if (!provider) return { sources: [] }
 
     // Reuse the per-bucket fetchers; aggregate across buckets to a single source list.
@@ -517,14 +527,15 @@ export class ProjectOverviewService {
   }
 
   /**
-   * Helper: sum all stripe revenue across every Stripe manual connection on the project.
-   * Project→connections relationship: connections aren't strictly scoped to projects today,
-   * so we pull all of this user's stripe_manual connections.
-   * Note: projectId is accepted for future scoping but currently unused.
+   * Helper: sum stripe revenue across every Stripe-manual connection eligible
+   * for this project. "Eligible" = `project_id = :projectId` (project-specific)
+   * OR `project_id IS NULL` (Common, shared across all projects). A connection
+   * scoped to a *different* project is excluded — which is the whole point of
+   * this function's existence.
    */
   private async fetchStripeRevenueForProject(
     userId: string,
-    _projectId: string,
+    projectId: string,
     dateFrom: string,
     dateTo: string,
     gran: BucketGranularity,
@@ -532,9 +543,10 @@ export class ProjectOverviewService {
     const { data: conns } = await this.supabaseService
       .getClient()
       .from('connections')
-      .select('id, type')
+      .select('id, type, project_id')
       .eq('user_id', userId)
       .eq('type', 'stripe_manual')
+      .or(`project_id.eq.${projectId},project_id.is.null`)
 
     if (!conns || conns.length === 0) return []
 

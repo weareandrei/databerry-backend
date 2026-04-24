@@ -14,7 +14,11 @@ import {
 } from '@nestjs/common'
 import { SupabaseAuthGuard } from '../auth/supabase-auth.guard'
 import { ConnectionsService } from './connections.service'
-import type { CreateConnectionDto, UpdateConnectionDto } from './connections.service'
+import type {
+  CreateConnectionDto,
+  UpdateConnectionDto,
+  UpdateConnectionProjectDto,
+} from './connections.service'
 import type { AuthenticatedRequest } from '../common/types'
 
 @Controller('connections')
@@ -40,6 +44,16 @@ export class ConnectionsController {
   @Patch(':id')
   update(@Param('id') id: string, @Body() dto: UpdateConnectionDto, @Req() req: AuthenticatedRequest) {
     return this.connectionsService.updateConnection(id, dto, req.authUser.id)
+  }
+
+  // Reassign a connection to a different project, or to "Common" (projectId=null).
+  @Patch(':id/project')
+  updateProject(
+    @Param('id') id: string,
+    @Body() dto: UpdateConnectionProjectDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.connectionsService.updateConnectionProject(id, dto, req.authUser.id)
   }
 
   @Get(':id/posthog/event-definitions')

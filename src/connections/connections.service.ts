@@ -6,11 +6,18 @@ import { PosthogCredentialsService } from '../posthog/connection/credentials'
 export interface CreateConnectionDto {
   name: string
   type: string
+  // projectId: null / undefined = "Common" (shared across all projects).
+  // A non-null UUID scopes the connection to a single project.
+  projectId?: string | null
   config?: Record<string, unknown> // type-specific credentials (e.g. apiKey, projectId)
 }
 
 export interface UpdateConnectionDto {
   name?: string
+}
+
+export interface UpdateConnectionProjectDto {
+  projectId: string | null
 }
 
 @Injectable()
@@ -49,9 +56,15 @@ export class ConnectionsService {
     const client = this.supabaseService.getClient()
 
     // 1. Insert base connection record
+    // project_id: null ⇒ "Common" (shared across all projects).
     const { data, error } = await client
       .from('connections')
-      .insert({ name: dto.name, type: dto.type, user_id: userId })
+      .insert({
+        name: dto.name,
+        type: dto.type,
+        user_id: userId,
+        project_id: dto.projectId ?? null,
+      })
       .select()
       .single()
 
@@ -78,6 +91,27 @@ export class ConnectionsService {
 
     if (error || !data) throw new NotFoundException('Connection not found')
     return this.toCamel(data)
+  }
+
+  async updateConnectionProject(
+    connectionId: string,
+    dto: UpdateConnectionProjectDto,
+    userId: string,
+  ) {
+    // projectId === null ⇒ move to "Common" (shared across projects).
+    const { data, error } = await this.supabaseService
+      .getClient()
+      .from('connections')
+      .update({ project_id: dto.projectId })
+      .eq('id', connectionId)
+      .eq('user_id', userId)
+      .select()
+      .single()
+
+    if (error || !data) throw new NotFoundException('Connection not found')
+    // Re-fetch with joins so the full shape (webhookId, gaPropertyName, …) is
+    // returned — same as createConnection.
+    return this.getConnectionById(connectionId, userId)
   }
 
   async deleteConnection(connectionId: string, userId: string) {
@@ -215,6 +249,9 @@ export class ConnectionsService {
       name: row.name,
       type: row.type,
       userId: row.user_id,
+      // project_id is nullable in the DB — null == "Common" (shared across
+      // all of this user's projects). Non-null scopes to a single project.
+      projectId: (row.project_id as string | null) ?? null,
       createdAt: row.created_at,
       webhookId: webhookRow?.webhook_id ?? null,
       gaPropertyId: gaRow?.property_id ?? null,
