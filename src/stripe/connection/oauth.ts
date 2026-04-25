@@ -5,12 +5,17 @@ import {
   InternalServerErrorException,
 } from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
+import { StripeBackfillService } from '../sync/backfill.service'
+import { makeStripeGetter } from '../views/stripe-api.helpers'
 
 @Injectable()
 export class StripeOAuthService {
   private readonly logger = new Logger(StripeOAuthService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly backfillService: StripeBackfillService,
+  ) {}
 
   getOAuthUrl(userId: string): string {
     const clientId = process.env.STRIPE_CLIENT_ID
@@ -33,7 +38,7 @@ export class StripeOAuthService {
     return `https://connect.stripe.com/oauth/authorize?${params.toString()}`
   }
 
-  async handleOAuthCallback(code: string, state: string): Promise<void> {
+  async handleOAuthCallback(code: string, state: string): Promise<{ connectionId: string }> {
     let userId: string
     try {
       userId = Buffer.from(state, 'base64').toString('utf8')
@@ -97,6 +102,22 @@ export class StripeOAuthService {
       throw new Error(stripeError.message)
     }
 
+    // Discover account metadata + kick off backfill. We use the access token
+    // we just received (which is account-scoped) rather than the platform key
+    // so /v1/account returns the connected account's row.
+    try {
+      const accountRow = await this.backfillService.resolveAccountFromCredentials(
+        makeStripeGetter(accessToken),
+      )
+      await this.backfillService.ensureAccountAndBackfill(accountRow)
+    } catch (err) {
+      // Don't fail the OAuth flow if backfill kickoff fails — the row is
+      // already in stripe_accounts (status 'pending'), and either the nightly
+      // reconcile or a manual retrigger can pick it up.
+      this.logger.warn(`  ⚠ Backfill kickoff failed for ${stripeAccountId}: ${String(err)}`)
+    }
+
     this.logger.log(`  ✓ Stripe connection created\n  connection_id : ${connection.id}`)
+    return { connectionId: connection.id }
   }
 }

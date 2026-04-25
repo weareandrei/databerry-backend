@@ -2,6 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common'
 import { createHash, randomBytes } from 'crypto'
 import { SupabaseService } from '../supabase/supabase.service'
 import { PosthogCredentialsService } from '../posthog/connection/credentials'
+import { StripeBackfillService } from '../stripe/sync/backfill.service'
 
 export interface CreateConnectionDto {
   name: string
@@ -25,6 +26,7 @@ export class ConnectionsService {
   constructor(
     private readonly supabaseService: SupabaseService,
     private readonly posthogCredentialsService: PosthogCredentialsService,
+    private readonly stripeBackfillService: StripeBackfillService,
   ) {}
 
   async getConnections(userId: string) {
@@ -208,11 +210,25 @@ export class ConnectionsService {
       })
       if (error) throw new Error(error.message)
     } else if (type === 'stripe_manual') {
+      // Resolve the Stripe account ID first so the row links to stripe_accounts
+      // immediately. This also validates the API key (a bad key surfaces here
+      // rather than later during backfill, with a cleaner error path).
+      const apiKey = config.apiKey as string | undefined
+      if (!apiKey) throw new Error('stripe_manual connection requires apiKey in config')
+
+      const accountRow = await this.stripeBackfillService.resolveAccountFromApiKey(apiKey)
+
       const { error } = await client.from('connections_stripe_manual').insert({
         connection_id: connectionId,
-        api_key: config.apiKey,
+        api_key: apiKey,
+        stripe_account_id: accountRow.id,
       })
       if (error) throw new Error(error.message)
+
+      // Fire-and-forget: account upsert + 90-day backfill. Doesn't block
+      // connection creation. Multiple connections to the same account dedup
+      // via stripe_accounts (`backfillAccount` short-circuits when complete).
+      await this.stripeBackfillService.ensureAccountAndBackfill(accountRow)
     } else if (type === 'calendly') {
       // Credentials are inserted directly by CalendlyService.handleOAuthCallback — no-op here
     } else if (type === 'vercel') {

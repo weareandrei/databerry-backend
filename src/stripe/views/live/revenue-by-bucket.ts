@@ -1,40 +1,56 @@
-import { fetchChargesSince } from '../stripe-api.helpers'
-import type { StripeGetter } from '../stripe-api.helpers'
+import type { SupabaseService } from '../../../supabase/supabase.service'
+import {
+  fetchAccountCharges,
+  type ChargeRow,
+} from '../storage-queries'
 
 export type BucketGranularity = 'hourly' | 'daily'
 
+type Client = ReturnType<SupabaseService['getClient']>
+
 /**
- * Revenue (succeeded charges, in cents) grouped by hourly or daily bucket.
+ * Revenue (succeeded charges, in cents) for a Stripe account, grouped by
+ * hourly or daily UTC bucket.
+ *
+ * Source of truth is Supabase (`stripe_charges` + optionally `stripe_line_items`).
+ * Callers pass `productIds` to scope to a subset of products — empty array
+ * means "all products" (default).
+ *
  * Returns unix-second keys so callers can map into their bucket grid.
  */
-export async function fetchStripeRevenueByBucket(
-  get: StripeGetter,
+export async function fetchStripeRevenueByBucketFromStorage(
+  client: Client,
+  stripeAccountId: string,
   dateFrom: string,
   dateTo: string,
   granularity: BucketGranularity,
+  productIds: string[] = [],
 ): Promise<{ bucketUnix: number; value: number }[]> {
-  const start = new Date(dateFrom + 'T00:00:00Z')
-  const endExclusive = new Date(dateTo + 'T00:00:00Z')
-  endExclusive.setUTCDate(endExclusive.getUTCDate() + 1)
+  const rows = await fetchAccountCharges(
+    client,
+    stripeAccountId,
+    dateFrom,
+    dateTo,
+    productIds,
+  )
+  return bucketRows(rows, granularity)
+}
 
-  const startUnix = Math.floor(start.getTime() / 1000)
-  const endUnix = Math.floor(endExclusive.getTime() / 1000)
-
-  const charges = await fetchChargesSince(get, startUnix, endUnix)
-
+function bucketRows(
+  rows: ChargeRow[],
+  granularity: BucketGranularity,
+): { bucketUnix: number; value: number }[] {
   const map = new Map<number, number>()
-  for (const c of charges) {
-    if (c.status !== 'succeeded') continue
-    const d = new Date(c.created * 1000)
+  for (const r of rows) {
+    const d = new Date(r.created)
     if (granularity === 'hourly') {
       d.setUTCMinutes(0, 0, 0)
     } else {
       d.setUTCHours(0, 0, 0, 0)
     }
     const key = Math.floor(d.getTime() / 1000)
-    map.set(key, (map.get(key) ?? 0) + c.amount)
+    map.set(key, (map.get(key) ?? 0) + r.amount)
   }
-
   return Array.from(map.entries())
     .sort((a, b) => a[0] - b[0])
     .map(([bucketUnix, value]) => ({ bucketUnix, value }))

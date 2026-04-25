@@ -25,14 +25,18 @@ export class StripeConnectionController {
     const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3000'
 
     if (oauthError) {
-      return res.redirect(`${frontendUrl}/connections?stripe=error&reason=${oauthError}`)
+      return res.redirect(`${frontendUrl}/hub/connections?stripe=error&reason=${oauthError}`)
     }
 
     try {
-      await this.stripeOAuthService.handleOAuthCallback(code, state)
-      return res.redirect(`${frontendUrl}/connections?stripe=connected`)
+      const { connectionId } = await this.stripeOAuthService.handleOAuthCallback(code, state)
+      // Land on the product picker so the user can scope the connection
+      // immediately. Same pattern as Google Analytics' property picker.
+      return res.redirect(
+        `${frontendUrl}/hub/connections?stripe=select-products&connectionId=${connectionId}`,
+      )
     } catch {
-      return res.redirect(`${frontendUrl}/connections?stripe=error`)
+      return res.redirect(`${frontendUrl}/hub/connections?stripe=error`)
     }
   }
 }

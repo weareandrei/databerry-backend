@@ -5,10 +5,6 @@ import { ProjectSettingsService } from '../project-settings/project-settings.ser
 import { GoogleAnalyticsOAuthService } from '../google-analytics/connection/oauth'
 import { getPosthogCredentials } from '../posthog/connection/credentials'
 import {
-  getApiKeyInternal,
-  makeStripeGetter,
-} from '../stripe/views/stripe-api.helpers'
-import {
   fetchSourcesByBucket as fetchGASourcesByBucket,
   fetchMetricByBucket as fetchGAMetricByBucket,
   type SourceBucketRow as GASourceRow,
@@ -20,7 +16,11 @@ import {
   listPosthogEventNames,
 } from '../posthog/views/live/sources'
 import { fetchPosthogUsersList } from '../posthog/views/live/users'
-import { fetchStripeRevenueByBucket } from '../stripe/views/live/revenue-by-bucket'
+import { fetchStripeRevenueByBucketFromStorage } from '../stripe/views/live/revenue-by-bucket'
+import {
+  getConnectionProductFilter,
+  getStripeAccountIdForConnection,
+} from '../stripe/views/storage-queries'
 import { normalizeSource } from './source-normalization'
 
 export type OverviewMode = 'daily' | 'weekly' | 'monthly'
@@ -604,11 +604,19 @@ export class ProjectOverviewService {
   }
 
   /**
-   * Helper: sum stripe revenue across every Stripe-manual connection eligible
-   * for this project. "Eligible" = `project_id = :projectId` (project-specific)
-   * OR `project_id IS NULL` (Common, shared across all projects). A connection
-   * scoped to a *different* project is excluded — which is the whole point of
-   * this function's existence.
+   * Helper: sum stripe revenue across every Stripe connection (manual or
+   * Connect) eligible for this project. "Eligible" = `project_id = :projectId`
+   * OR `project_id IS NULL` (Common, shared across all projects).
+   *
+   * Reads from Supabase (`stripe_charges` + optionally `stripe_line_items`),
+   * NOT the live Stripe API. Each eligible connection's per-connection
+   * product filter is honoured — two connections for the same Stripe account
+   * filtered to different product subsets contribute different amounts to
+   * the same project (sum of both is the project's total). Two connections
+   * pointing at the same account with NO product filter produce duplicate
+   * rows for every charge — to avoid this, we dedup by `stripe_account_id`
+   * within the unfiltered set: only the first unfiltered connection per
+   * account contributes its rows. Filtered connections always contribute.
    */
   private async fetchStripeRevenueForProject(
     userId: string,
@@ -617,23 +625,46 @@ export class ProjectOverviewService {
     dateTo: string,
     gran: BucketGranularity,
   ): Promise<{ bucketUnix: number; value: number }[]> {
-    const { data: conns } = await this.supabaseService
-      .getClient()
+    const client = this.supabaseService.getClient()
+
+    const { data: conns } = await client
       .from('connections')
       .select('id, type, project_id')
       .eq('user_id', userId)
-      .eq('type', 'stripe_manual')
+      .in('type', ['stripe_manual', 'stripe'])
       .or(`project_id.eq.${projectId},project_id.is.null`)
 
     if (!conns || conns.length === 0) return []
 
     const merged = new Map<number, number>()
+    const accountsCoveredUnfiltered = new Set<string>()
+
     for (const c of conns) {
       try {
-        const apiKey = await getApiKeyInternal(c.id as string, this.supabaseService)
-        const get = makeStripeGetter(apiKey)
-        const rows = await fetchStripeRevenueByBucket(get, dateFrom, dateTo, gran)
-        for (const r of rows) merged.set(r.bucketUnix, (merged.get(r.bucketUnix) ?? 0) + r.value)
+        const accountId = await getStripeAccountIdForConnection(client, c.id as string)
+        if (!accountId) continue
+
+        const productFilter = await getConnectionProductFilter(client, c.id as string)
+
+        if (productFilter.length === 0) {
+          // Unfiltered = "all products". Avoid double-counting if two
+          // unfiltered connections cover the same account.
+          if (accountsCoveredUnfiltered.has(accountId)) continue
+          accountsCoveredUnfiltered.add(accountId)
+        }
+
+        const rows = await fetchStripeRevenueByBucketFromStorage(
+          client,
+          accountId,
+          dateFrom,
+          dateTo,
+          gran,
+          productFilter,
+        )
+
+        for (const r of rows) {
+          merged.set(r.bucketUnix, (merged.get(r.bucketUnix) ?? 0) + r.value)
+        }
       } catch (err) {
         this.logger.warn(`Stripe connection ${c.id} failed: ${String(err)}`)
       }

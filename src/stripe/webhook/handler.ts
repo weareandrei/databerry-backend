@@ -1,8 +1,22 @@
 import { Injectable, Logger } from '@nestjs/common'
 import Stripe from 'stripe'
 import { SupabaseService } from '../../supabase/supabase.service'
-import { handlePaymentSucceeded } from './events/payment-succeeded'
+import { handleChargeEvent } from './events/charge-event'
 
+/**
+ * Stripe webhook entrypoint.
+ *
+ * Events we care about:
+ *   - charge.succeeded   → first persistence of a successful charge + line items
+ *   - charge.updated     → status / metadata changes (e.g. dispute → succeeded)
+ *   - charge.refunded    → updates `amount_refunded` (refund views are out
+ *                          of scope for v1, but the data is captured for
+ *                          when they ship)
+ *
+ * All three flow through the same `handleChargeEvent` helper because they
+ * carry a Charge object and our writes are idempotent — last-write-wins on
+ * the same `charge.id`.
+ */
 @Injectable()
 export class StripeWebhookService {
   private readonly logger = new Logger(StripeWebhookService.name)
@@ -30,20 +44,22 @@ export class StripeWebhookService {
     console.log('  💳 Stripe webhook received')
     console.log(`  type    : ${event.type}`)
     console.log(`  account : ${event.account ?? '(platform)'}`)
-    console.log('  payload :', JSON.stringify(event.data.object, null, 4))
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n')
 
-    if (event.type !== 'payment_intent.succeeded') return
-
-    const stripeAccountId = event.account
-    if (!stripeAccountId) {
-      this.logger.warn('  ⚠ No account field — not a Connect event, skipping')
-      return
-    }
-
-    const paymentIntent = event.data.object as Stripe.PaymentIntent
     const client = this.supabaseService.getClient()
 
-    await handlePaymentSucceeded(paymentIntent.amount, stripeAccountId, client, this.logger)
+    switch (event.type) {
+      case 'charge.succeeded':
+      case 'charge.updated':
+      case 'charge.refunded': {
+        const charge = event.data.object as Stripe.Charge
+        await handleChargeEvent(charge, event.account ?? null, client, this.logger)
+        return
+      }
+      default:
+        // Unhandled event type — log and ignore. Stripe sends many event
+        // types we don't subscribe to; quiet drop is correct.
+        return
+    }
   }
 }

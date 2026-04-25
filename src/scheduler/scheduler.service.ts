@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common'
 import { Cron } from '@nestjs/schedule'
 import { SupabaseService } from '../supabase/supabase.service'
 import { getPosthogCredentials } from '../posthog/connection/credentials'
-import { getApiKeyInternal, makeStripeGetter, sumCharges } from '../stripe/views/stripe-api.helpers'
+import { fetchAccountCharges, getConnectionProductFilter, getStripeAccountIdForConnection } from '../stripe/views/storage-queries'
 
 interface PendingRow {
   id: string
@@ -80,6 +80,7 @@ export class SchedulerService {
       case 'posthog':
         return this.fetchPosthogCount(row)
       case 'stripe_manual':
+      case 'stripe':
         return this.fetchStripeRevenue(row)
       default:
         throw new Error(`No sync handler for connection type: ${connType}`)
@@ -121,14 +122,22 @@ export class SchedulerService {
   }
 
   private async fetchStripeRevenue(row: PendingRow): Promise<string> {
+    // Stripe data lives in Supabase now (see stripe/sync). The "needs_sync"
+    // flag for Stripe rows is legacy — webhooks push charges into
+    // `stripe_charges` directly, and the nightly reconcile catches gaps.
+    // This handler simply reads the same Supabase tables to fill in the
+    // tile cache (`views_values.value`) for cross-provider consistency.
+    const client = this.supabaseService.getClient()
     const connectionId = row.views.connection_id
-    const apiKey = await getApiKeyInternal(connectionId, this.supabaseService)
-    const get = makeStripeGetter(apiKey)
 
-    // Fetch charges strictly within the target date (midnight to midnight UTC)
-    const dayStart = Math.floor(new Date(row.created_at + 'T00:00:00Z').getTime() / 1000)
-    const dayEnd = dayStart + 86_400
+    const accountId = await getStripeAccountIdForConnection(client, connectionId)
+    if (!accountId) return '0'
 
-    return sumCharges(get, dayStart, dayEnd)
+    const productFilter = await getConnectionProductFilter(client, connectionId)
+    const date = row.created_at
+    const charges = await fetchAccountCharges(client, accountId, date, date, productFilter)
+
+    const total = charges.reduce((sum, c) => sum + c.amount, 0)
+    return String(total)
   }
 }
