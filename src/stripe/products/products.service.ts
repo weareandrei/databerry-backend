@@ -1,5 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
+import { StripeBackfillService } from '../sync/backfill.service'
 
 export interface StripeProductOption {
   id: string
@@ -19,6 +20,8 @@ export interface ProductsForConnectionResult {
   backfillComplete: boolean
   /** Raw status — frontend uses this to render a progress banner. */
   backfillStatus: 'pending' | 'in_progress' | 'complete' | 'error' | null
+  /** Last backfill error message, if `backfillStatus === 'error'`. */
+  backfillError: string | null
   stripeAccountId: string | null
 }
 
@@ -45,7 +48,10 @@ export interface StripeAccountStatus {
 export class StripeProductsService {
   private readonly logger = new Logger(StripeProductsService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly backfillService: StripeBackfillService,
+  ) {}
 
   /**
    * List all products visible on the connection's Stripe account, plus the
@@ -77,6 +83,7 @@ export class StripeProductsService {
         selectedProductIds: [],
         backfillComplete: false,
         backfillStatus: null,
+        backfillError: null,
         stripeAccountId: null,
       }
     }
@@ -94,7 +101,7 @@ export class StripeProductsService {
         .eq('connection_id', connectionId),
       client
         .from('stripe_accounts')
-        .select('backfill_status')
+        .select('backfill_status, backfill_error')
         .eq('id', stripeAccountId)
         .maybeSingle(),
     ])
@@ -110,12 +117,14 @@ export class StripeProductsService {
     const selectedProductIds = (selectionRes.data ?? []).map(r => r.product_id as string)
     const backfillStatus =
       (accountRes.data?.backfill_status as ProductsForConnectionResult['backfillStatus']) ?? null
+    const backfillError = (accountRes.data?.backfill_error as string | null) ?? null
 
     return {
       products,
       selectedProductIds,
       backfillComplete: backfillStatus === 'complete',
       backfillStatus,
+      backfillError,
       stripeAccountId,
     }
   }
@@ -198,6 +207,23 @@ export class StripeProductsService {
    * pointing at this account so a leaked acct_xxx can't be probed by
    * unauthorised users.
    */
+  /**
+   * Force a backfill retry. Used after the user fixes a missing scope on
+   * their Restricted Key, or to recover an account stranded in `in_progress`
+   * by a server restart. Ownership is verified the same way as
+   * `getAccountStatus` — at least one of the user's connections must point
+   * at the account.
+   */
+  async retryBackfill(stripeAccountId: string, userId: string): Promise<{ ok: true }> {
+    const client = this.supabaseService.getClient()
+    const ownsAccount = await this.userOwnsAccount(client, stripeAccountId, userId)
+    if (!ownsAccount) throw new NotFoundException('Stripe account not found')
+
+    await this.backfillService.retryBackfill(stripeAccountId)
+    this.logger.log(`  ✓ retryBackfill kicked off  account=${stripeAccountId}  user=${userId}`)
+    return { ok: true }
+  }
+
   async getAccountStatus(
     stripeAccountId: string,
     userId: string,

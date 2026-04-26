@@ -74,25 +74,38 @@ export async function syncCharges(
 }
 
 /**
- * List every active product for a Stripe account and upsert into `stripe_products`.
- * Pagination: 100/page. Used by backfill (so the picker has data immediately)
- * and not by reconcile — products rarely change, and the picker can lazy-refresh.
+ * List every product (active *and* archived) for a Stripe account and upsert
+ * into `stripe_products`. Pagination: 100/page. Used by backfill so the
+ * picker has data immediately; reconcile skips this since products rarely
+ * change.
+ *
+ * We deliberately fetch archived products too: the picker labels them
+ * "· archived" but the user may want to retroactively attribute past charges
+ * to a product they've since archived. Filtering them out at fetch time
+ * silently broke that case.
  */
 export async function syncProducts(
   client: Client,
   stripeAccountId: string,
   get: StripeGetter,
+  logger?: Logger,
 ): Promise<number> {
   let processed = 0
   let hasMore = true
   let startingAfter: string | undefined
+  let pageNum = 0
 
   while (hasMore) {
-    const params: Record<string, string> = { active: 'true', limit: '100' }
+    pageNum++
+    const params: Record<string, string> = { limit: '100' }
     if (startingAfter) params['starting_after'] = startingAfter
 
     const page = (await get('products', params)) as unknown as StripeListPage<StripeProductRow>
     const products = page.data ?? []
+
+    logger?.log(
+      `    syncProducts  account=${stripeAccountId}  page=${pageNum}  items=${products.length}  has_more=${page.has_more}`,
+    )
 
     if (products.length > 0) {
       await upsertProducts(client, stripeAccountId, products)
@@ -103,6 +116,13 @@ export async function syncProducts(
     if (hasMore && products.length > 0) {
       startingAfter = products[products.length - 1].id
     }
+  }
+
+  if (processed === 0) {
+    logger?.warn(
+      `    syncProducts  account=${stripeAccountId}  → 0 products fetched. ` +
+        `Either the account has none, or the API key lacks "Products → Read" scope.`,
+    )
   }
 
   return processed

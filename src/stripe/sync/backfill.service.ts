@@ -74,21 +74,28 @@ export class StripeBackfillService {
       return
     }
 
-    this.logger.log(`\n  ► backfillAccount  ${stripeAccountId}  (${BACKFILL_DAYS}d)`)
+    this.logger.log(`\n  ► backfillAccount START  account=${stripeAccountId}  window=${BACKFILL_DAYS}d`)
 
     try {
       await setBackfillStatus(client, stripeAccountId, 'in_progress')
+      this.logger.log(`  → status=in_progress  account=${stripeAccountId}`)
 
       const get = await makeStripeGetterForAccount(client, stripeAccountId)
 
       // Products first — picker UI depends on it and we want it live before
-      // the slow charges pass finishes.
-      const productCount = await syncProducts(client, stripeAccountId, get)
-      this.logger.log(`  → synced ${productCount} product(s)`)
+      // the slow charges pass finishes. Pass the logger through so each page
+      // gets logged; this is the single biggest source of "why is the picker
+      // empty?" mystery and we want a paper trail.
+      this.logger.log(`  → syncProducts BEGIN  account=${stripeAccountId}`)
+      const productCount = await syncProducts(client, stripeAccountId, get, this.logger)
+      this.logger.log(`  → syncProducts DONE   account=${stripeAccountId}  count=${productCount}`)
 
       const now = Math.floor(Date.now() / 1000)
       const since = now - BACKFILL_DAYS * 86_400
 
+      this.logger.log(
+        `  → syncCharges BEGIN   account=${stripeAccountId}  since=${new Date(since * 1000).toISOString()}`,
+      )
       const chargeCount = await syncCharges(
         client,
         stripeAccountId,
@@ -97,6 +104,7 @@ export class StripeBackfillService {
         now,
         this.logger,
       )
+      this.logger.log(`  → syncCharges DONE    account=${stripeAccountId}  count=${chargeCount}`)
 
       const { error: throughErr } = await client
         .from('stripe_accounts')
@@ -108,10 +116,14 @@ export class StripeBackfillService {
 
       await setBackfillStatus(client, stripeAccountId, 'complete')
       await bumpLastSyncedAt(client, stripeAccountId)
-      this.logger.log(`  ✓ backfillAccount complete — ${chargeCount} charge(s) over ${BACKFILL_DAYS}d`)
+      this.logger.log(
+        `  ✓ backfillAccount END    account=${stripeAccountId}  products=${productCount}  charges=${chargeCount}  window=${BACKFILL_DAYS}d`,
+      )
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      this.logger.error(`  ✗ backfillAccount failed for ${stripeAccountId}: ${msg}`)
+      const stack = err instanceof Error ? err.stack : undefined
+      this.logger.error(`  ✗ backfillAccount FAILED  account=${stripeAccountId}  msg="${msg}"`)
+      if (stack) this.logger.error(stack)
       await setBackfillStatus(client, stripeAccountId, 'error', msg).catch(() => {})
     }
   }
@@ -127,5 +139,21 @@ export class StripeBackfillService {
     await upsertAccount(client, account)
     // Fire-and-forget — explicit `void` so eslint/no-floating-promises is happy
     void this.backfillAccount(account.id)
+  }
+
+  /**
+   * Retry a backfill, regardless of current status. Used when the user
+   * clicks "Retry" in the UI — for example after fixing a missing scope on
+   * their Restricted Key, or when an account got stranded in `in_progress`
+   * because the server restarted mid-run.
+   *
+   * Resets `backfill_status` to `'pending'` first so the normal idempotency
+   * checks in `backfillAccount` don't short-circuit, then fires the backfill
+   * in the background.
+   */
+  async retryBackfill(stripeAccountId: string): Promise<void> {
+    const client = this.supabaseService.getClient()
+    await setBackfillStatus(client, stripeAccountId, 'pending')
+    void this.backfillAccount(stripeAccountId)
   }
 }

@@ -1,5 +1,9 @@
-import { NotFoundException, UnauthorizedException } from '@nestjs/common'
+import { Logger, NotFoundException, UnauthorizedException } from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
+
+// Single shared logger for every Stripe HTTP call. Tagged so it's easy to
+// grep for: `[StripeAPI]`. Every request and every failure gets one line.
+const stripeApiLogger = new Logger('StripeAPI')
 
 export interface ChartPoint {
   label: string
@@ -43,22 +47,75 @@ export async function getApiKey(
   return data.api_key as string
 }
 
-/** Returns an authenticated fetch function for the Stripe API. */
+/**
+ * Returns an authenticated fetch function for the Stripe API.
+ *
+ * Logs every call: method+path, params (without the API key), HTTP status,
+ * and a one-line summary of the body (item count + has_more for list
+ * responses). On error, logs the full Stripe error code + message before
+ * throwing — those are the breadcrumbs we need when "the picker is empty"
+ * but no exception ever bubbled to the user.
+ */
 export function makeStripeGetter(apiKey: string): StripeGetter {
+  // Mask the key in logs: `rk_test_***abc`. Enough to disambiguate which key
+  // a request used during multi-account debugging without leaking secrets.
+  const keyTag = apiKey.length >= 8
+    ? `${apiKey.slice(0, 8)}…${apiKey.slice(-4)}`
+    : '<short-key>'
+
   return async (path: string, params?: Record<string, string>) => {
     const url = new URL(`https://api.stripe.com/v1/${path}`)
     if (params) {
       for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v)
     }
+    const paramsTag = params
+      ? Object.entries(params)
+          .filter(([k]) => k !== 'starting_after') // noisy + always changing
+          .map(([k, v]) => `${k}=${v}`)
+          .join('&')
+      : ''
+
+    const startedAt = Date.now()
     const res = await fetch(url.toString(), {
       headers: { Authorization: `Bearer ${apiKey}` },
     })
+    const elapsed = Date.now() - startedAt
+
     if (!res.ok) {
       const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
-      const msg = (body?.error as Record<string, unknown>)?.message as string | undefined
-      throw new UnauthorizedException(msg ?? `Stripe API error ${res.status}`)
+      const err = (body?.error ?? {}) as Record<string, unknown>
+      const msg = (err.message as string | undefined) ?? `Stripe API error ${res.status}`
+      const code = (err.code as string | undefined) ?? ''
+      const type = (err.type as string | undefined) ?? ''
+      stripeApiLogger.error(
+        `✗ GET /${path}${paramsTag ? `?${paramsTag}` : ''}  key=${keyTag}  status=${res.status}  ` +
+          `type=${type}  code=${code}  msg="${msg}"  (${elapsed}ms)`,
+      )
+      // 401/403 → scope/key issue. Anything else is a real Stripe outage and
+      // the caller should see it as a generic error, not "Unauthorized".
+      if (res.status === 401 || res.status === 403) {
+        throw new UnauthorizedException(msg)
+      }
+      throw new Error(`Stripe ${res.status}: ${msg}`)
     }
-    return res.json() as Promise<Record<string, unknown>>
+
+    const body = (await res.json()) as Record<string, unknown>
+    // List responses have `data` array + `has_more`. Single-resource
+    // responses (e.g. `/account`) don't — fall through to a generic line.
+    const data = body.data
+    if (Array.isArray(data)) {
+      const hasMore = body.has_more === true
+      stripeApiLogger.log(
+        `✓ GET /${path}${paramsTag ? `?${paramsTag}` : ''}  key=${keyTag}  ` +
+          `items=${data.length}  has_more=${hasMore}  (${elapsed}ms)`,
+      )
+    } else {
+      const id = (body.id as string | undefined) ?? '<no-id>'
+      stripeApiLogger.log(
+        `✓ GET /${path}${paramsTag ? `?${paramsTag}` : ''}  key=${keyTag}  id=${id}  (${elapsed}ms)`,
+      )
+    }
+    return body
   }
 }
 
