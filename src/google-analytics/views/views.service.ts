@@ -40,10 +40,10 @@ export class GoogleAnalyticsViewsService {
         this.logger.log(`  → ga_active_users requested for non-today range — unavailable`)
         return { value: null, unavailable: true }
       }
-      value = await fetchRealtimeActiveUsers(token, propertyId)
+      value = await fetchRealtimeActiveUsers(token, connectionId, propertyId)
     } else {
       const metricName = metricForViewType(viewType)
-      value = await fetchTodayMetric(token, propertyId, metricName, from, to)
+      value = await fetchTodayMetric(token, connectionId, propertyId, metricName, from, to)
     }
 
     // Only persist stored daily values for single-day queries.

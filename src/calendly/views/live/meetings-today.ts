@@ -1,3 +1,8 @@
+import {
+  IntegrationReauthRequiredException,
+  IntegrationUpstreamException,
+} from '../../../common/integration-errors'
+
 const BASE_API = 'https://api.calendly.com'
 
 function dayStart(dateStr?: string): Date {
@@ -18,19 +23,24 @@ function dayAfter(dateStr?: string): Date {
  */
 export async function computeMeetingsRange(
   token: string,
+  connectionId: string,
   userUri: string,
   dateFrom?: string,
   dateTo?: string,
 ): Promise<string> {
-  const events = await getEventsInRange(token, userUri, dateFrom, dateTo)
+  const events = await getEventsInRange(token, connectionId, userUri, dateFrom, dateTo)
   return String(events.length)
 }
 
 /**
  * Back-compat wrapper for today's meeting count.
  */
-export async function computeMeetingsToday(token: string, userUri: string): Promise<string> {
-  return computeMeetingsRange(token, userUri)
+export async function computeMeetingsToday(
+  token: string,
+  connectionId: string,
+  userUri: string,
+): Promise<string> {
+  return computeMeetingsRange(token, connectionId, userUri)
 }
 
 /**
@@ -38,6 +48,7 @@ export async function computeMeetingsToday(token: string, userUri: string): Prom
  */
 export async function getEventsInRange(
   token: string,
+  connectionId: string,
   userUri: string,
   dateFrom?: string,
   dateTo?: string,
@@ -57,8 +68,22 @@ export async function getEventsInRange(
   })
 
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error('Calendly API error: ' + JSON.stringify(body))
+    const body = await res.text().catch(() => '')
+    // 401 here is unusual (we just refreshed) but real — it can happen if
+    // the user's Calendly account was disabled, or the org membership
+    // changed. Surface as reauth so the user gets the right prompt.
+    if (res.status === 401 || res.status === 403) {
+      throw new IntegrationReauthRequiredException(
+        'calendly',
+        connectionId,
+        `Calendly API: ${body.slice(0, 200)}`,
+      )
+    }
+    throw new IntegrationUpstreamException(
+      'calendly',
+      connectionId,
+      `Calendly API (${res.status}): ${body.slice(0, 200)}`,
+    )
   }
 
   const data = (await res.json()) as { collection: Record<string, unknown>[] }
@@ -70,7 +95,8 @@ export async function getEventsInRange(
  */
 export async function getTodayEvents(
   token: string,
+  connectionId: string,
   userUri: string,
 ): Promise<Record<string, unknown>[]> {
-  return getEventsInRange(token, userUri)
+  return getEventsInRange(token, connectionId, userUri)
 }

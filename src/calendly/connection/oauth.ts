@@ -1,6 +1,10 @@
-import { Injectable, Logger, NotFoundException, UnauthorizedException } from '@nestjs/common'
+import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { createHash, randomBytes } from 'crypto'
 import { SupabaseService } from '../../supabase/supabase.service'
+import {
+  IntegrationReauthRequiredException,
+  IntegrationUpstreamException,
+} from '../../common/integration-errors'
 
 @Injectable()
 export class CalendlyOAuthService {
@@ -122,11 +126,17 @@ export class CalendlyOAuthService {
 
     const { data } = await client
       .from('connections_calendly')
-      .select('access_token, refresh_token, expires_at')
+      .select('access_token, refresh_token, expires_at, token_status')
       .eq('connection_id', connectionId)
       .maybeSingle()
 
     if (!data) throw new NotFoundException('Calendly credentials not found')
+
+    // Fast-fail if we've already learned this row's refresh token is dead.
+    // Symmetric with GA — see the GA `ensureFreshToken` for the rationale.
+    if (data.token_status === 'needs_reauth') {
+      throw new IntegrationReauthRequiredException('calendly', connectionId)
+    }
 
     const expiresAt = new Date(data.expires_at as string)
     const bufferTime = new Date(Date.now() + 5 * 60 * 1000)
@@ -137,18 +147,51 @@ export class CalendlyOAuthService {
 
     this.logger.log(`Refreshing Calendly token for connection ${connectionId}`)
 
-    const tokenRes = await fetch(`${this.authBase}/oauth/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: data.refresh_token as string,
-        client_id: this.clientId,
-        client_secret: this.clientSecret,
-      }),
-    })
+    let tokenRes: Response
+    try {
+      tokenRes = await fetch(`${this.authBase}/oauth/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: data.refresh_token as string,
+          client_id: this.clientId,
+          client_secret: this.clientSecret,
+        }),
+      })
+    } catch (err) {
+      this.logger.warn(`Calendly refresh network error for ${connectionId}: ${String(err)}`)
+      throw new IntegrationUpstreamException(
+        'calendly',
+        connectionId,
+        'Could not reach Calendly token endpoint',
+      )
+    }
 
-    if (!tokenRes.ok) throw new UnauthorizedException('Failed to refresh Calendly token')
+    if (!tokenRes.ok) {
+      const detail = await tokenRes.text().catch(() => '')
+
+      // 5xx = Calendly outage (transient); 4xx = refresh token is dead.
+      if (tokenRes.status >= 500) {
+        this.logger.warn(
+          `Calendly refresh upstream error (${tokenRes.status}) for ${connectionId}: ${detail.slice(0, 200)}`,
+        )
+        throw new IntegrationUpstreamException(
+          'calendly',
+          connectionId,
+          `Calendly token endpoint returned ${tokenRes.status}`,
+        )
+      }
+
+      this.logger.warn(
+        `Calendly refresh failed for connection ${connectionId} (${tokenRes.status}): ${detail.slice(0, 200)}`,
+      )
+      await client
+        .from('connections_calendly')
+        .update({ token_status: 'needs_reauth', token_failed_at: new Date().toISOString() })
+        .eq('connection_id', connectionId)
+      throw new IntegrationReauthRequiredException('calendly', connectionId)
+    }
 
     const tokens = (await tokenRes.json()) as {
       access_token: string
@@ -158,12 +201,16 @@ export class CalendlyOAuthService {
 
     const newExpiresAt = new Date(Date.now() + tokens.expires_in * 1000).toISOString()
 
+    // Calendly *rotates* refresh tokens on each successful refresh, so we
+    // must persist the new one — unlike Google, which reuses the original.
     await client
       .from('connections_calendly')
       .update({
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         expires_at: newExpiresAt,
+        token_status: 'ok',
+        token_failed_at: null,
       })
       .eq('connection_id', connectionId)
 

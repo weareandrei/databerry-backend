@@ -19,12 +19,13 @@ export interface CalendlyMeeting {
  */
 export async function computeMeetingsList(
   token: string,
+  connectionId: string,
   userUri: string,
   logger: Logger,
   dateFrom?: string,
   dateTo?: string,
 ): Promise<CalendlyMeeting[]> {
-  const events = await getEventsInRange(token, userUri, dateFrom, dateTo)
+  const events = await getEventsInRange(token, connectionId, userUri, dateFrom, dateTo)
   const meetings: CalendlyMeeting[] = []
 
   for (const event of events) {

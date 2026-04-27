@@ -1,6 +1,10 @@
-import { Injectable, Logger, NotFoundException, UnauthorizedException } from '@nestjs/common'
+import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { randomBytes } from 'crypto'
 import { SupabaseService } from '../../supabase/supabase.service'
+import {
+  IntegrationReauthRequiredException,
+  IntegrationUpstreamException,
+} from '../../common/integration-errors'
 
 export interface GAProperty {
   id: string
@@ -115,14 +119,22 @@ export class GoogleAnalyticsOAuthService {
   }
 
   async ensureFreshToken(connectionId: string): Promise<string> {
-    const { data } = await this.supabaseService
-      .getClient()
+    const client = this.supabaseService.getClient()
+
+    const { data } = await client
       .from('connections_google_analytics')
-      .select('access_token, refresh_token, token_expiry')
+      .select('access_token, refresh_token, token_expiry, token_status')
       .eq('connection_id', connectionId)
       .maybeSingle()
 
     if (!data) throw new NotFoundException('Google Analytics credentials not found')
+
+    // If we already know this connection's refresh token is dead, fail
+    // fast with the structured error — no point burning a request on
+    // Google's token endpoint just to get the same answer.
+    if (data.token_status === 'needs_reauth') {
+      throw new IntegrationReauthRequiredException('google_analytics', connectionId)
+    }
 
     const expiry = new Date(data.token_expiry as string)
     const buffer = new Date(Date.now() + 5 * 60 * 1000)
@@ -130,25 +142,80 @@ export class GoogleAnalyticsOAuthService {
     if (expiry > buffer) return data.access_token as string
 
     this.logger.log(`Refreshing GA token for connection ${connectionId}`)
-    const res = await fetch(TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: data.refresh_token as string,
-        client_id: this.clientId,
-        client_secret: this.clientSecret,
-      }),
-    })
-    if (!res.ok) throw new UnauthorizedException('Failed to refresh Google Analytics token')
+    let res: Response
+    try {
+      res = await fetch(TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: data.refresh_token as string,
+          client_id: this.clientId,
+          client_secret: this.clientSecret,
+        }),
+      })
+    } catch (err) {
+      // Network failure reaching Google. Don't mark the row as
+      // needs_reauth — the refresh token might be perfectly fine; we
+      // just couldn't ask. Surface as upstream so the user sees a
+      // transient-error UX, not a misleading "reconnect" prompt.
+      this.logger.warn(`GA refresh network error for ${connectionId}: ${String(err)}`)
+      throw new IntegrationUpstreamException(
+        'google_analytics',
+        connectionId,
+        'Could not reach Google token endpoint',
+      )
+    }
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '')
+
+      // Google returns 5xx for its own outages — those are transient. 4xx
+      // (typically `invalid_grant`) is the canonical "this refresh token
+      // is dead" signal: revoked by the user, scope changed, or — most
+      // commonly for us — the GA OAuth app is in "Testing" status and
+      // Google nuked the refresh token after 7 days.
+      if (res.status >= 500) {
+        this.logger.warn(
+          `GA refresh upstream error (${res.status}) for ${connectionId}: ${detail.slice(0, 200)}`,
+        )
+        throw new IntegrationUpstreamException(
+          'google_analytics',
+          connectionId,
+          `Google token endpoint returned ${res.status}`,
+        )
+      }
+
+      this.logger.warn(
+        `GA refresh failed for connection ${connectionId} (${res.status}): ${detail.slice(0, 200)}`,
+      )
+      // Mark the row so (a) the cron's partial index excludes it from
+      // future polling and (b) the next live-value request fast-fails
+      // instead of repeating the failing refresh POST.
+      await client
+        .from('connections_google_analytics')
+        .update({ token_status: 'needs_reauth', token_failed_at: new Date().toISOString() })
+        .eq('connection_id', connectionId)
+      throw new IntegrationReauthRequiredException('google_analytics', connectionId)
+    }
 
     const tokens = (await res.json()) as { access_token: string; expires_in: number }
     const newExpiry = new Date(Date.now() + tokens.expires_in * 1000).toISOString()
 
-    await this.supabaseService
-      .getClient()
+    await client
       .from('connections_google_analytics')
-      .update({ access_token: tokens.access_token, token_expiry: newExpiry })
+      .update({
+        access_token: tokens.access_token,
+        token_expiry: newExpiry,
+        // If a previous refresh failed but the user reconnected (which
+        // overwrites these fields via handleOAuthCallback), the row is
+        // already 'ok'. But if the cron is recovering from a transient
+        // network blip that flipped this to needs_reauth, clear the flag
+        // on success — defense in depth. handleOAuthCallback should
+        // really be the canonical reset path; this is just safety.
+        token_status: 'ok',
+        token_failed_at: null,
+      })
       .eq('connection_id', connectionId)
 
     return tokens.access_token

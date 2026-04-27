@@ -1,4 +1,7 @@
-import { UnauthorizedException } from '@nestjs/common'
+import {
+  IntegrationReauthRequiredException,
+  IntegrationUpstreamException,
+} from '../../../common/integration-errors'
 
 const DATA_BASE = 'https://analyticsdata.googleapis.com/v1beta'
 
@@ -11,11 +14,39 @@ export interface SourceBucketRow {
 }
 
 /**
+ * Translate non-OK responses into the structured integration exceptions.
+ * 401/403 → user must reconnect; everything else → upstream error. See
+ * `metrics.ts` for the rationale; the previous code wrapped EVERY non-OK
+ * as `UnauthorizedException`, which made transient property/quota errors
+ * look like auth failures to the frontend.
+ */
+async function throwForResponse(
+  connectionId: string,
+  res: Response,
+  context: string,
+): Promise<never> {
+  const body = await res.text().catch(() => '')
+  if (res.status === 401 || res.status === 403) {
+    throw new IntegrationReauthRequiredException(
+      'google_analytics',
+      connectionId,
+      `${context}: ${body.slice(0, 200)}`,
+    )
+  }
+  throw new IntegrationUpstreamException(
+    'google_analytics',
+    connectionId,
+    `${context} (${res.status}): ${body.slice(0, 200)}`,
+  )
+}
+
+/**
  * Fetches sessions (activeUsers) grouped by session source and time bucket.
  * Uses `dateHour` dimension for Daily mode (hourly buckets) and `date` dimension for Weekly/Monthly.
  */
 export async function fetchSourcesByBucket(
   token: string,
+  connectionId: string,
   propertyId: string,
   dateFrom: string,
   dateTo: string,
@@ -34,10 +65,7 @@ export async function fetchSourcesByBucket(
     }),
   })
 
-  if (!res.ok) {
-    const body = await res.text()
-    throw new UnauthorizedException(`GA Data API error (sources): ${body}`)
-  }
+  if (!res.ok) await throwForResponse(connectionId, res, 'GA Data API error (sources)')
 
   const data = (await res.json()) as {
     rows?: { dimensionValues: { value: string }[]; metricValues: { value: string }[] }[]
@@ -56,6 +84,7 @@ export async function fetchSourcesByBucket(
  */
 export async function fetchMetricByBucket(
   token: string,
+  connectionId: string,
   propertyId: string,
   metricName: string,
   dateFrom: string,
@@ -75,10 +104,7 @@ export async function fetchMetricByBucket(
     }),
   })
 
-  if (!res.ok) {
-    const body = await res.text()
-    throw new UnauthorizedException(`GA Data API error (${metricName}): ${body}`)
-  }
+  if (!res.ok) await throwForResponse(connectionId, res, `GA Data API error (${metricName})`)
 
   const data = (await res.json()) as {
     rows?: { dimensionValues: { value: string }[]; metricValues: { value: string }[] }[]

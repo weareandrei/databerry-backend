@@ -33,7 +33,7 @@ export class CalendlyViewsService {
     const token = await this.oauthService.ensureFreshToken(connectionId)
     const userUri = await this.oauthService.getUserUri(connectionId)
 
-    const value = await computeMeetingsRange(token, userUri, from, to)
+    const value = await computeMeetingsRange(token, connectionId, userUri, from, to)
 
     if (isSingleDay) {
       await this.viewsService.upsertValue(connectionId, viewType, value, from)
@@ -53,6 +53,6 @@ export class CalendlyViewsService {
     const token = await this.oauthService.ensureFreshToken(connectionId)
     const userUri = await this.oauthService.getUserUri(connectionId)
 
-    return computeMeetingsList(token, userUri, this.logger, dateFrom, dateTo)
+    return computeMeetingsList(token, connectionId, userUri, this.logger, dateFrom, dateTo)
   }
 }

@@ -261,11 +261,19 @@ export class ProjectOverviewService {
           const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
 
           if (primaryMetric === 'visitors') {
-            const rows = await fetchGASourcesByBucket(token, propertyId, dateFrom, dateTo, gran)
+            const rows = await fetchGASourcesByBucket(
+              token,
+              provider.connectionId,
+              propertyId,
+              dateFrom,
+              dateTo,
+              gran,
+            )
             this.assignSourceRows(buckets, byBucketTotal, byBucketSources, rows)
           } else {
             const rows = await fetchGAMetricByBucket(
               token,
+              provider.connectionId,
               propertyId,
               'screenPageViews',
               dateFrom,
@@ -363,7 +371,15 @@ export class ProjectOverviewService {
           const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
           const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
           const metric = secondaryMetric === 'bounce_rate' ? 'bounceRate' : 'averageSessionDuration'
-          const rows = await fetchGAMetricByBucket(token, propertyId, metric, dateFrom, dateTo, gran)
+          const rows = await fetchGAMetricByBucket(
+            token,
+            provider.connectionId,
+            propertyId,
+            metric,
+            dateFrom,
+            dateTo,
+            gran,
+          )
           const byKey = new Map(rows.map(r => [r.bucketKey, r.value]))
           let count = 0
           let sum = 0
@@ -392,6 +408,7 @@ export class ProjectOverviewService {
             const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
             const rows = await fetchGAMetricByBucket(
               token,
+              provider.connectionId,
               propertyId,
               'sessions',
               dateFrom,
@@ -487,7 +504,14 @@ export class ProjectOverviewService {
       if (provider.type === 'google_analytics') {
         const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
         const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
-        const all = await fetchGASourcesByBucket(token, propertyId, dateFrom, dateTo, gran)
+        const all = await fetchGASourcesByBucket(
+          token,
+          provider.connectionId,
+          propertyId,
+          dateFrom,
+          dateTo,
+          gran,
+        )
         rows = all.map(r => ({ source: r.source, value: r.value }))
       } else {
         const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
