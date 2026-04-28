@@ -29,7 +29,13 @@ export async function fetchPosthogSourcesByBucket(
   const safeTo = dateTo.replace(/'/g, '')
 
   // `$initial_referring_domain` is the standard Posthog property for session source.
-  const hogql = `SELECT ${timeExpr} AS bucket, properties.$initial_referring_domain AS src, count() FROM events WHERE event = '$pageview' AND toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}') GROUP BY bucket, src ORDER BY bucket`
+  //
+  // Parens around the BETWEEN are load-bearing: HogQL's parser binds the
+  // surrounding AND tighter than BETWEEN, so without them the query reads
+  // as `(event = '$pageview' AND toDate(timestamp)) BETWEEN x AND y`, which
+  // tries to AND a string with a Date and bombs out with
+  // "Illegal type (Date) of 2 argument of function and".
+  const hogql = `SELECT ${timeExpr} AS bucket, properties.$initial_referring_domain AS src, count() FROM events WHERE event = '$pageview' AND (toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket, src ORDER BY bucket`
 
   const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
     method: 'POST',
@@ -73,7 +79,9 @@ export async function fetchPosthogEventCountByBucket(
   const safeFrom = dateFrom.replace(/'/g, '')
   const safeTo = dateTo.replace(/'/g, '')
 
-  const hogql = `SELECT ${timeExpr} AS bucket, count() FROM events WHERE event = '${safeEvent}' AND toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}') GROUP BY bucket ORDER BY bucket`
+  // See note in fetchPosthogSourcesByBucket: the parens around BETWEEN are
+  // load-bearing because HogQL's AND binds tighter than BETWEEN.
+  const hogql = `SELECT ${timeExpr} AS bucket, count() FROM events WHERE event = '${safeEvent}' AND (toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket ORDER BY bucket`
 
   const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
     method: 'POST',

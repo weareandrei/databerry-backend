@@ -61,7 +61,11 @@ export class PosthogViewsService {
     const safeEvent = eventName.replace(/'/g, "\\'")
     const safeFrom = from.replace(/'/g, '')
     const safeTo = to.replace(/'/g, '')
-    const hogqlQuery = `SELECT count() FROM events WHERE event = '${safeEvent}' AND toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')`
+    // Parens around BETWEEN are load-bearing — HogQL's AND binds tighter
+    // than BETWEEN, so without them the parser reads
+    // `(event = X AND toDate(timestamp)) BETWEEN …` and crashes on the
+    // string-AND-Date type mismatch.
+    const hogqlQuery = `SELECT count() FROM events WHERE event = '${safeEvent}' AND (toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}'))`
 
     this.logger.log(`  → querying PostHog HogQL: ${hogqlQuery}`)
 

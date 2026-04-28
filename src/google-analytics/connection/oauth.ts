@@ -127,7 +127,15 @@ export class GoogleAnalyticsOAuthService {
       .eq('connection_id', connectionId)
       .maybeSingle()
 
-    if (!data) throw new NotFoundException('Google Analytics credentials not found')
+    if (!data) {
+      // Most common cause: an orphaned `connections` row of type
+      // 'google_analytics' whose corresponding credentials row never got
+      // written (interrupted OAuth callback, manual delete, etc.). The
+      // connectionId in the log is what you need to chase it down in
+      // Supabase.
+      this.logger.warn(`GA credentials row missing for connection ${connectionId}`)
+      throw new NotFoundException('Google Analytics credentials not found')
+    }
 
     // If we already know this connection's refresh token is dead, fail
     // fast with the structured error — no point burning a request on

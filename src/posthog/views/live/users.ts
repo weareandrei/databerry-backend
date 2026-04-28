@@ -34,7 +34,9 @@ export async function fetchPosthogUsersList(
   const safeTo = dateTo.replace(/'/g, '')
   const safeLimit = Math.max(1, Math.min(500, Math.floor(limit)))
 
-  const hogql = `SELECT distinct_id, any(properties.$initial_referring_domain) AS src, dateDiff('second', min(timestamp), max(timestamp)) AS session_sec, max(timestamp) AS last_seen FROM events WHERE event = '$pageview' AND toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}') GROUP BY distinct_id ORDER BY last_seen DESC LIMIT ${safeLimit}`
+  // Parens around BETWEEN are load-bearing — see fetchPosthogSourcesByBucket
+  // for the precedence-bug story.
+  const hogql = `SELECT distinct_id, any(properties.$initial_referring_domain) AS src, dateDiff('second', min(timestamp), max(timestamp)) AS session_sec, max(timestamp) AS last_seen FROM events WHERE event = '$pageview' AND (toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY distinct_id ORDER BY last_seen DESC LIMIT ${safeLimit}`
 
   const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
     method: 'POST',
