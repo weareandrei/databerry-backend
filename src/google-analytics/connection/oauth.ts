@@ -121,30 +121,28 @@ export class GoogleAnalyticsOAuthService {
   async ensureFreshToken(connectionId: string): Promise<string> {
     const client = this.supabaseService.getClient()
 
-    const { data } = await client
+    const { data, error } = await client
       .from('connections_google_analytics')
-      .select('access_token, refresh_token, token_expiry, token_status')
+      .select('access_token, refresh_token, token_expiry')
       .eq('connection_id', connectionId)
       .maybeSingle()
 
+    // Distinguish three cases that previously all looked like "row missing":
+    //   1. Supabase returned an actual error (missing column, network blip,
+    //      schema cache miss). data is null AND error is set.
+    //   2. Query succeeded but no row matched — orphaned connections row.
+    //      data is null and error is null.
+    //   3. Row found — proceed.
+    if (error) {
+      this.logger.error(
+        `GA credentials lookup errored for connection ${connectionId}: ` +
+          `code=${error.code ?? '?'} message=${error.message} details=${error.details ?? ''} hint=${error.hint ?? ''}`,
+      )
+      throw new NotFoundException('Google Analytics credentials lookup failed')
+    }
     if (!data) {
-      // Most common cause: an orphaned `connections` row of type
-      // 'google_analytics' whose corresponding credentials row never got
-      // written (interrupted OAuth callback, manual delete, etc.). The
-      // connectionId in the log is what you need to chase it down in
-      // Supabase.
       this.logger.warn(`GA credentials row missing for connection ${connectionId}`)
       throw new NotFoundException('Google Analytics credentials not found')
-    }
-
-    // If we already know this connection's refresh token is dead, fail
-    // fast with the structured error — no point burning a request on
-    // Google's token endpoint just to get the same answer.
-    if (data.token_status === 'needs_reauth') {
-      this.logger.warn(
-        `GA token already marked needs_reauth for ${connectionId} — failing fast`,
-      )
-      throw new IntegrationReauthRequiredException('google_analytics', connectionId)
     }
 
     const expiry = new Date(data.token_expiry as string)
@@ -204,13 +202,13 @@ export class GoogleAnalyticsOAuthService {
       this.logger.warn(
         `GA refresh failed for connection ${connectionId} (${res.status}): ${detail.slice(0, 200)}`,
       )
-      // Mark the row so (a) the cron's partial index excludes it from
-      // future polling and (b) the next live-value request fast-fails
-      // instead of repeating the failing refresh POST.
-      await client
-        .from('connections_google_analytics')
-        .update({ token_status: 'needs_reauth', token_failed_at: new Date().toISOString() })
-        .eq('connection_id', connectionId)
+      // Refresh token is dead. Surface the structured error so the
+      // frontend renders the "Reconnect" banner. We don't mark anything
+      // in the DB — every subsequent request will re-attempt the refresh
+      // and 4xx again, which costs ~200ms and a Google API call, but
+      // saves a column and a migration. At our scale that trade is fine;
+      // revisit if a single broken connection ever generates enough
+      // refresh churn to matter.
       throw new IntegrationReauthRequiredException('google_analytics', connectionId)
     }
 
@@ -222,14 +220,6 @@ export class GoogleAnalyticsOAuthService {
       .update({
         access_token: tokens.access_token,
         token_expiry: newExpiry,
-        // If a previous refresh failed but the user reconnected (which
-        // overwrites these fields via handleOAuthCallback), the row is
-        // already 'ok'. But if a transient network blip earlier flipped
-        // this to needs_reauth, clear the flag on success — defense in
-        // depth. handleOAuthCallback should really be the canonical reset
-        // path; this is just safety.
-        token_status: 'ok',
-        token_failed_at: null,
       })
       .eq('connection_id', connectionId)
 

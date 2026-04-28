@@ -124,18 +124,22 @@ export class CalendlyOAuthService {
   async ensureFreshToken(connectionId: string): Promise<string> {
     const client = this.supabaseService.getClient()
 
-    const { data } = await client
+    const { data, error } = await client
       .from('connections_calendly')
-      .select('access_token, refresh_token, expires_at, token_status')
+      .select('access_token, refresh_token, expires_at')
       .eq('connection_id', connectionId)
       .maybeSingle()
 
-    if (!data) throw new NotFoundException('Calendly credentials not found')
-
-    // Fast-fail if we've already learned this row's refresh token is dead.
-    // Symmetric with GA — see the GA `ensureFreshToken` for the rationale.
-    if (data.token_status === 'needs_reauth') {
-      throw new IntegrationReauthRequiredException('calendly', connectionId)
+    if (error) {
+      this.logger.error(
+        `Calendly credentials lookup errored for connection ${connectionId}: ` +
+          `code=${error.code ?? '?'} message=${error.message} details=${error.details ?? ''} hint=${error.hint ?? ''}`,
+      )
+      throw new NotFoundException('Calendly credentials lookup failed')
+    }
+    if (!data) {
+      this.logger.warn(`Calendly credentials row missing for connection ${connectionId}`)
+      throw new NotFoundException('Calendly credentials not found')
     }
 
     const expiresAt = new Date(data.expires_at as string)
@@ -186,10 +190,9 @@ export class CalendlyOAuthService {
       this.logger.warn(
         `Calendly refresh failed for connection ${connectionId} (${tokenRes.status}): ${detail.slice(0, 200)}`,
       )
-      await client
-        .from('connections_calendly')
-        .update({ token_status: 'needs_reauth', token_failed_at: new Date().toISOString() })
-        .eq('connection_id', connectionId)
+      // Refresh token is dead. See the GA equivalent for the rationale on
+      // not persisting a status flag — every subsequent request re-attempts
+      // and 4xx's again, fine at our scale.
       throw new IntegrationReauthRequiredException('calendly', connectionId)
     }
 
@@ -209,8 +212,6 @@ export class CalendlyOAuthService {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         expires_at: newExpiresAt,
-        token_status: 'ok',
-        token_failed_at: null,
       })
       .eq('connection_id', connectionId)
 

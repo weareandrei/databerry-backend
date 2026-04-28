@@ -34,10 +34,10 @@ interface IntegrationErrorPayload {
  * frontend can render an inline "Reconnect <Integration>" prompt instead
  * of a generic error.
  *
- * Side effect (caller's responsibility): when this is thrown, the relevant
- * `connections_<integration>` row should already have `token_status` set
- * to `'needs_reauth'` and `token_failed_at` stamped, so a future cron tick
- * doesn't keep retrying a definitively-dead refresh token.
+ * No DB-side memoization: every subsequent request re-attempts the refresh
+ * and 4xx's again. That's ~200ms + one Google/Calendly API call per
+ * dashboard load on a broken connection — acceptable until/unless a single
+ * stuck connection ever generates enough churn to matter.
  */
 export class IntegrationReauthRequiredException extends HttpException {
   readonly integration: IntegrationKey
