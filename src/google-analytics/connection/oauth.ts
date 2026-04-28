@@ -133,13 +133,20 @@ export class GoogleAnalyticsOAuthService {
     // fast with the structured error — no point burning a request on
     // Google's token endpoint just to get the same answer.
     if (data.token_status === 'needs_reauth') {
+      this.logger.warn(
+        `GA token already marked needs_reauth for ${connectionId} — failing fast`,
+      )
       throw new IntegrationReauthRequiredException('google_analytics', connectionId)
     }
 
     const expiry = new Date(data.token_expiry as string)
     const buffer = new Date(Date.now() + 5 * 60 * 1000)
 
-    if (expiry > buffer) return data.access_token as string
+    if (expiry > buffer) {
+      const minsLeft = Math.round((expiry.getTime() - Date.now()) / 60_000)
+      this.logger.log(`GA token still fresh for ${connectionId} (${minsLeft}m left, no refresh)`)
+      return data.access_token as string
+    }
 
     this.logger.log(`Refreshing GA token for connection ${connectionId}`)
     let res: Response
@@ -209,15 +216,18 @@ export class GoogleAnalyticsOAuthService {
         token_expiry: newExpiry,
         // If a previous refresh failed but the user reconnected (which
         // overwrites these fields via handleOAuthCallback), the row is
-        // already 'ok'. But if the cron is recovering from a transient
-        // network blip that flipped this to needs_reauth, clear the flag
-        // on success — defense in depth. handleOAuthCallback should
-        // really be the canonical reset path; this is just safety.
+        // already 'ok'. But if a transient network blip earlier flipped
+        // this to needs_reauth, clear the flag on success — defense in
+        // depth. handleOAuthCallback should really be the canonical reset
+        // path; this is just safety.
         token_status: 'ok',
         token_failed_at: null,
       })
       .eq('connection_id', connectionId)
 
+    this.logger.log(
+      `✓ Refreshed GA token for ${connectionId} (expires_in=${tokens.expires_in}s, new_expiry=${newExpiry})`,
+    )
     return tokens.access_token
   }
 

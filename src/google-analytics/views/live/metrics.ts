@@ -1,10 +1,11 @@
-import { NotFoundException } from '@nestjs/common'
+import { Logger, NotFoundException } from '@nestjs/common'
 import {
   IntegrationReauthRequiredException,
   IntegrationUpstreamException,
 } from '../../../common/integration-errors'
 
 const DATA_BASE = 'https://analyticsdata.googleapis.com/v1beta'
+const logger = new Logger('GoogleAnalyticsDataAPI')
 
 /**
  * Maps a GA view type to the GA Data API metric name.
@@ -37,6 +38,12 @@ async function throwForResponse(
   context: string,
 ): Promise<never> {
   const body = await res.text().catch(() => '')
+  // Log here so the Google response body lands in the GA log stream alongside
+  // ensureFreshToken's logs — instead of relying on whichever upstream filter
+  // happens to print the exception message.
+  logger.warn(
+    `${context} for ${connectionId}: status=${res.status} body=${body.slice(0, 200)}`,
+  )
   if (res.status === 401 || res.status === 403) {
     throw new IntegrationReauthRequiredException(
       'google_analytics',
