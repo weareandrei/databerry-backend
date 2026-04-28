@@ -5,6 +5,7 @@ import {
   IntegrationReauthRequiredException,
   IntegrationUpstreamException,
 } from '../../common/integration-errors'
+import { getPrimaryFrontendUrl } from '../../common/frontend-url'
 
 export interface GAProperty {
   id: string
@@ -22,7 +23,7 @@ export class GoogleAnalyticsOAuthService {
 
   readonly clientId = process.env.GA_CLIENT_ID!
   readonly clientSecret = process.env.GA_CLIENT_SECRET!
-  readonly frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3000'
+  readonly frontendUrl = getPrimaryFrontendUrl()
 
   constructor(private readonly supabaseService: SupabaseService) {}
 

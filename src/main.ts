@@ -9,6 +9,9 @@ async function bootstrap() {
   // allowlist both the bare apex ("https://databerry.app") and the www
   // subdomain ("https://www.databerry.app") from the same env var, which
   // the browser treats as distinct origins for CORS purposes.
+  //
+  // For server-issued redirects (OAuth callbacks) only the FIRST entry is
+  // used — see `common/frontend-url.ts`. Put the canonical host first.
   const extraOrigins = (process.env.FRONTEND_URL ?? '')
     .split(',')
     .map(s => s.trim())

@@ -2,6 +2,7 @@ import { Controller, Get, Query, Req, Res, UseGuards } from '@nestjs/common'
 import type { Response } from 'express'
 import { SupabaseAuthGuard } from '../../auth/supabase-auth.guard'
 import { StripeOAuthService } from './oauth'
+import { getPrimaryFrontendUrl } from '../../common/frontend-url'
 
 @Controller('stripe')
 export class StripeConnectionController {
@@ -22,7 +23,7 @@ export class StripeConnectionController {
     @Query('error') oauthError: string | undefined,
     @Res() res: Response,
   ) {
-    const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3000'
+    const frontendUrl = getPrimaryFrontendUrl()
 
     if (oauthError) {
       return res.redirect(`${frontendUrl}/hub/connections?stripe=error&reason=${oauthError}`)

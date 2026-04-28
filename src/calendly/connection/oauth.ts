@@ -5,6 +5,7 @@ import {
   IntegrationReauthRequiredException,
   IntegrationUpstreamException,
 } from '../../common/integration-errors'
+import { getPrimaryFrontendUrl } from '../../common/frontend-url'
 
 @Injectable()
 export class CalendlyOAuthService {
@@ -13,7 +14,7 @@ export class CalendlyOAuthService {
   readonly clientId = process.env.CALENDLY_CLIENT_ID!
   readonly clientSecret = process.env.CALENDLY_CLIENT_SECRET!
   readonly redirectUri = `${process.env.WEBHOOK_BASE_URL ?? 'http://localhost:3001'}/calendly/oauth/callback`
-  readonly frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3000'
+  readonly frontendUrl = getPrimaryFrontendUrl()
   readonly baseApi = 'https://api.calendly.com'
   readonly authBase = 'https://auth.calendly.com'
 
