@@ -218,6 +218,14 @@ export class ConnectionsService {
 
       const accountRow = await this.stripeBackfillService.resolveAccountFromApiKey(apiKey)
 
+      // ORDER MATTERS. The credential row FKs into `stripe_accounts.id`,
+      // so the parent row must exist first — otherwise the insert below
+      // explodes with `connections_stripe_manual_stripe_account_id_fkey`.
+      // The upsert is awaited; the backfill itself is kicked AFTER the
+      // credential row is in place so `makeStripeGetterForAccount` can
+      // find credentials when it runs.
+      await this.stripeBackfillService.upsertAccountRow(accountRow)
+
       const { error } = await client.from('connections_stripe_manual').insert({
         connection_id: connectionId,
         api_key: apiKey,
@@ -225,10 +233,10 @@ export class ConnectionsService {
       })
       if (error) throw new Error(error.message)
 
-      // Fire-and-forget: account upsert + 90-day backfill. Doesn't block
-      // connection creation. Multiple connections to the same account dedup
-      // via stripe_accounts (`backfillAccount` short-circuits when complete).
-      await this.stripeBackfillService.ensureAccountAndBackfill(accountRow)
+      // Fire-and-forget 90-day backfill. Multiple connections to the same
+      // account dedup via stripe_accounts (`backfillAccount` short-circuits
+      // when complete or in-progress).
+      this.stripeBackfillService.kickBackfill(accountRow.id)
     } else if (type === 'calendly') {
       // Credentials are inserted directly by CalendlyService.handleOAuthCallback — no-op here
     } else if (type === 'vercel') {

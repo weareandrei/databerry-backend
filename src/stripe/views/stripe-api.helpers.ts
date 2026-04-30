@@ -1,5 +1,6 @@
 import { Logger, NotFoundException, UnauthorizedException } from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
+import { ConnectionMissingException } from '../../common/integration-errors'
 
 // Single shared logger for every Stripe HTTP call. Tagged so it's easy to
 // grep for: `[StripeAPI]`. Every request and every failure gets one line.
@@ -34,7 +35,9 @@ export async function getApiKey(
     .eq('user_id', userId)
     .maybeSingle()
 
-  if (!conn) throw new NotFoundException('Connection not found')
+  // 410 → frontend renders an inline reattach prompt on the affected tile
+  // instead of a generic fetch-failed badge.
+  if (!conn) throw new ConnectionMissingException('stripe_manual', connectionId)
 
   const { data } = await supabaseService
     .getClient()

@@ -1,12 +1,64 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
-import { getPosthogCredentials } from '../connection/credentials'
+import { ConnectionMissingException } from '../../common/integration-errors'
+import { getPosthogCredentials, type PosthogCredentials } from '../connection/credentials'
+import {
+  fetchPosthogFunnel,
+  type FunnelStepConfig,
+  type FunnelStepRow,
+} from './live/funnel'
+import {
+  fetchPosthogRetention,
+  type RetentionConfig,
+  type RetentionPeriod,
+  type RetentionRow,
+} from './live/retention'
+import { fetchPosthogUsersList, type PosthogUserRow } from './live/users'
+
+interface LoadedView {
+  config: Record<string, unknown>
+  ph: PosthogCredentials
+}
 
 @Injectable()
 export class PosthogViewsService {
   private readonly logger = new Logger(PosthogViewsService.name)
 
   constructor(private readonly supabaseService: SupabaseService) {}
+
+  /**
+   * Shared preamble: ownership check + view config + PostHog credentials.
+   * Originally inlined in `fetchLiveValue`; pulled out so the new funnel /
+   * retention / users methods don't repeat the same 4-DB-roundtrip dance.
+   */
+  private async loadViewAndCreds(
+    connectionId: string,
+    viewId: string,
+    userId: string,
+  ): Promise<LoadedView> {
+    const client = this.supabaseService.getClient()
+
+    const { data: conn, error: connErr } = await client
+      .from('connections')
+      .select('id')
+      .eq('id', connectionId)
+      .eq('user_id', userId)
+      .single()
+    if (connErr || !conn) throw new ConnectionMissingException('posthog', connectionId)
+
+    const { data: view, error: viewErr } = await client
+      .from('views')
+      .select('config')
+      .eq('id', viewId)
+      .eq('user_id', userId)
+      .single()
+    if (viewErr || !view) throw new NotFoundException('View not found')
+
+    const ph = await getPosthogCredentials(connectionId, this.supabaseService)
+    if (!ph) throw new NotFoundException('PostHog credentials not found')
+
+    return { config: (view.config ?? {}) as Record<string, unknown>, ph }
+  }
 
   async fetchLiveValue(
     connectionId: string,
@@ -25,38 +77,13 @@ export class PosthogViewsService {
     )
 
     const client = this.supabaseService.getClient()
-
-    // Verify connection ownership
-    const { data: conn, error: connErr } = await client
-      .from('connections')
-      .select('id')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .single()
-
-    if (connErr || !conn) throw new NotFoundException('Connection not found')
-
-    // Fetch view config to get eventName
-    const { data: view, error: viewErr } = await client
-      .from('views')
-      .select('config')
-      .eq('id', viewId)
-      .eq('user_id', userId)
-      .single()
-
-    if (viewErr || !view) throw new NotFoundException('View not found')
-
-    const config = (view.config ?? {}) as Record<string, unknown>
+    const { config, ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
     const eventName = (config.eventName as string | undefined) ?? ''
 
     if (!eventName) {
       this.logger.warn(`  ⚠ No eventName in view config — returning 0`)
       return { value: '0' }
     }
-
-    // Get PostHog credentials
-    const ph = await getPosthogCredentials(connectionId, this.supabaseService)
-    if (!ph) throw new NotFoundException('PostHog credentials not found')
 
     const safeEvent = eventName.replace(/'/g, "\\'")
     const safeFrom = from.replace(/'/g, '')
@@ -106,5 +133,100 @@ export class PosthogViewsService {
     }
 
     return { value }
+  }
+
+  /**
+   * Funnel — counts users who progressed through 2–5 ordered events
+   * within `conversionWindowSeconds`. Wire shape is `{ steps: [...] }`
+   * with cumulative counts + per-step conversion percentages.
+   */
+  async fetchFunnel(
+    connectionId: string,
+    viewId: string,
+    userId: string,
+    dateFrom?: string,
+    dateTo?: string,
+  ): Promise<{ steps: FunnelStepRow[]; unavailable?: boolean }> {
+    const todayStr = new Date().toISOString().split('T')[0]
+    const from = dateFrom ?? todayStr
+    const to = dateTo ?? from
+
+    this.logger.log(
+      `\n  ► fetchFunnel (posthog)\n  connectionId : ${connectionId}\n  viewId       : ${viewId}\n  dateFrom     : ${from}\n  dateTo       : ${to}`,
+    )
+
+    const { config, ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
+    const steps = (config.steps as FunnelStepConfig[] | undefined) ?? []
+    // 7 days is the same default we expose in the picker; if for some reason
+    // a view persisted without one (older drafts, manual SQL edits), we fall
+    // back to the same value rather than 0 (which would void the funnel).
+    const window = (config.conversionWindowSeconds as number | undefined) ?? 86400 * 7
+
+    if (steps.length < 2) {
+      this.logger.warn(`  ⚠ Funnel needs ≥2 steps; got ${steps.length}`)
+      return { steps: [] }
+    }
+
+    return fetchPosthogFunnel(ph, steps, window, from, to, this.logger)
+  }
+
+  /**
+   * Retention — cohort heatmap. `dateTo` anchors the most-recent cohort row;
+   * the cohort window walks back `cohortCount` periods from there. The
+   * global picker's `dateFrom` is intentionally ignored here (see comments
+   * in `retention.ts:buildRetentionHogql`).
+   */
+  async fetchRetention(
+    connectionId: string,
+    viewId: string,
+    userId: string,
+    _dateFrom?: string,
+    dateTo?: string,
+  ): Promise<{
+    cohorts: RetentionRow[]
+    periodLabel: RetentionPeriod
+    unavailable?: boolean
+  }> {
+    const todayStr = new Date().toISOString().split('T')[0]
+    const to = dateTo ?? todayStr
+
+    this.logger.log(
+      `\n  ► fetchRetention (posthog)\n  connectionId : ${connectionId}\n  viewId       : ${viewId}\n  dateTo       : ${to}`,
+    )
+
+    const { config, ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
+    const retentionConfig: RetentionConfig = {
+      startEvent: (config.startEvent as string | undefined) ?? '$pageview',
+      returnEvent: (config.returnEvent as string | undefined) ?? '$pageview',
+      period: (config.period as RetentionPeriod | undefined) ?? 'day',
+      cohortCount: (config.cohortCount as number | undefined) ?? 7,
+      retentionPeriods: (config.retentionPeriods as number | undefined) ?? 7,
+    }
+
+    return fetchPosthogRetention(ph, retentionConfig, to, this.logger)
+  }
+
+  /**
+   * Users — wraps the existing `fetchPosthogUsersList`. No view config
+   * required in v1; the date range gates the query window.
+   */
+  async fetchUsers(
+    connectionId: string,
+    viewId: string,
+    userId: string,
+    dateFrom?: string,
+    dateTo?: string,
+  ): Promise<{ users: PosthogUserRow[]; unavailable?: boolean }> {
+    const todayStr = new Date().toISOString().split('T')[0]
+    const from = dateFrom ?? todayStr
+    const to = dateTo ?? from
+
+    this.logger.log(
+      `\n  ► fetchUsers (posthog)\n  connectionId : ${connectionId}\n  viewId       : ${viewId}\n  dateFrom     : ${from}\n  dateTo       : ${to}`,
+    )
+
+    const { ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
+    const users = await fetchPosthogUsersList(ph, from, to, 500, this.logger)
+    return { users }
   }
 }

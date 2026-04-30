@@ -21,12 +21,19 @@ export class ProjectOverviewController {
     @Query('mode') mode: OverviewMode,
     @Query('primaryMetric') primaryMetric: PrimaryMetric,
     @Query('secondaryMetric') secondaryMetric: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     const normalizedSecondary: SecondaryMetric =
       !secondaryMetric || secondaryMetric === 'null' || secondaryMetric === 'none'
         ? null
         : (secondaryMetric as SecondaryMetric)
+
+    // Validate tz: only allow IANA-style identifiers ([A-Za-z0-9_/+-]). The
+    // service re-validates before threading it into HogQL, but rejecting junk
+    // here keeps the log line clean and gives a fast 'UTC' fallback.
+    const safeTz =
+      typeof tz === 'string' && /^[A-Za-z0-9_/+-]+$/.test(tz) ? tz : 'UTC'
 
     return this.service.fetchChart(
       req.authUser.id,
@@ -36,6 +43,7 @@ export class ProjectOverviewController {
       mode,
       primaryMetric,
       normalizedSecondary,
+      safeTz,
     )
   }
 

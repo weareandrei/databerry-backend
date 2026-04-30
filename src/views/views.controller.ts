@@ -55,7 +55,7 @@ export class ViewsController {
   @Patch(':id')
   update(
     @Param('id') id: string,
-    @Body() dto: { config?: Record<string, unknown>; name?: string },
+    @Body() dto: { config?: Record<string, unknown>; name?: string; connectionId?: string | null },
     @Req() req: AuthenticatedRequest,
   ) {
     return this.viewsService.updateView(id, dto, req.authUser.id)

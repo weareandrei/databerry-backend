@@ -44,4 +44,24 @@ export class StripeViewsController {
     )
     return { points }
   }
+
+  /**
+   * Top customers list — separate route from `live-value` because the wire
+   * shape is an array of structured rows, not a single string. Mirrors
+   * `GET /calendly/views/meetings`. Date range optional (defaults to "today").
+   */
+  @Get('top-customers')
+  async getTopCustomers(
+    @Query('connectionId') connectionId: string,
+    @Query('dateFrom') dateFrom: string | undefined,
+    @Query('dateTo') dateTo: string | undefined,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.stripeViewsService.fetchTopCustomers(
+      connectionId,
+      req.authUser.id,
+      dateFrom,
+      dateTo,
+    )
+  }
 }

@@ -2,6 +2,7 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { randomBytes } from 'crypto'
 import { SupabaseService } from '../../supabase/supabase.service'
 import {
+  ConnectionMissingException,
   IntegrationReauthRequiredException,
   IntegrationUpstreamException,
 } from '../../common/integration-errors'
@@ -255,7 +256,11 @@ export class GoogleAnalyticsOAuthService {
       .eq('user_id', userId)
       .maybeSingle()
 
-    if (!data) throw new NotFoundException('Connection not found')
+    // 410 (not 404) so the per-view live-value tile can render the inline
+    // "Reconnect" → reassign-connection-dialog flow instead of a generic
+    // "Couldn't load value" badge. Same shape as the reauth path; see
+    // `frontend/lib/api.ts#ConnectionMissingError`.
+    if (!data) throw new ConnectionMissingException('google_analytics', connectionId)
   }
 
   async listPropertiesWithToken(token: string): Promise<GAProperty[]> {

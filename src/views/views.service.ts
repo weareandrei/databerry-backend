@@ -1,6 +1,14 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common'
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { SupabaseService } from '../supabase/supabase.service'
 import { PosthogLifecycleService } from '../posthog/lifecycle/hog-function'
+
+/**
+ * View types that *intentionally* have no `connection_id` — the server
+ * resolves the right provider per-request via `pickTrafficProvider`. Auto-
+ * reattach skips these.
+ */
+const COMPOSITE_VIEW_TYPES = new Set(['project_overview', 'project_overview_sources'])
+const COMPOSITE_CONNECTION_TYPE = 'composite'
 
 export interface CreateViewDto {
   projectId: string
@@ -35,7 +43,8 @@ export class ViewsService {
       .order('created_at', { ascending: true })
 
     if (error) throw new Error(error.message)
-    return data.map(row => this.toCamel(row, dateFrom, dateTo))
+    const healed = await this.healOrphans(data ?? [], userId)
+    return healed.map(row => this.toCamel(row, dateFrom, dateTo))
   }
 
   async getViewsByProject(projectId: string, userId: string, dateFrom?: string, dateTo?: string) {
@@ -53,7 +62,8 @@ export class ViewsService {
       .order('created_at', { ascending: true })
 
     if (error) throw new Error(error.message)
-    return data.map(row => this.toCamel(row, dateFrom, dateTo))
+    const healed = await this.healOrphans(data ?? [], userId)
+    return healed.map(row => this.toCamel(row, dateFrom, dateTo))
   }
 
   async getPinnedViews(userId: string) {
@@ -68,7 +78,8 @@ export class ViewsService {
       .order('created_at', { ascending: true })
 
     if (error) throw new Error(error.message)
-    return data.map(row => this.toCamel(row))
+    const healed = await this.healOrphans(data ?? [], userId)
+    return healed.map(row => this.toCamel(row))
   }
 
   async pinView(viewId: string, userId: string) {
@@ -172,12 +183,51 @@ export class ViewsService {
 
   async updateView(
     viewId: string,
-    dto: { config?: Record<string, unknown>; name?: string },
+    dto: { config?: Record<string, unknown>; name?: string; connectionId?: string | null },
     userId: string,
   ) {
     const patch: Record<string, unknown> = {}
     if (dto.config !== undefined) patch.config = dto.config
     if (dto.name !== undefined) patch.name = dto.name
+
+    // Reassigning the connection: validate the chosen connection belongs to
+    // this user, matches the view's connection_type, and is project-eligible
+    // (project-scoped to the view's project, or Common). Mismatches throw 400
+    // so the frontend doesn't silently pin a wrong-typed connection that the
+    // live-value endpoints will then 4xx on.
+    if (dto.connectionId !== undefined) {
+      if (dto.connectionId === null) {
+        patch.connection_id = null
+      } else {
+        const client = this.supabaseService.getClient()
+        const { data: view } = await client
+          .from('views')
+          .select('project_id, connection_type')
+          .eq('id', viewId)
+          .eq('user_id', userId)
+          .maybeSingle()
+        if (!view) throw new NotFoundException('View not found')
+
+        const { data: conn } = await client
+          .from('connections')
+          .select('id, type, project_id')
+          .eq('id', dto.connectionId)
+          .eq('user_id', userId)
+          .maybeSingle()
+        if (!conn) throw new NotFoundException('Connection not found')
+        if (conn.type !== view.connection_type) {
+          throw new BadRequestException(
+            `Connection type "${conn.type}" does not match view connection_type "${view.connection_type}"`,
+          )
+        }
+        if (conn.project_id != null && conn.project_id !== view.project_id) {
+          throw new BadRequestException(
+            'Connection is scoped to a different project and is not eligible for this view',
+          )
+        }
+        patch.connection_id = dto.connectionId
+      }
+    }
 
     if (Object.keys(patch).length === 0) {
       // No-op — return current row
@@ -277,6 +327,116 @@ export class ViewsService {
         .eq('view_id', viewId)
         .eq('created_at', targetDate)
     }
+  }
+
+  /**
+   * Auto-reattach views to a fresh connection when the original is gone.
+   *
+   * Why this exists: when a user deletes a stale connection (e.g. revoked
+   * GA refresh token) and creates a new one of the same type for the same
+   * project, the project-overview chart self-heals because it resolves
+   * its provider per-request via `pickTrafficProvider`. Per-view tiles
+   * don't — they store `connection_id` on the row and become orphans.
+   *
+   * Heuristic (per the user's request — strict, no surprises):
+   *   1. Skip composite views (`project_overview`, `project_overview_sources`,
+   *      and any row tagged `connection_type: 'composite'`).
+   *   2. A row is "orphan" if `connection_id` is null OR points to a row
+   *      that no longer exists under this user.
+   *   3. For each orphan, look for project-scoped connections matching
+   *      `(view.project_id, view.connection_type)`. If exactly 1 → use it.
+   *      If 2+ → ambiguous, leave the view orphaned. If 0 → fall through
+   *      to Common (`project_id IS NULL`) with the same exactly-1 rule.
+   *      If still no unique pick → leave orphaned (the user picks via the
+   *      reassignment dialog).
+   *
+   * The mutation is in-place on the result rows so the caller's `.toCamel()`
+   * pass returns the healed `connection_id`. Updates are fire-and-await per
+   * row (volume is tiny — at most a handful of orphans per fetch).
+   */
+  private async healOrphans(
+    rows: Record<string, unknown>[],
+    userId: string,
+  ): Promise<Record<string, unknown>[]> {
+    if (rows.length === 0) return rows
+
+    // Anything we'd consider for healing — exclude composites up-front.
+    const candidates = rows.filter(
+      r =>
+        !COMPOSITE_VIEW_TYPES.has(r.type as string) &&
+        r.connection_type !== COMPOSITE_CONNECTION_TYPE,
+    )
+    if (candidates.length === 0) return rows
+
+    const client = this.supabaseService.getClient()
+
+    // One round-trip for the entire user's connections — cheap (small N) and
+    // simpler than per-view lookups.
+    const { data: connections } = await client
+      .from('connections')
+      .select('id, type, project_id')
+      .eq('user_id', userId)
+
+    const conns = (connections ?? []) as { id: string; type: string; project_id: string | null }[]
+    const validIds = new Set(conns.map(c => c.id))
+
+    // Index by (type, project_id) so the per-view pick is O(1). Use empty
+    // string sentinel for Common since Map keys can't be null.
+    const byKey = new Map<string, string[]>()
+    const keyFor = (type: string, projectId: string | null) => `${type}|${projectId ?? ''}`
+    for (const c of conns) {
+      const k = keyFor(c.type, c.project_id)
+      const list = byKey.get(k) ?? []
+      list.push(c.id)
+      byKey.set(k, list)
+    }
+
+    const updates: { viewId: string; connectionId: string }[] = []
+    for (const v of candidates) {
+      const currentId = v.connection_id as string | null
+      const isOrphan = !currentId || !validIds.has(currentId)
+      if (!isOrphan) continue
+
+      const type = v.connection_type as string
+      const projectId = v.project_id as string
+
+      // Project-scoped first.
+      const scoped = byKey.get(keyFor(type, projectId)) ?? []
+      let pick: string | null = null
+      if (scoped.length === 1) {
+        pick = scoped[0]
+      } else if (scoped.length === 0) {
+        // Fall through to Common only when there's nothing project-scoped at
+        // all — if the user has multiple project-scoped connections the
+        // intent is ambiguous, don't quietly pick a Common one over them.
+        const common = byKey.get(keyFor(type, null)) ?? []
+        if (common.length === 1) pick = common[0]
+      }
+
+      if (pick) {
+        v.connection_id = pick
+        updates.push({ viewId: v.id as string, connectionId: pick })
+      }
+    }
+
+    if (updates.length > 0) {
+      this.logger.log(
+        `  ↻ healOrphans  auto-attached ${updates.length} view(s) to fresh connections`,
+      )
+      // Per-row updates — Supabase has no batched-by-id update without RPC,
+      // and the orphan count is small in practice.
+      await Promise.all(
+        updates.map(u =>
+          client
+            .from('views')
+            .update({ connection_id: u.connectionId })
+            .eq('id', u.viewId)
+            .eq('user_id', userId),
+        ),
+      )
+    }
+
+    return rows
   }
 
   private aggregateValues(

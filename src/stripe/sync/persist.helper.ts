@@ -1,9 +1,15 @@
 import type { SupabaseService } from '../../supabase/supabase.service'
 import type { ResolvedLineItem } from './line-items.helper'
+import {
+  computeMonthlyAmountCents,
+  subscriptionItemsForRow,
+} from './mrr.helper'
 import type {
   StripeAccountRow,
   StripeChargeRow,
+  StripeCustomerRow,
   StripeProductRow,
+  StripeSubscriptionRow,
 } from './types'
 
 type Client = ReturnType<SupabaseService['getClient']>
@@ -31,6 +37,80 @@ export async function upsertAccount(
     )
 
   if (error) throw new Error(`stripe_accounts upsert: ${error.message}`)
+}
+
+/**
+ * Bulk upsert customers for a given account. Empty array is a no-op.
+ * Filters out Stripe's "deleted: true" stub customers — we don't surface
+ * them in the top-customers tile and persisting them would break the
+ * NOT-NULL `created` constraint anyway (Stripe doesn't include the field
+ * on stubs).
+ */
+export async function upsertCustomers(
+  client: Client,
+  stripeAccountId: string,
+  customers: StripeCustomerRow[],
+): Promise<void> {
+  if (customers.length === 0) return
+
+  const rows = customers
+    .filter(c => !c.deleted)
+    .map(c => ({
+      id: c.id,
+      stripe_account_id: stripeAccountId,
+      name: c.name ?? null,
+      email: c.email ?? null,
+      created: new Date(c.created * 1000).toISOString(),
+    }))
+
+  if (rows.length === 0) return
+
+  const { error } = await client
+    .from('stripe_customers')
+    .upsert(rows, { onConflict: 'id' })
+
+  if (error) throw new Error(`stripe_customers upsert: ${error.message}`)
+}
+
+/**
+ * Bulk upsert subscriptions. Computes `monthly_amount_cents` and the
+ * persisted JSONB items shape inline so the read-side never has to know
+ * about Stripe's price expansion.
+ */
+export async function upsertSubscriptions(
+  client: Client,
+  stripeAccountId: string,
+  subs: StripeSubscriptionRow[],
+): Promise<void> {
+  if (subs.length === 0) return
+
+  const rows = subs.map(s => {
+    const monthly = computeMonthlyAmountCents(s)
+    const items = subscriptionItemsForRow(s)
+    return {
+      id: s.id,
+      stripe_account_id: stripeAccountId,
+      customer_id: s.customer,
+      status: s.status,
+      currency: s.currency,
+      monthly_amount_cents: monthly,
+      created: new Date(s.created * 1000).toISOString(),
+      canceled_at: s.canceled_at
+        ? new Date(s.canceled_at * 1000).toISOString()
+        : null,
+      current_period_end: s.current_period_end
+        ? new Date(s.current_period_end * 1000).toISOString()
+        : null,
+      // Postgres' jsonb column accepts JS arrays directly via PostgREST.
+      items,
+    }
+  })
+
+  const { error } = await client
+    .from('stripe_subscriptions')
+    .upsert(rows, { onConflict: 'id' })
+
+  if (error) throw new Error(`stripe_subscriptions upsert: ${error.message}`)
 }
 
 /** Bulk upsert products for a given account. Empty array is a no-op. */
@@ -124,7 +204,16 @@ export async function replaceLineItems(
   if (insErr) throw new Error(`stripe_line_items insert: ${insErr.message}`)
 }
 
-/** Update only the `backfill_status` (and optionally error/error-message). */
+/**
+ * Update `backfill_status` (and optionally error/error-message).
+ *
+ * `backfill_started_at` bookkeeping piggybacks on this:
+ *   - `'in_progress'` stamps a fresh `NOW()` so stale-run detection can
+ *     measure how long the run has been alive.
+ *   - terminal statuses (`'complete'` / `'error'`) clear it — the row is no
+ *     longer "claimed" by an in-flight worker.
+ *   - `'pending'` also clears it (used by retry).
+ */
 export async function setBackfillStatus(
   client: Client,
   stripeAccountId: string,
@@ -132,10 +221,20 @@ export async function setBackfillStatus(
   errorMessage?: string,
 ): Promise<void> {
   const update: Record<string, unknown> = { backfill_status: status }
-  if (status === 'error') update.backfill_error = errorMessage ?? null
+  if (status === 'error') {
+    update.backfill_error = errorMessage ?? null
+    update.backfill_started_at = null
+  }
   if (status === 'complete') {
     update.backfill_error = null
     update.last_synced_at = new Date().toISOString()
+    update.backfill_started_at = null
+  }
+  if (status === 'pending') {
+    update.backfill_started_at = null
+  }
+  if (status === 'in_progress') {
+    update.backfill_started_at = new Date().toISOString()
   }
 
   const { error } = await client

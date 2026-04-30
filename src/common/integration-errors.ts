@@ -18,11 +18,27 @@ export type IntegrationKey = 'google_analytics' | 'calendly'
  *                                 (404, 429, 5xx, network). Not the user's
  *                                 fault, not fixed by reconnecting.
  */
-export type IntegrationErrorCode = 'INTEGRATION_NEEDS_REAUTH' | 'INTEGRATION_UPSTREAM_ERROR'
+export type IntegrationErrorCode =
+  | 'INTEGRATION_NEEDS_REAUTH'
+  | 'INTEGRATION_UPSTREAM_ERROR'
+  | 'CONNECTION_MISSING'
 
 interface IntegrationErrorPayload {
   error: IntegrationErrorCode
   integration: IntegrationKey
+  connectionId: string
+  detail?: string
+}
+
+/**
+ * Same shape as `IntegrationErrorPayload` but with a wider `integration`
+ * field — `ConnectionMissingException` applies to every provider (including
+ * stripe / stripe_manual / posthog), not just OAuth-refreshable ones, so
+ * we can't reuse `IntegrationKey` here.
+ */
+interface ConnectionMissingPayload {
+  error: 'CONNECTION_MISSING'
+  integration: string
   connectionId: string
   detail?: string
 }
@@ -76,6 +92,41 @@ export class IntegrationUpstreamException extends HttpException {
       ...(detail ? { detail } : {}),
     }
     super(payload, HttpStatus.BAD_GATEWAY)
+    this.integration = integration
+    this.connectionId = connectionId
+  }
+}
+
+/**
+ * Thrown when a request references a `connectionId` that no longer exists
+ * for the current user — typically because the user (or an admin) deleted
+ * the connection while a view tile was still open. The view's
+ * `connection_id` FK is now dangling.
+ *
+ * Returns HTTP 410 Gone so the frontend can branch on it cleanly:
+ * `apiFetch` parses this into a `ConnectionMissingError`, and the view
+ * tile then offers an inline "Reconnect" entry point that opens the
+ * `ReassignConnectionDialog` (instead of the misleading generic
+ * "Couldn't load value" badge).
+ *
+ * Distinct from `IntegrationReauthRequiredException` (401 — credential
+ * expired but connection row still exists) and from a missing project /
+ * folder etc. (still `NotFoundException` 404). Distinct from `IntegrationKey`
+ * because this case can fire for stripe / stripe_manual / posthog too,
+ * which never go through OAuth refresh.
+ */
+export class ConnectionMissingException extends HttpException {
+  readonly integration: string
+  readonly connectionId: string
+
+  constructor(integration: string, connectionId: string, detail?: string) {
+    const payload: ConnectionMissingPayload = {
+      error: 'CONNECTION_MISSING',
+      integration,
+      connectionId,
+      ...(detail ? { detail } : {}),
+    }
+    super(payload, HttpStatus.GONE)
     this.integration = integration
     this.connectionId = connectionId
   }

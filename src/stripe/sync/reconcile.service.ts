@@ -3,7 +3,7 @@ import { Cron } from '@nestjs/schedule'
 import { SupabaseService } from '../../supabase/supabase.service'
 import { makeStripeGetterForAccount } from './account-getter.helper'
 import { bumpLastSyncedAt } from './persist.helper'
-import { syncCharges } from './sync-range.helper'
+import { syncCharges, syncSubscriptions } from './sync-range.helper'
 
 const RECONCILE_WINDOW_HOURS = 48
 
@@ -60,8 +60,17 @@ export class StripeReconcileService {
       const since = now - RECONCILE_WINDOW_HOURS * 3600
 
       const count = await syncCharges(client, stripeAccountId, get, since, now, this.logger)
+
+      // Full re-pull of subscriptions (NOT windowed) — the active set is
+      // small and we need to catch cancellations that happened between
+      // webhook deliveries. Reconcile charges are windowed because they're
+      // immutable and append-only; subscriptions transition state.
+      const subCount = await syncSubscriptions(client, stripeAccountId, get, this.logger)
+
       await bumpLastSyncedAt(client, stripeAccountId)
-      this.logger.log(`  ✓ reconciled ${stripeAccountId} — ${count} charge(s) over last ${RECONCILE_WINDOW_HOURS}h`)
+      this.logger.log(
+        `  ✓ reconciled ${stripeAccountId} — ${count} charge(s) over last ${RECONCILE_WINDOW_HOURS}h, ${subCount} sub(s)`,
+      )
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       this.logger.error(`  ✗ reconcile failed for ${stripeAccountId}: ${msg}`)

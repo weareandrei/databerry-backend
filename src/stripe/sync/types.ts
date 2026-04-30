@@ -67,3 +67,57 @@ export interface StripeListPage<T> {
   data: T[]
   has_more: boolean
 }
+
+/**
+ * Customer as returned by `/v1/customers`. We only persist identity fields —
+ * the "top customers" tile shows name/email and a revenue figure, nothing
+ * billing-internal. Stripe occasionally returns deleted customer stubs
+ * (`{ id, deleted: true }`); the sync layer filters those before upsert.
+ */
+export interface StripeCustomerRow {
+  id: string
+  name?: string | null
+  email?: string | null
+  created: number // unix seconds
+  deleted?: boolean
+}
+
+/** Recurring price metadata embedded under `subscription.items.data[].price`. */
+export interface StripeRecurringRow {
+  interval: 'day' | 'week' | 'month' | 'year'
+  interval_count: number
+}
+
+export interface StripeSubscriptionPriceRow {
+  id: string
+  product?: string | null
+  unit_amount?: number | null
+  currency?: string | null
+  recurring?: StripeRecurringRow | null
+}
+
+/** Subscription item as returned by `expand[]=data.items.data.price`. */
+export interface StripeSubscriptionItemRow {
+  id: string
+  quantity?: number | null
+  price?: StripeSubscriptionPriceRow | null
+}
+
+/**
+ * Subscription row as returned by `/v1/subscriptions?status=all` with
+ * `expand[]=data.items.data.price`.
+ *
+ * Stripe surfaces `current_period_end` and `canceled_at` as unix seconds (or
+ * nullable for active subs). We persist both as TIMESTAMPTZ; conversion lives
+ * at the persist layer.
+ */
+export interface StripeSubscriptionRow {
+  id: string
+  customer: string | null
+  status: string
+  currency: string
+  created: number
+  canceled_at: number | null
+  current_period_end: number | null
+  items?: { data: StripeSubscriptionItemRow[] } | null
+}

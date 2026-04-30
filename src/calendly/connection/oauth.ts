@@ -2,6 +2,7 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { createHash, randomBytes } from 'crypto'
 import { SupabaseService } from '../../supabase/supabase.service'
 import {
+  ConnectionMissingException,
   IntegrationReauthRequiredException,
   IntegrationUpstreamException,
 } from '../../common/integration-errors'
@@ -240,6 +241,8 @@ export class CalendlyOAuthService {
       .eq('user_id', userId)
       .maybeSingle()
 
-    if (!data) throw new NotFoundException('Connection not found')
+    // 410 (not 404) so the per-view live-value tile renders the inline
+    // reattach prompt. Mirrors the GA `verifyOwnership` change.
+    if (!data) throw new ConnectionMissingException('calendly', connectionId)
   }
 }

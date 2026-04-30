@@ -22,6 +22,12 @@ import {
   getStripeAccountIdForConnection,
 } from '../stripe/views/storage-queries'
 import { normalizeSource } from './source-normalization'
+import {
+  dateStrInTz,
+  gaDateHourKeyInTz,
+  localMidnightUtc,
+  phHourlyKeyInTz,
+} from '../common/tz'
 
 export type OverviewMode = 'daily' | 'weekly' | 'monthly'
 export type PrimaryMetric = 'visitors' | 'pageviews' | 'conversions' | 'revenue'
@@ -103,32 +109,48 @@ function fmtHourLabel(h: number): string {
 const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
-/** Build the fixed bucket grid for the requested period. */
-function buildBuckets(mode: OverviewMode, dateFrom: string, dateTo: string): Bucket[] {
+/**
+ * Build the fixed bucket grid for the requested period, in `tz`.
+ *
+ * Daily mode anchors at *local* midnight (`tz`) so the 24 hourly buckets
+ * cover the user's day, not UTC's day. Weekly/monthly modes still iterate
+ * UTC days — see plan note: shift across midnight for extreme tz offsets is
+ * a known follow-up.
+ */
+function buildBuckets(
+  mode: OverviewMode,
+  dateFrom: string,
+  dateTo: string,
+  tz: string = 'UTC',
+): Bucket[] {
   const buckets: Bucket[] = []
-  const start = new Date(dateFrom + 'T00:00:00Z')
 
   if (mode === 'daily') {
-    // 24 hourly buckets on dateFrom
+    // 24 hourly buckets on dateFrom, each one hour wide, anchored at the
+    // user-local midnight in `tz`. We add `h * 3600 * 1000` rather than
+    // `setUTCHours(h)` because DST transitions inside the day would skew an
+    // hour-of-day setter; epoch-ms math is unambiguous.
+    const startUtc = localMidnightUtc(dateFrom, tz)
     for (let h = 0; h < 24; h++) {
-      const bs = new Date(start)
-      bs.setUTCHours(h, 0, 0, 0)
-      const be = new Date(bs)
-      be.setUTCHours(h + 1)
+      const bs = new Date(startUtc.getTime() + h * 3600_000)
+      const be = new Date(bs.getTime() + 3600_000)
       buckets.push({
+        // h here is the *user-local* hour (0..23) by construction, since bs
+        // is N hours past local midnight in tz. fmtHourLabel(h) is correct.
         label: fmtHourLabel(h),
         start: bs,
         end: be,
-        gaKey: `${bs.getUTCFullYear()}${pad2(bs.getUTCMonth() + 1)}${pad2(bs.getUTCDate())}${pad2(h)}`,
-        phHourlyKey: `${bs.getUTCFullYear()}-${pad2(bs.getUTCMonth() + 1)}-${pad2(bs.getUTCDate())}T${pad2(h)}:00:00`,
-        phDailyKey: `${bs.getUTCFullYear()}-${pad2(bs.getUTCMonth() + 1)}-${pad2(bs.getUTCDate())}`,
+        gaKey: gaDateHourKeyInTz(bs, tz),
+        phHourlyKey: phHourlyKeyInTz(bs, tz),
+        phDailyKey: dateStrInTz(bs, tz),
         unix: Math.floor(bs.getTime() / 1000),
       })
     }
     return buckets
   }
 
-  // weekly / monthly — daily buckets from dateFrom through dateTo
+  // weekly / monthly — daily buckets from dateFrom through dateTo (UTC days).
+  const start = new Date(dateFrom + 'T00:00:00Z')
   const end = new Date(dateTo + 'T00:00:00Z')
   const cursor = new Date(start)
   while (cursor <= end) {
@@ -233,16 +255,29 @@ export class ProjectOverviewService {
     mode: OverviewMode,
     primaryMetric: PrimaryMetric,
     secondaryMetric: SecondaryMetric,
+    tz: string = 'UTC',
   ): Promise<OverviewChartResponse> {
     this.logger.log(
-      `\n  ► fetchChart  projectId=${projectId} ${mode} ${dateFrom}→${dateTo}  primary=${primaryMetric} secondary=${secondaryMetric ?? 'none'}`,
+      `\n  ► fetchChart  projectId=${projectId} ${mode} ${dateFrom}→${dateTo}  primary=${primaryMetric} secondary=${secondaryMetric ?? 'none'} tz=${tz}`,
     )
 
-    const buckets = buildBuckets(mode, dateFrom, dateTo)
+    const buckets = buildBuckets(mode, dateFrom, dateTo, tz)
     const gran = this.granularity(mode)
 
     const provider = await this.pickTrafficProvider(userId, projectId)
     const projectSettings = await this.projectSettingsService.get(projectId, userId)
+
+    // GA4 Data API doesn't accept a per-query timezone — `dateHour` is rendered
+    // in the *property's* configured timezone (GA Admin → Property settings).
+    // If property tz === user tz, bars align like PostHog. Otherwise GA bars
+    // in daily mode will be off by the offset between the two zones. Logged
+    // here so the gap is observable in production. Full fix = switch to a
+    // timestamp dimension + bucket on the backend (out of scope, see plan).
+    if (tz !== 'UTC' && provider?.type === 'google_analytics') {
+      this.logger.warn(
+        `GA traffic with tz=${tz}: GA's dateHour is property-tz; chart may be misaligned if property tz !== user tz`,
+      )
+    }
 
     // Accumulators keyed by bucket index
     const byBucketTotal: number[] = new Array(buckets.length).fill(0)
@@ -292,7 +327,7 @@ export class ProjectOverviewService {
           if (!ph) {
             primaryUnavailable = true
           } else {
-            const rows = await fetchPosthogSourcesByBucket(ph, dateFrom, dateTo, gran, this.logger)
+            const rows = await fetchPosthogSourcesByBucket(ph, dateFrom, dateTo, gran, this.logger, tz)
             this.assignSourceRows(buckets, byBucketTotal, byBucketSources, rows, 'posthog')
           }
         } catch (err) {
@@ -314,6 +349,7 @@ export class ProjectOverviewService {
               dateTo,
               gran,
               this.logger,
+              tz,
             )
             this.assignFlatRows(buckets, byBucketTotal, byBucketSources, rows, 'Conversions')
           } else {
@@ -419,7 +455,7 @@ export class ProjectOverviewService {
           } else {
             const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
             if (ph) {
-              const rows = await fetchPosthogSourcesByBucket(ph, dateFrom, dateTo, gran, this.logger)
+              const rows = await fetchPosthogSourcesByBucket(ph, dateFrom, dateTo, gran, this.logger, tz)
               for (const r of rows) {
                 const k = r.bucketKey
                 sessionsByKey.set(k, (sessionsByKey.get(k) ?? 0) + r.value)
@@ -437,6 +473,7 @@ export class ProjectOverviewService {
               dateTo,
               gran,
               this.logger,
+              tz,
             )
             conversionsByKey = new Map(rows.map(r => [r.bucketKey, r.value]))
           }

@@ -1,13 +1,34 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
 import { ViewsService } from '../../views/views.service'
+import { ConnectionMissingException } from '../../common/integration-errors'
 import {
   fetchAccountCharges,
+  fetchActiveSubsAndMrr,
+  fetchChurnRate30d,
+  fetchTopCustomers,
   getConnectionProductFilter,
   getStripeAccountIdForConnection,
   type ChargeRow,
+  type TopCustomerRow,
 } from './storage-queries'
 import type { ChartPoint } from './stripe-api.helpers'
+
+/**
+ * View types backed by `fetchLiveValue`. Centralised so the dispatch check
+ * and any future registry can share one source of truth.
+ *
+ * `stripe_top_customers` is intentionally NOT here — it returns a list, not
+ * a string, and rides its own controller route + service method.
+ */
+const LIVE_VALUE_TYPES = new Set([
+  'stripe_revenue_today',
+  'stripe_gross_today',
+  'stripe_gross',
+  'stripe_mrr',
+  'stripe_active_subs',
+  'stripe_churn_rate',
+])
 
 type ChartMode = 'daily' | 'weekly' | 'monthly'
 
@@ -48,12 +69,18 @@ export class StripeViewsService {
       `\n  ► fetchLiveValue  connectionId=${connectionId}  viewType=${viewType}  ${from}→${to}`,
     )
 
-    if (
-      viewType !== 'stripe_revenue_today' &&
-      viewType !== 'stripe_gross_today' &&
-      viewType !== 'stripe_gross'
-    ) {
+    if (!LIVE_VALUE_TYPES.has(viewType)) {
       throw new NotFoundException(`Unknown live view type: ${viewType}`)
+    }
+
+    // SaaS-metric tiles read `stripe_subscriptions` directly — no charge-set
+    // bucketing. Date range is ignored (MRR/active/churn are point-in-time).
+    if (
+      viewType === 'stripe_mrr' ||
+      viewType === 'stripe_active_subs' ||
+      viewType === 'stripe_churn_rate'
+    ) {
+      return this.fetchSubscriptionMetric(connectionId, viewType, userId, from)
     }
 
     const { rows, accountId } = await this.fetchChargesForConnection(
@@ -82,6 +109,108 @@ export class StripeViewsService {
 
     this.logger.log(`  ✓ fetchLiveValue → ${value}`)
     return { value }
+  }
+
+  /**
+   * Subscription-backed tiles (MRR, active subs, churn). Branched out of
+   * `fetchLiveValue` because they share an account+filter resolution path
+   * but read different storage. All three are point-in-time — date range
+   * is intentionally not threaded through.
+   *
+   * Wire shape stays `{ value: string | null, unavailable?: true }` for
+   * frontend consistency. Format conventions:
+   *   - mrr:         cents-string ("12345" = $123.45)
+   *   - active_subs: integer-string ("17")
+   *   - churn_rate:  one-decimal percent string ("4.2")  — frontend appends '%'
+   */
+  private async fetchSubscriptionMetric(
+    connectionId: string,
+    viewType: 'stripe_mrr' | 'stripe_active_subs' | 'stripe_churn_rate',
+    userId: string,
+    cacheDate: string,
+  ): Promise<{ value: string | null; unavailable?: boolean }> {
+    const client = this.supabaseService.getClient()
+
+    const { data: conn } = await client
+      .from('connections')
+      .select('id')
+      .eq('id', connectionId)
+      .eq('user_id', userId)
+      .maybeSingle()
+    if (!conn) throw new ConnectionMissingException('stripe', connectionId)
+
+    const accountId = await getStripeAccountIdForConnection(client, connectionId)
+    if (!accountId) return { value: null, unavailable: true }
+
+    let value: string
+
+    if (viewType === 'stripe_churn_rate') {
+      // v1 limitation: ignores the per-connection product filter. Documented
+      // in `fetchChurnRate30d`'s docstring.
+      const { churnRate } = await fetchChurnRate30d(client, accountId)
+      value = (churnRate * 100).toFixed(1)
+    } else {
+      const productFilter = await getConnectionProductFilter(client, connectionId)
+      const { activeSubs, mrrCents } = await fetchActiveSubsAndMrr(
+        client,
+        accountId,
+        productFilter,
+      )
+      value = viewType === 'stripe_mrr' ? String(mrrCents) : String(activeSubs)
+    }
+
+    // Cache for cross-provider single-value tiles. The metric is
+    // point-in-time, but the cache key is per-day so it dovetails with the
+    // existing scheduler infrastructure.
+    await this.viewsService.upsertValue(connectionId, viewType, value, cacheDate)
+
+    this.logger.log(`  ✓ fetchSubscriptionMetric → ${value}`)
+    return { value }
+  }
+
+  /**
+   * Top customers list — separate from `fetchLiveValue` because the wire
+   * shape is `Array<TopCustomerRow>`, not a single string. Mirrors
+   * `CalendlyViewsService.fetchMeetings` in spirit.
+   */
+  async fetchTopCustomers(
+    connectionId: string,
+    userId: string,
+    dateFrom?: string,
+    dateTo?: string,
+  ): Promise<{ customers: TopCustomerRow[]; unavailable?: boolean }> {
+    const todayStr = new Date().toISOString().split('T')[0]
+    const from = dateFrom ?? todayStr
+    const to = dateTo ?? from
+
+    this.logger.log(
+      `\n  ► fetchTopCustomers  connectionId=${connectionId}  ${from}→${to}`,
+    )
+
+    const client = this.supabaseService.getClient()
+
+    const { data: conn } = await client
+      .from('connections')
+      .select('id')
+      .eq('id', connectionId)
+      .eq('user_id', userId)
+      .maybeSingle()
+    if (!conn) throw new ConnectionMissingException('stripe', connectionId)
+
+    const accountId = await getStripeAccountIdForConnection(client, connectionId)
+    if (!accountId) return { customers: [], unavailable: true }
+
+    const productFilter = await getConnectionProductFilter(client, connectionId)
+    const customers = await fetchTopCustomers(
+      client,
+      accountId,
+      productFilter,
+      from,
+      to,
+    )
+
+    this.logger.log(`  ✓ fetchTopCustomers → ${customers.length} customer(s)`)
+    return { customers }
   }
 
   async fetchChartData(
@@ -147,7 +276,10 @@ export class StripeViewsService {
       .eq('id', connectionId)
       .eq('user_id', userId)
       .maybeSingle()
-    if (!conn) throw new NotFoundException('Connection not found')
+    // 410 (not 404) so the frontend can route this into the inline
+    // reassign-connection dialog instead of the generic error badge — the
+    // view's `connection_id` FK is dangling, not absent.
+    if (!conn) throw new ConnectionMissingException('stripe', connectionId)
 
     const accountId = await getStripeAccountIdForConnection(client, connectionId)
     if (!accountId) return { rows: [], accountId: null }

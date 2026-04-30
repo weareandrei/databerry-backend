@@ -38,8 +38,10 @@ export interface StripeAccountStatus {
  *
  * The data model: a Databerry connection points at a Stripe account, the
  * account has many products, and the user picks a subset (or "all") for that
- * specific connection. This is a junction table (`connection_stripe_products`)
- * — empty means "all products", a non-empty set means "only these".
+ * specific connection. The selected IDs live in a `tracked_product_ids TEXT[]`
+ * column on the credential row (`connections_stripe` or
+ * `connections_stripe_manual`) — `'{}'` (empty array) is the "all products"
+ * sentinel.
  *
  * Two connections on the same Stripe account can have different filters; we
  * still only backfill the underlying account once.
@@ -73,7 +75,10 @@ export class StripeProductsService {
       .maybeSingle()
     if (!conn) throw new NotFoundException('Connection not found')
 
-    const stripeAccountId = await this.getStripeAccountIdForConnection(connectionId, conn.type as string)
+    // Single round trip: the credential row gives us BOTH the stripe_account_id
+    // and the tracked_product_ids selection now that the latter lives there.
+    const credential = await this.getCredentialForConnection(connectionId, conn.type as string)
+    const stripeAccountId = credential?.stripeAccountId ?? null
 
     if (!stripeAccountId) {
       // Non-Stripe or unlinked Stripe connection — return an empty shell so the
@@ -88,17 +93,13 @@ export class StripeProductsService {
       }
     }
 
-    const [productsRes, selectionRes, accountRes] = await Promise.all([
+    const [productsRes, accountRes] = await Promise.all([
       client
         .from('stripe_products')
         .select('id, name, active')
         .eq('stripe_account_id', stripeAccountId)
         .order('active', { ascending: false })
         .order('name', { ascending: true }),
-      client
-        .from('connection_stripe_products')
-        .select('product_id')
-        .eq('connection_id', connectionId),
       client
         .from('stripe_accounts')
         .select('backfill_status, backfill_error')
@@ -107,14 +108,13 @@ export class StripeProductsService {
     ])
 
     if (productsRes.error) throw new Error(`stripe_products read: ${productsRes.error.message}`)
-    if (selectionRes.error) throw new Error(`connection_stripe_products read: ${selectionRes.error.message}`)
 
     const products: StripeProductOption[] = (productsRes.data ?? []).map(r => ({
       id: r.id as string,
       name: r.name as string,
       active: Boolean(r.active),
     }))
-    const selectedProductIds = (selectionRes.data ?? []).map(r => r.product_id as string)
+    const selectedProductIds = credential?.trackedProductIds ?? []
     const backfillStatus =
       (accountRes.data?.backfill_status as ProductsForConnectionResult['backfillStatus']) ?? null
     const backfillError = (accountRes.data?.backfill_error as string | null) ?? null
@@ -148,13 +148,14 @@ export class StripeProductsService {
       .maybeSingle()
     if (!conn) throw new NotFoundException('Connection not found')
 
-    const stripeAccountId = await this.getStripeAccountIdForConnection(connectionId, conn.type as string)
+    const credential = await this.getCredentialForConnection(connectionId, conn.type as string)
+    const stripeAccountId = credential?.stripeAccountId ?? null
     if (!stripeAccountId) {
       throw new NotFoundException('Connection is not linked to a Stripe account yet')
     }
 
-    // De-dup defensively — frontend should already do it, but the junction
-    // PK (connection_id, product_id) would reject dupes anyway.
+    // De-dup is now load-bearing: a `TEXT[]` column accepts duplicates, unlike
+    // the old `(connection_id, product_id)` junction PK which rejected them.
     const uniqueIds = Array.from(new Set(productIds))
 
     if (uniqueIds.length > 0) {
@@ -176,22 +177,25 @@ export class StripeProductsService {
       }
     }
 
-    // Replace the junction rows atomically: delete then insert. Doing it in
-    // two statements is fine — the junction is small and this endpoint is
-    // not on a hot path. (No Postgres function = no migration needed.)
-    const { error: delErr } = await client
-      .from('connection_stripe_products')
-      .delete()
-      .eq('connection_id', connectionId)
-    if (delErr) throw new Error(`connection_stripe_products clear: ${delErr.message}`)
-
-    if (uniqueIds.length > 0) {
-      const rows = uniqueIds.map(product_id => ({ connection_id: connectionId, product_id }))
-      const { error: insErr } = await client
-        .from('connection_stripe_products')
-        .insert(rows)
-      if (insErr) throw new Error(`connection_stripe_products insert: ${insErr.message}`)
+    // Single UPDATE on the credential row. The credential table is dispatched
+    // by connection type; same dispatch as `getCredentialForConnection`.
+    const credentialTable =
+      conn.type === 'stripe_manual'
+        ? 'connections_stripe_manual'
+        : conn.type === 'stripe'
+          ? 'connections_stripe'
+          : null
+    if (!credentialTable) {
+      // Should be unreachable — `getCredentialForConnection` returned a
+      // stripeAccountId above, which only happens for the two Stripe types.
+      throw new NotFoundException('Connection is not a Stripe connection')
     }
+
+    const { error: updErr } = await client
+      .from(credentialTable)
+      .update({ tracked_product_ids: uniqueIds })
+      .eq('connection_id', connectionId)
+    if (updErr) throw new Error(`${credentialTable} tracked_product_ids update: ${updErr.message}`)
 
     this.logger.log(
       `  ✓ setProductFilter  connection=${connectionId}  products=[${uniqueIds.join(', ') || '<all>'}]`,
@@ -253,29 +257,40 @@ export class StripeProductsService {
 
   // ──────────────────────────────────────────────────────────────────────────
 
-  private async getStripeAccountIdForConnection(
+  /**
+   * Fetch the credential-row context for a connection in a single round trip:
+   * the linked `stripe_account_id` AND the `tracked_product_ids` filter.
+   *
+   * Returns `null` for non-Stripe connection types (`stripe`, `stripe_manual`
+   * are the only Stripe shapes — anything else has no credential row to read).
+   * Returns `{ stripeAccountId: null, trackedProductIds: [] }` for a Stripe
+   * connection whose credential row hasn't been linked yet (rare; mostly an
+   * intermediate state during connection creation).
+   */
+  private async getCredentialForConnection(
     connectionId: string,
     connectionType: string,
-  ): Promise<string | null> {
+  ): Promise<{ stripeAccountId: string | null; trackedProductIds: string[] } | null> {
     const client = this.supabaseService.getClient()
 
-    if (connectionType === 'stripe_manual') {
-      const { data } = await client
-        .from('connections_stripe_manual')
-        .select('stripe_account_id')
-        .eq('connection_id', connectionId)
-        .maybeSingle()
-      return (data?.stripe_account_id as string | null) ?? null
+    const table =
+      connectionType === 'stripe_manual'
+        ? 'connections_stripe_manual'
+        : connectionType === 'stripe'
+          ? 'connections_stripe'
+          : null
+    if (!table) return null
+
+    const { data } = await client
+      .from(table)
+      .select('stripe_account_id, tracked_product_ids')
+      .eq('connection_id', connectionId)
+      .maybeSingle()
+
+    return {
+      stripeAccountId: (data?.stripe_account_id as string | null) ?? null,
+      trackedProductIds: (data?.tracked_product_ids as string[] | null) ?? [],
     }
-    if (connectionType === 'stripe') {
-      const { data } = await client
-        .from('connections_stripe')
-        .select('stripe_account_id')
-        .eq('connection_id', connectionId)
-        .maybeSingle()
-      return (data?.stripe_account_id as string | null) ?? null
-    }
-    return null
   }
 
   /**

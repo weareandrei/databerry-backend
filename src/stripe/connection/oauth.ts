@@ -77,6 +77,29 @@ export class StripeOAuthService {
 
     const client = this.supabaseService.getClient()
 
+    // Discover account metadata BEFORE writing anything. The connections_stripe
+    // row FKs into `stripe_accounts.id`, so the parent row must exist before
+    // we insert credentials. Doing the /v1/account call up-front also lets a
+    // bad token fail cleanly before we've written half a connection.
+    //
+    // We use the just-received access token (which is account-scoped) rather
+    // than the platform key so /v1/account returns the connected account's
+    // row, not the platform's.
+    let accountRow: Awaited<ReturnType<StripeBackfillService['resolveAccountFromCredentials']>>
+    try {
+      accountRow = await this.backfillService.resolveAccountFromCredentials(
+        makeStripeGetter(accessToken),
+        accessToken,
+      )
+    } catch (err) {
+      this.logger.error(
+        `  ✗ /v1/account failed for ${stripeAccountId}: ${String(err)} — aborting OAuth flow`,
+      )
+      throw new InternalServerErrorException('Failed to resolve Stripe account')
+    }
+
+    await this.backfillService.upsertAccountRow(accountRow)
+
     const { data: connection, error: connError } = await client
       .from('connections')
       .insert({ name: 'Stripe', type: 'stripe', user_id: userId })
@@ -102,20 +125,10 @@ export class StripeOAuthService {
       throw new Error(stripeError.message)
     }
 
-    // Discover account metadata + kick off backfill. We use the access token
-    // we just received (which is account-scoped) rather than the platform key
-    // so /v1/account returns the connected account's row.
-    try {
-      const accountRow = await this.backfillService.resolveAccountFromCredentials(
-        makeStripeGetter(accessToken),
-      )
-      await this.backfillService.ensureAccountAndBackfill(accountRow)
-    } catch (err) {
-      // Don't fail the OAuth flow if backfill kickoff fails — the row is
-      // already in stripe_accounts (status 'pending'), and either the nightly
-      // reconcile or a manual retrigger can pick it up.
-      this.logger.warn(`  ⚠ Backfill kickoff failed for ${stripeAccountId}: ${String(err)}`)
-    }
+    // Credentials are now in place — safe to kick the fire-and-forget backfill.
+    // If the account was already backfilled by a previous connection, this
+    // no-ops via the `backfill_status='complete'` short-circuit.
+    this.backfillService.kickBackfill(accountRow.id)
 
     this.logger.log(`  ✓ Stripe connection created\n  connection_id : ${connection.id}`)
     return { connectionId: connection.id }
