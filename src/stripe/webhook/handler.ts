@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common'
+import { BadRequestException, Injectable, Logger } from '@nestjs/common'
 import Stripe from 'stripe'
 import { SupabaseService } from '../../supabase/supabase.service'
 import { handleChargeEvent } from './events/charge-event'
@@ -36,15 +36,15 @@ export class StripeWebhookService {
     try {
       event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret)
     } catch (err) {
-      this.logger.error(`  ✗ Stripe signature verification failed\n  ${String(err)}`)
-      throw new Error('Invalid Stripe signature')
+      this.logger.error(`Stripe signature verification failed: ${String(err)}`)
+      // Surfaces as 400 to Stripe — they retry on 5xx, not 4xx, which is
+      // what we want for a malformed signature (retrying won't fix it).
+      throw new BadRequestException('Invalid Stripe signature')
     }
 
-    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
-    console.log('  💳 Stripe webhook received')
-    console.log(`  type    : ${event.type}`)
-    console.log(`  account : ${event.account ?? '(platform)'}`)
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n')
+    this.logger.log(
+      `Stripe webhook  type=${event.type}  account=${event.account ?? '(platform)'}`,
+    )
 
     const client = this.supabaseService.getClient()
 

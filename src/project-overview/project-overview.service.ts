@@ -1,7 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { SupabaseService } from '../supabase/supabase.service'
 import { UserSettingsService } from '../user-settings/user-settings.service'
-import { ProjectSettingsService } from '../project-settings/project-settings.service'
+import {
+  ProjectSettingsService,
+  type ProjectSettings,
+} from '../project-settings/project-settings.service'
 import { GoogleAnalyticsOAuthService } from '../google-analytics/connection/oauth'
 import { getPosthogCredentials } from '../posthog/connection/credentials'
 import {
@@ -37,6 +40,17 @@ export type SecondaryMetric =
   | 'avg_session_sec'
   | 'revenue'
   | null
+
+/**
+ * The connection that drives the traffic/sources panel for a project.
+ * `pickTrafficProvider` returns one of these (or null when no eligible
+ * connection is set). Carried through `fetchChart` as part of the
+ * shared context object so the metric accumulators don't each have to
+ * thread the same value.
+ */
+export type TrafficProvider =
+  | { type: 'google_analytics'; connectionId: string }
+  | { type: 'posthog'; connectionId: string }
 
 export interface OverviewBucket {
   label: string
@@ -80,6 +94,34 @@ export interface OverviewUsersResponse {
    * `'posthog'` when results are from PostHog.
    */
   provider: 'google_analytics' | 'posthog' | null
+}
+
+/**
+ * Per-bucket source breakdown — keyed by normalised source key
+ * (`google`, `direct`, `other:tinylaunch.com`, …). Mutated in place by
+ * the metric accumulators; flattened into `OverviewBucket.bySource` at
+ * response-build time.
+ */
+type BucketSourceMap = Map<
+  string,
+  { label: string; color: string; value: number }
+>
+
+/**
+ * Shared fetch context for the chart — bundles the inputs that all
+ * three pipeline stages (primary metric, secondary metric, response
+ * build) need so each can be a single-arg method.
+ */
+interface ChartFetchContext {
+  userId: string
+  projectId: string
+  dateFrom: string
+  dateTo: string
+  gran: BucketGranularity
+  tz: string
+  provider: TrafficProvider | null
+  projectSettings: ProjectSettings
+  buckets: Bucket[]
 }
 
 interface Bucket {
@@ -202,11 +244,7 @@ export class ProjectOverviewService {
   private async pickTrafficProvider(
     userId: string,
     projectId: string,
-  ): Promise<
-    | { type: 'google_analytics'; connectionId: string }
-    | { type: 'posthog'; connectionId: string }
-    | null
-  > {
+  ): Promise<TrafficProvider | null> {
     const settings = await this.userSettingsService.get(userId)
     const client = this.supabaseService.getClient()
     const scopeFilter = `project_id.eq.${projectId},project_id.is.null`
@@ -247,6 +285,15 @@ export class ProjectOverviewService {
     return mode === 'daily' ? 'hourly' : 'daily'
   }
 
+  /**
+   * Orchestrates the chart fetch: prep buckets, pick the traffic
+   * provider, accumulate the primary + secondary metrics into shared
+   * arrays, build the response.
+   *
+   * The two `accumulate*` helpers carry most of the per-metric logic;
+   * this function stays orchestration-focused so the lifecycle reads
+   * top-down (provider → primary → secondary → response).
+   */
   async fetchChart(
     userId: string,
     projectId: string,
@@ -258,12 +305,11 @@ export class ProjectOverviewService {
     tz: string = 'UTC',
   ): Promise<OverviewChartResponse> {
     this.logger.log(
-      `\n  ► fetchChart  projectId=${projectId} ${mode} ${dateFrom}→${dateTo}  primary=${primaryMetric} secondary=${secondaryMetric ?? 'none'} tz=${tz}`,
+      `fetchChart  projectId=${projectId} ${mode} ${dateFrom}→${dateTo}  primary=${primaryMetric} secondary=${secondaryMetric ?? 'none'} tz=${tz}`,
     )
 
     const buckets = buildBuckets(mode, dateFrom, dateTo, tz)
     const gran = this.granularity(mode)
-
     const provider = await this.pickTrafficProvider(userId, projectId)
     const projectSettings = await this.projectSettingsService.get(projectId, userId)
 
@@ -279,115 +325,153 @@ export class ProjectOverviewService {
       )
     }
 
-    // Accumulators keyed by bucket index
+    const ctx: ChartFetchContext = {
+      userId,
+      projectId,
+      dateFrom,
+      dateTo,
+      gran,
+      tz,
+      provider,
+      projectSettings,
+      buckets,
+    }
+
+    // Accumulators keyed by bucket index — mutated in place by the two
+    // metric helpers below.
     const byBucketTotal: number[] = new Array(buckets.length).fill(0)
-    const byBucketSources: Map<string, { label: string; color: string; value: number }>[] =
-      buckets.map(() => new Map())
+    const byBucketSources: BucketSourceMap[] = buckets.map(() => new Map())
+    const bySecondary: (number | null)[] = new Array(buckets.length).fill(null)
 
-    let primaryUnavailable = false
+    const { unavailable: primaryUnavailable } = await this.accumulatePrimaryMetric(
+      ctx,
+      primaryMetric,
+      byBucketTotal,
+      byBucketSources,
+    )
+    const { unavailable: secondaryUnavailable, total: totalSecondary } =
+      await this.accumulateSecondaryMetric(ctx, secondaryMetric, bySecondary)
 
-    // ─── Primary metric ───────────────────────────────────────────────────
+    return this.buildChartResponse({
+      buckets,
+      byBucketTotal,
+      byBucketSources,
+      bySecondary,
+      totalSecondary,
+      primaryUnavailable,
+      secondaryUnavailable,
+      provider,
+    })
+  }
+
+  /**
+   * Visitors / pageviews / conversions / revenue → fill the per-bucket
+   * `total` and `sources` accumulators. Returns `unavailable: true`
+   * when the required connection is missing or the upstream fetch
+   * threw (we degrade rather than failing the whole chart — the
+   * secondary metric should still render).
+   */
+  private async accumulatePrimaryMetric(
+    ctx: ChartFetchContext,
+    primaryMetric: PrimaryMetric,
+    byBucketTotal: number[],
+    byBucketSources: BucketSourceMap[],
+  ): Promise<{ unavailable: boolean }> {
+    const { provider, projectSettings, dateFrom, dateTo, gran, tz, buckets } = ctx
+
     if (primaryMetric === 'visitors' || primaryMetric === 'pageviews') {
-      if (!provider) {
-        primaryUnavailable = true
-      } else if (provider.type === 'google_analytics') {
+      if (!provider) return { unavailable: true }
+      if (provider.type === 'google_analytics') {
         try {
           const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
           const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
-
           if (primaryMetric === 'visitors') {
-            const rows = await fetchGASourcesByBucket(
-              token,
-              provider.connectionId,
-              propertyId,
-              dateFrom,
-              dateTo,
-              gran,
-            )
+            const rows = await fetchGASourcesByBucket(token, provider.connectionId, propertyId, dateFrom, dateTo, gran)
             this.assignSourceRows(buckets, byBucketTotal, byBucketSources, rows)
           } else {
-            const rows = await fetchGAMetricByBucket(
-              token,
-              provider.connectionId,
-              propertyId,
-              'screenPageViews',
-              dateFrom,
-              dateTo,
-              gran,
-            )
+            const rows = await fetchGAMetricByBucket(token, provider.connectionId, propertyId, 'screenPageViews', dateFrom, dateTo, gran)
             this.assignFlatRows(buckets, byBucketTotal, byBucketSources, rows, 'Total')
           }
+          return { unavailable: false }
         } catch (err) {
           this.logger.warn(`GA fetch failed: ${String(err)}`)
-          primaryUnavailable = true
-        }
-      } else if (provider.type === 'posthog') {
-        try {
-          const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
-          if (!ph) {
-            primaryUnavailable = true
-          } else {
-            const rows = await fetchPosthogSourcesByBucket(ph, dateFrom, dateTo, gran, this.logger, tz)
-            this.assignSourceRows(buckets, byBucketTotal, byBucketSources, rows, 'posthog')
-          }
-        } catch (err) {
-          this.logger.warn(`PostHog fetch failed: ${String(err)}`)
-          primaryUnavailable = true
+          return { unavailable: true }
         }
       }
-    } else if (primaryMetric === 'conversions') {
-      if (!projectSettings.conversionConnectionId || !projectSettings.conversionEvent) {
-        primaryUnavailable = true
-      } else {
-        try {
-          const ph = await getPosthogCredentials(projectSettings.conversionConnectionId, this.supabaseService)
-          if (ph) {
-            const rows = await fetchPosthogEventCountByBucket(
-              ph,
-              projectSettings.conversionEvent,
-              dateFrom,
-              dateTo,
-              gran,
-              this.logger,
-              tz,
-            )
-            this.assignFlatRows(buckets, byBucketTotal, byBucketSources, rows, 'Conversions')
-          } else {
-            primaryUnavailable = true
-          }
-        } catch (err) {
-          this.logger.warn(`Conversions fetch failed: ${String(err)}`)
-          primaryUnavailable = true
-        }
-      }
-    } else if (primaryMetric === 'revenue') {
+      // PostHog
       try {
-        const amounts = await this.fetchStripeRevenueForProject(userId, projectId, dateFrom, dateTo, gran)
-        // amounts are keyed by bucket unix
-        const byUnix = new Map(amounts.map(a => [a.bucketUnix, a.value]))
-        for (let i = 0; i < buckets.length; i++) {
-          const cents = byUnix.get(buckets[i].unix) ?? 0
-          const dollars = cents / 100
-          if (dollars > 0) {
-            byBucketTotal[i] += dollars
-            const rev = normalizeSource('stripe') // falls to "other" but we'll override label
-            byBucketSources[i].set('revenue', { label: 'Revenue', color: '#635bff', value: dollars })
-          }
-        }
+        const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+        if (!ph) return { unavailable: true }
+        const rows = await fetchPosthogSourcesByBucket(ph, dateFrom, dateTo, gran, this.logger, tz)
+        this.assignSourceRows(buckets, byBucketTotal, byBucketSources, rows, 'posthog')
+        return { unavailable: false }
       } catch (err) {
-        this.logger.warn(`Stripe revenue fetch failed: ${String(err)}`)
-        primaryUnavailable = true
+        this.logger.warn(`PostHog fetch failed: ${String(err)}`)
+        return { unavailable: true }
       }
     }
 
-    // ─── Secondary metric (line series) ───────────────────────────────────
-    const bySecondary: (number | null)[] = new Array(buckets.length).fill(null)
-    let secondaryUnavailable = false
-    let totalSecondary: number | null = null
+    if (primaryMetric === 'conversions') {
+      if (!projectSettings.conversionConnectionId || !projectSettings.conversionEvent) {
+        return { unavailable: true }
+      }
+      try {
+        const ph = await getPosthogCredentials(projectSettings.conversionConnectionId, this.supabaseService)
+        if (!ph) return { unavailable: true }
+        const rows = await fetchPosthogEventCountByBucket(
+          ph,
+          projectSettings.conversionEvent,
+          dateFrom,
+          dateTo,
+          gran,
+          this.logger,
+          tz,
+        )
+        this.assignFlatRows(buckets, byBucketTotal, byBucketSources, rows, 'Conversions')
+        return { unavailable: false }
+      } catch (err) {
+        this.logger.warn(`Conversions fetch failed: ${String(err)}`)
+        return { unavailable: true }
+      }
+    }
+
+    // revenue — Stripe charges aggregated per bucket. The unique
+    // wrinkle vs. visitors/conversions is the cents-to-dollars
+    // conversion and the synthetic "Revenue" source row.
+    try {
+      const amounts = await this.fetchStripeRevenueForProject(ctx.userId, ctx.projectId, dateFrom, dateTo, gran)
+      const byUnix = new Map(amounts.map(a => [a.bucketUnix, a.value]))
+      for (let i = 0; i < buckets.length; i++) {
+        const cents = byUnix.get(buckets[i].unix) ?? 0
+        const dollars = cents / 100
+        if (dollars > 0) {
+          byBucketTotal[i] += dollars
+          byBucketSources[i].set('revenue', { label: 'Revenue', color: '#635bff', value: dollars })
+        }
+      }
+      return { unavailable: false }
+    } catch (err) {
+      this.logger.warn(`Stripe revenue fetch failed: ${String(err)}`)
+      return { unavailable: true }
+    }
+  }
+
+  /**
+   * Secondary line series — revenue / bounce / avg-session / conversion-rate.
+   * Fills `bySecondary` (one entry per bucket, `null` when there's no data
+   * for that bucket) and returns the aggregate total for the period.
+   */
+  private async accumulateSecondaryMetric(
+    ctx: ChartFetchContext,
+    secondaryMetric: SecondaryMetric,
+    bySecondary: (number | null)[],
+  ): Promise<{ unavailable: boolean; total: number | null }> {
+    if (secondaryMetric == null) return { unavailable: false, total: null }
+    const { provider, projectSettings, dateFrom, dateTo, gran, tz, buckets } = ctx
 
     if (secondaryMetric === 'revenue') {
       try {
-        const amounts = await this.fetchStripeRevenueForProject(userId, projectId, dateFrom, dateTo, gran)
+        const amounts = await this.fetchStripeRevenueForProject(ctx.userId, ctx.projectId, dateFrom, dateTo, gran)
         const byUnix = new Map(amounts.map(a => [a.bucketUnix, a.value]))
         let sum = 0
         for (let i = 0; i < buckets.length; i++) {
@@ -395,109 +479,124 @@ export class ProjectOverviewService {
           bySecondary[i] = dollars
           sum += dollars
         }
-        totalSecondary = sum
+        return { unavailable: false, total: sum }
       } catch {
-        secondaryUnavailable = true
-      }
-    } else if (secondaryMetric === 'bounce_rate' || secondaryMetric === 'avg_session_sec') {
-      if (provider?.type !== 'google_analytics') {
-        secondaryUnavailable = true
-      } else {
-        try {
-          const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
-          const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
-          const metric = secondaryMetric === 'bounce_rate' ? 'bounceRate' : 'averageSessionDuration'
-          const rows = await fetchGAMetricByBucket(
-            token,
-            provider.connectionId,
-            propertyId,
-            metric,
-            dateFrom,
-            dateTo,
-            gran,
-          )
-          const byKey = new Map(rows.map(r => [r.bucketKey, r.value]))
-          let count = 0
-          let sum = 0
-          for (let i = 0; i < buckets.length; i++) {
-            const v = byKey.get(buckets[i].gaKey) ?? null
-            bySecondary[i] = v
-            if (v != null) {
-              sum += v
-              count++
-            }
-          }
-          totalSecondary = count > 0 ? sum / count : null
-        } catch {
-          secondaryUnavailable = true
-        }
-      }
-    } else if (secondaryMetric === 'conversion_rate') {
-      if (!provider || !projectSettings.conversionConnectionId || !projectSettings.conversionEvent) {
-        secondaryUnavailable = true
-      } else {
-        try {
-          // Denominator = sessions per bucket from traffic provider
-          let sessionsByKey: Map<string, number> = new Map()
-          if (provider.type === 'google_analytics') {
-            const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
-            const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
-            const rows = await fetchGAMetricByBucket(
-              token,
-              provider.connectionId,
-              propertyId,
-              'sessions',
-              dateFrom,
-              dateTo,
-              gran,
-            )
-            sessionsByKey = new Map(rows.map(r => [r.bucketKey, r.value]))
-          } else {
-            const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
-            if (ph) {
-              const rows = await fetchPosthogSourcesByBucket(ph, dateFrom, dateTo, gran, this.logger, tz)
-              for (const r of rows) {
-                const k = r.bucketKey
-                sessionsByKey.set(k, (sessionsByKey.get(k) ?? 0) + r.value)
-              }
-            }
-          }
-
-          const ph = await getPosthogCredentials(projectSettings.conversionConnectionId, this.supabaseService)
-          let conversionsByKey = new Map<string, number>()
-          if (ph) {
-            const rows = await fetchPosthogEventCountByBucket(
-              ph,
-              projectSettings.conversionEvent,
-              dateFrom,
-              dateTo,
-              gran,
-              this.logger,
-              tz,
-            )
-            conversionsByKey = new Map(rows.map(r => [r.bucketKey, r.value]))
-          }
-
-          let totalConv = 0
-          let totalSess = 0
-          for (let i = 0; i < buckets.length; i++) {
-            const b = buckets[i]
-            const sessKey = provider.type === 'google_analytics' ? b.gaKey : (gran === 'hourly' ? b.phHourlyKey : b.phDailyKey)
-            const convKey = gran === 'hourly' ? b.phHourlyKey : b.phDailyKey
-            const sess = sessionsByKey.get(sessKey) ?? 0
-            const conv = conversionsByKey.get(convKey) ?? 0
-            totalConv += conv
-            totalSess += sess
-            bySecondary[i] = sess > 0 ? (conv / sess) * 100 : null
-          }
-          totalSecondary = totalSess > 0 ? (totalConv / totalSess) * 100 : null
-        } catch {
-          secondaryUnavailable = true
-        }
+        return { unavailable: true, total: null }
       }
     }
 
-    // ─── Build response ────────────────────────────────────────────────────
+    if (secondaryMetric === 'bounce_rate' || secondaryMetric === 'avg_session_sec') {
+      if (provider?.type !== 'google_analytics') return { unavailable: true, total: null }
+      try {
+        const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
+        const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
+        const metric = secondaryMetric === 'bounce_rate' ? 'bounceRate' : 'averageSessionDuration'
+        const rows = await fetchGAMetricByBucket(token, provider.connectionId, propertyId, metric, dateFrom, dateTo, gran)
+        const byKey = new Map(rows.map(r => [r.bucketKey, r.value]))
+        let count = 0
+        let sum = 0
+        for (let i = 0; i < buckets.length; i++) {
+          const v = byKey.get(buckets[i].gaKey) ?? null
+          bySecondary[i] = v
+          if (v != null) {
+            sum += v
+            count++
+          }
+        }
+        return { unavailable: false, total: count > 0 ? sum / count : null }
+      } catch {
+        return { unavailable: true, total: null }
+      }
+    }
+
+    // conversion_rate — needs both the traffic provider (denominator =
+    // sessions) and the conversion-event PostHog connection (numerator =
+    // event count).
+    if (!provider || !projectSettings.conversionConnectionId || !projectSettings.conversionEvent) {
+      return { unavailable: true, total: null }
+    }
+    try {
+      const sessionsByKey = await this.fetchSessionsByBucket(provider, dateFrom, dateTo, gran, tz)
+      const conversionsByKey = await this.fetchConversionsByBucket(
+        projectSettings.conversionConnectionId,
+        projectSettings.conversionEvent,
+        dateFrom,
+        dateTo,
+        gran,
+        tz,
+      )
+
+      let totalConv = 0
+      let totalSess = 0
+      for (let i = 0; i < buckets.length; i++) {
+        const b = buckets[i]
+        const sessKey =
+          provider.type === 'google_analytics' ? b.gaKey : gran === 'hourly' ? b.phHourlyKey : b.phDailyKey
+        const convKey = gran === 'hourly' ? b.phHourlyKey : b.phDailyKey
+        const sess = sessionsByKey.get(sessKey) ?? 0
+        const conv = conversionsByKey.get(convKey) ?? 0
+        totalConv += conv
+        totalSess += sess
+        bySecondary[i] = sess > 0 ? (conv / sess) * 100 : null
+      }
+      return { unavailable: false, total: totalSess > 0 ? (totalConv / totalSess) * 100 : null }
+    } catch {
+      return { unavailable: true, total: null }
+    }
+  }
+
+  /** Sessions per bucket from the traffic provider — used for
+   *  conversion_rate's denominator. GA returns `sessions` directly;
+   *  PostHog gives us per-source counts that we sum. */
+  private async fetchSessionsByBucket(
+    provider: TrafficProvider,
+    dateFrom: string,
+    dateTo: string,
+    gran: BucketGranularity,
+    tz: string,
+  ): Promise<Map<string, number>> {
+    if (provider.type === 'google_analytics') {
+      const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
+      const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
+      const rows = await fetchGAMetricByBucket(token, provider.connectionId, propertyId, 'sessions', dateFrom, dateTo, gran)
+      return new Map(rows.map(r => [r.bucketKey, r.value]))
+    }
+    const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+    if (!ph) return new Map()
+    const rows = await fetchPosthogSourcesByBucket(ph, dateFrom, dateTo, gran, this.logger, tz)
+    const out = new Map<string, number>()
+    for (const r of rows) out.set(r.bucketKey, (out.get(r.bucketKey) ?? 0) + r.value)
+    return out
+  }
+
+  /** Conversions per bucket from the configured PostHog connection. */
+  private async fetchConversionsByBucket(
+    connectionId: string,
+    eventName: string,
+    dateFrom: string,
+    dateTo: string,
+    gran: BucketGranularity,
+    tz: string,
+  ): Promise<Map<string, number>> {
+    const ph = await getPosthogCredentials(connectionId, this.supabaseService)
+    if (!ph) return new Map()
+    const rows = await fetchPosthogEventCountByBucket(ph, eventName, dateFrom, dateTo, gran, this.logger, tz)
+    return new Map(rows.map(r => [r.bucketKey, r.value]))
+  }
+
+  /** Final assembly: stitch the bucket grid + accumulators into the
+   *  response shape the controller returns. Pure transform — no I/O. */
+  private buildChartResponse(args: {
+    buckets: Bucket[]
+    byBucketTotal: number[]
+    byBucketSources: BucketSourceMap[]
+    bySecondary: (number | null)[]
+    totalSecondary: number | null
+    primaryUnavailable: boolean
+    secondaryUnavailable: boolean
+    provider: TrafficProvider | null
+  }): OverviewChartResponse {
+    const { buckets, byBucketTotal, byBucketSources, bySecondary, totalSecondary, primaryUnavailable, secondaryUnavailable, provider } = args
     const outBuckets: OverviewBucket[] = buckets.map((b, i) => ({
       label: b.label,
       total: byBucketTotal[i],
@@ -506,9 +605,7 @@ export class ProjectOverviewService {
         .sort((a, b) => b.value - a.value),
       secondary: bySecondary[i],
     }))
-
     const totalPrimary = byBucketTotal.reduce((a, b) => a + b, 0)
-
     return {
       buckets: outBuckets,
       totalPrimary,
@@ -562,13 +659,30 @@ export class ProjectOverviewService {
       return { sources: [] }
     }
 
-    // Group + normalise
+    // Group + normalise.
+    //
+    // Recognised brands (google, twitter/x, reddit, …) keep their single
+    // bucket via `n.key`. Unrecognised referrers, however, would all
+    // collapse onto `key = 'other'` — losing the actual domain that drove
+    // the traffic. Re-key those by the raw domain so each unique
+    // unknown-referrer gets its own row (e.g. `tinylaunch.com`,
+    // `producthunt.com`). The frontend's `sourceStyle()` lookup already
+    // falls through to the label for keys it doesn't recognise, so the
+    // "other:<domain>" prefix needs no UI-side icon-map work.
+    //
+    // Truly missing referrers still hit the `direct` rule (it matches
+    // empty / "(direct)" / "(none)"), so direct visits stay grouped under
+    // a single "Direct" row — they're not split into per-row blanks.
     const byKey = new Map<string, { label: string; color: string; value: number }>()
     for (const r of rows) {
       const n = normalizeSource(r.source)
-      const existing = byKey.get(n.key)
+      const groupKey =
+        n.key === 'other'
+          ? `other:${(r.source ?? '').trim().toLowerCase() || 'other'}`
+          : n.key
+      const existing = byKey.get(groupKey)
       if (existing) existing.value += r.value
-      else byKey.set(n.key, { label: n.label, color: n.color, value: r.value })
+      else byKey.set(groupKey, { label: n.label, color: n.color, value: r.value })
     }
 
     const total = Array.from(byKey.values()).reduce((acc, v) => acc + v.value, 0)

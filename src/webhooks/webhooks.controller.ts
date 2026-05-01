@@ -32,13 +32,13 @@ export class WebhooksController {
     @Param('viewId') viewId: string,
     @Body() payload: Record<string, unknown>,
   ) {
-    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
-    console.log('  📦 PostHog webhook received')
-    console.log(`  connectionId : ${connectionId}`)
-    console.log(`  viewId       : ${viewId}`)
-    console.log('  full payload :')
-    console.log(JSON.stringify(payload, null, 4))
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n')
+    // Single structured line — keeps log aggregators (Datadog/Logflare/etc.)
+    // happy and lets us grep by `PostHog webhook` without wrestling with the
+    // ASCII border that the previous `console.log` block emitted.
+    this.logger.log(
+      `PostHog webhook  connectionId=${connectionId}  viewId=${viewId}`,
+    )
+    this.logger.debug(`PostHog webhook payload: ${JSON.stringify(payload)}`)
 
     // Fire-and-forget — PostHog expects a fast 200 back
     this.posthogWebhookService

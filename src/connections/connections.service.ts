@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common'
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common'
 import { createHash, randomBytes } from 'crypto'
 import { SupabaseService } from '../supabase/supabase.service'
 import { PosthogCredentialsService } from '../posthog/connection/credentials'
@@ -214,7 +214,9 @@ export class ConnectionsService {
       // immediately. This also validates the API key (a bad key surfaces here
       // rather than later during backfill, with a cleaner error path).
       const apiKey = config.apiKey as string | undefined
-      if (!apiKey) throw new Error('stripe_manual connection requires apiKey in config')
+      if (!apiKey) {
+        throw new BadRequestException('Stripe API key is required to create this connection.')
+      }
 
       const accountRow = await this.stripeBackfillService.resolveAccountFromApiKey(apiKey)
 

@@ -43,7 +43,6 @@ yarn-error.log
 /example
 
 # tests
-/test
 /benchmarks/memory
 /coverage
 /.nyc_output
@@ -55,3 +54,5 @@ build/config\.gypi
 pnpm-lock.yaml
 /.history
 /.env
+# Manual test-script secrets — see test/manual/ + .env.testing.example
+/.env.testing

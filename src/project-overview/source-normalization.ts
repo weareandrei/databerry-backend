@@ -20,6 +20,14 @@ interface Rule {
  */
 const RULES: Rule[] = [
   { match: /^(\s*|direct|\(direct\)|\(none\))$/i,     key: 'direct',     label: 'Direct',      color: '#1B1B1B' },
+  // "Not set" sentinels — GA returns "(not set)" when the dimension is
+  // missing, and some PostHog data pipelines surface "Not set"/"not_set".
+  // Bucket them under a single "Other" row instead of letting the grouping
+  // split each variant ("(not set)", "Not set", "not_set") into its own
+  // line in the panel. The `unset` key is distinct from `other` so the
+  // per-domain split in `fetchSources` doesn't apply here — every variant
+  // collapses to one row.
+  { match: /^(not[\s_-]?set|\(not\s*set\))$/i,        key: 'unset',      label: 'Other',       color: '#CBC9CA' },
   { match: /(chatgpt|openai|chat\.openai)/i,          key: 'chatgpt',    label: 'ChatGPT',     color: '#10a37f' },
   { match: /google/i,                                  key: 'google',     label: 'Google',      color: '#ffffff' },
   { match: /(t\.co|twitter|x\.com)/i,                  key: 'x',          label: 'X',           color: '#4b5563' },

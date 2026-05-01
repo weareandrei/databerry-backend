@@ -14,6 +14,7 @@ export class StripeViewsController {
     @Query('viewType') viewType: string,
     @Query('dateFrom') dateFrom: string | undefined,
     @Query('dateTo') dateTo: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     return this.stripeViewsService.fetchLiveValue(
@@ -22,6 +23,7 @@ export class StripeViewsController {
       req.authUser.id,
       dateFrom,
       dateTo,
+      tz,
     )
   }
 
@@ -32,6 +34,7 @@ export class StripeViewsController {
     @Query('dateFrom') dateFrom: string | undefined,
     @Query('dateTo') dateTo: string | undefined,
     @Query('mode') mode: 'daily' | 'weekly' | 'monthly' | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     const points = await this.stripeViewsService.fetchChartData(
@@ -41,6 +44,7 @@ export class StripeViewsController {
       dateFrom,
       dateTo,
       mode,
+      tz,
     )
     return { points }
   }
@@ -55,6 +59,7 @@ export class StripeViewsController {
     @Query('connectionId') connectionId: string,
     @Query('dateFrom') dateFrom: string | undefined,
     @Query('dateTo') dateTo: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     return this.stripeViewsService.fetchTopCustomers(
@@ -62,6 +67,7 @@ export class StripeViewsController {
       req.authUser.id,
       dateFrom,
       dateTo,
+      tz,
     )
   }
 }

@@ -2,6 +2,7 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
 import { ViewsService } from '../../views/views.service'
 import { ConnectionMissingException } from '../../common/integration-errors'
+import { buildViewFetchContext } from '../../common/view-fetch-context'
 import {
   fetchAccountCharges,
   fetchActiveSubsAndMrr,
@@ -60,13 +61,13 @@ export class StripeViewsService {
     userId: string,
     dateFrom?: string,
     dateTo?: string,
+    tz: string = 'UTC',
   ): Promise<{ value: string | null; unavailable?: boolean }> {
-    const todayStr = new Date().toISOString().split('T')[0]
-    const from = dateFrom ?? todayStr
-    const to = dateTo ?? from
+    const ctx = buildViewFetchContext(dateFrom, dateTo, tz)
+    const { from, to, isSingleDay } = ctx
 
     this.logger.log(
-      `\n  ► fetchLiveValue  connectionId=${connectionId}  viewType=${viewType}  ${from}→${to}`,
+      `fetchLiveValue  connectionId=${connectionId}  viewType=${viewType}  ${from}→${to}  tz=${ctx.tz}`,
     )
 
     if (!LIVE_VALUE_TYPES.has(viewType)) {
@@ -88,6 +89,7 @@ export class StripeViewsService {
       userId,
       from,
       to,
+      tz,
     )
 
     if (!accountId) {
@@ -100,14 +102,14 @@ export class StripeViewsService {
     const total = rows.reduce((sum, r) => sum + r.amount, 0)
     const value = String(total)
 
-    if (from === to) {
+    if (isSingleDay) {
       // Keep the views_values cache layer happy for cross-provider single-day
       // tiles. Reads still come from Supabase, so this is purely so the
       // existing scheduler / counters don't see a missing row.
       await this.viewsService.upsertValue(connectionId, viewType, value, from)
     }
 
-    this.logger.log(`  ✓ fetchLiveValue → ${value}`)
+    this.logger.log(`fetchLiveValue → ${value}`)
     return { value }
   }
 
@@ -178,13 +180,14 @@ export class StripeViewsService {
     userId: string,
     dateFrom?: string,
     dateTo?: string,
+    tz: string = 'UTC',
   ): Promise<{ customers: TopCustomerRow[]; unavailable?: boolean }> {
     const todayStr = new Date().toISOString().split('T')[0]
     const from = dateFrom ?? todayStr
     const to = dateTo ?? from
 
     this.logger.log(
-      `\n  ► fetchTopCustomers  connectionId=${connectionId}  ${from}→${to}`,
+      `\n  ► fetchTopCustomers  connectionId=${connectionId}  ${from}→${to}  tz=${tz}`,
     )
 
     const client = this.supabaseService.getClient()
@@ -207,6 +210,8 @@ export class StripeViewsService {
       productFilter,
       from,
       to,
+      10,
+      tz,
     )
 
     this.logger.log(`  ✓ fetchTopCustomers → ${customers.length} customer(s)`)
@@ -220,20 +225,21 @@ export class StripeViewsService {
     dateFrom?: string,
     dateTo?: string,
     mode?: ChartMode,
+    tz: string = 'UTC',
   ): Promise<ChartPoint[]> {
     this.logger.log(
-      `\n  ► fetchChartData  connectionId=${connectionId}  viewType=${viewType}  ${dateFrom ?? '?'}→${dateTo ?? '?'}  mode=${mode ?? '?'}`,
+      `\n  ► fetchChartData  connectionId=${connectionId}  viewType=${viewType}  ${dateFrom ?? '?'}→${dateTo ?? '?'}  mode=${mode ?? '?'}  tz=${tz}`,
     )
 
     if (viewType === 'stripe_gross_today') {
       const today = new Date().toISOString().split('T')[0]
-      const { rows } = await this.fetchChargesForConnection(connectionId, userId, today, today)
+      const { rows } = await this.fetchChargesForConnection(connectionId, userId, today, today, tz)
       return bucketByHour(rows, today, /* truncateAtNow= */ true)
     }
 
     if (viewType === 'stripe_gross_week') {
       const { from, to } = thisWeekRange()
-      const { rows } = await this.fetchChargesForConnection(connectionId, userId, from, to)
+      const { rows } = await this.fetchChargesForConnection(connectionId, userId, from, to, tz)
       return bucketByDayLabels(rows, from, to)
     }
 
@@ -241,7 +247,7 @@ export class StripeViewsService {
       const todayStr = new Date().toISOString().split('T')[0]
       const from = dateFrom ?? todayStr
       const to = dateTo ?? from
-      const { rows } = await this.fetchChargesForConnection(connectionId, userId, from, to)
+      const { rows } = await this.fetchChargesForConnection(connectionId, userId, from, to, tz)
 
       if (mode === 'daily' || (!mode && from === to)) {
         const truncate = from === todayStr
@@ -266,6 +272,7 @@ export class StripeViewsService {
     userId: string,
     dateFrom: string,
     dateTo: string,
+    tz: string = 'UTC',
   ): Promise<{ rows: ChargeRow[]; accountId: string | null }> {
     const client = this.supabaseService.getClient()
 
@@ -285,7 +292,14 @@ export class StripeViewsService {
     if (!accountId) return { rows: [], accountId: null }
 
     const productFilter = await getConnectionProductFilter(client, connectionId)
-    const rows = await fetchAccountCharges(client, accountId, dateFrom, dateTo, productFilter)
+    const rows = await fetchAccountCharges(
+      client,
+      accountId,
+      dateFrom,
+      dateTo,
+      productFilter,
+      tz,
+    )
 
     return { rows, accountId }
   }

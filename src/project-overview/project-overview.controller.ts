@@ -55,8 +55,13 @@ export class ProjectOverviewController {
     @Query('limit') limit: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
-    const n = limit ? parseInt(limit, 10) : 10
-    return this.service.fetchSources(req.authUser.id, projectId, dateFrom, dateTo, isNaN(n) ? 10 : n)
+    // Default 100 — the panel paginates client-side now, so we want to send
+    // a generous batch in one go and let the UI flip pages locally rather
+    // than re-fetching per page. 100 is the practical ceiling for a solo-
+    // founder-scale project; beyond that, drilling into PostHog directly is
+    // the right escape hatch.
+    const n = limit ? parseInt(limit, 10) : 100
+    return this.service.fetchSources(req.authUser.id, projectId, dateFrom, dateTo, isNaN(n) ? 100 : n)
   }
 
   @Get('users')

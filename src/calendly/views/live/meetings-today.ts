@@ -2,24 +2,49 @@ import {
   IntegrationReauthRequiredException,
   IntegrationUpstreamException,
 } from '../../../common/integration-errors'
+import { localMidnightUtc } from '../../../common/tz'
 
 const BASE_API = 'https://api.calendly.com'
 
-function dayStart(dateStr?: string): Date {
-  const d = dateStr ? new Date(dateStr + 'T00:00:00Z') : new Date()
-  d.setUTCHours(0, 0, 0, 0)
-  return d
+/**
+ * UTC instant of `dateStr`'s midnight in `tz`. When `dateStr` is omitted we
+ * fall back to "today as observed from UTC" — caller-side wrappers
+ * (`computeMeetingsRange`) can supply both args to override.
+ */
+function dayStart(dateStr: string | undefined, tz: string): Date {
+  if (!dateStr) {
+    const now = new Date()
+    const todayStr = `${now.getUTCFullYear()}-${pad2(now.getUTCMonth() + 1)}-${pad2(now.getUTCDate())}`
+    return localMidnightUtc(todayStr, tz)
+  }
+  return localMidnightUtc(dateStr, tz)
 }
 
-function dayAfter(dateStr?: string): Date {
-  const d = dayStart(dateStr)
-  d.setUTCDate(d.getUTCDate() + 1)
-  return d
+function dayAfter(dateStr: string | undefined, tz: string): Date {
+  // dayStart, +1 day at the same wall-clock — re-resolve via localMidnightUtc
+  // so DST transitions don't drift the bound.
+  if (!dateStr) {
+    const now = new Date()
+    const todayStr = `${now.getUTCFullYear()}-${pad2(now.getUTCMonth() + 1)}-${pad2(now.getUTCDate())}`
+    return localMidnightUtc(addOneDay(todayStr), tz)
+  }
+  return localMidnightUtc(addOneDay(dateStr), tz)
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : String(n)
+}
+
+function addOneDay(yyyymmdd: string): string {
+  const [y, m, d] = yyyymmdd.split('-').map(n => parseInt(n, 10))
+  const next = new Date(Date.UTC(y, m - 1, d + 1))
+  return `${next.getUTCFullYear()}-${pad2(next.getUTCMonth() + 1)}-${pad2(next.getUTCDate())}`
 }
 
 /**
  * Returns the count of active scheduled events for a date range.
- * When both args are omitted, counts today (UTC) — same as the old `computeMeetingsToday` behaviour.
+ * When both args are omitted, counts today (in `tz`) — same as the old
+ * `computeMeetingsToday` behaviour but tz-aware.
  */
 export async function computeMeetingsRange(
   token: string,
@@ -27,8 +52,9 @@ export async function computeMeetingsRange(
   userUri: string,
   dateFrom?: string,
   dateTo?: string,
+  tz: string = 'UTC',
 ): Promise<string> {
-  const events = await getEventsInRange(token, connectionId, userUri, dateFrom, dateTo)
+  const events = await getEventsInRange(token, connectionId, userUri, dateFrom, dateTo, tz)
   return String(events.length)
 }
 
@@ -39,12 +65,15 @@ export async function computeMeetingsToday(
   token: string,
   connectionId: string,
   userUri: string,
+  tz: string = 'UTC',
 ): Promise<string> {
-  return computeMeetingsRange(token, connectionId, userUri)
+  return computeMeetingsRange(token, connectionId, userUri, undefined, undefined, tz)
 }
 
 /**
- * Fetch all scheduled events in [dateFrom, dateTo] (inclusive, UTC days).
+ * Fetch all scheduled events in [dateFrom, dateTo] (inclusive). Day
+ * boundaries are evaluated in `tz` — i.e. "Apr 30" means 00:00–24:00 in
+ * `tz`, not UTC.
  */
 export async function getEventsInRange(
   token: string,
@@ -52,9 +81,10 @@ export async function getEventsInRange(
   userUri: string,
   dateFrom?: string,
   dateTo?: string,
+  tz: string = 'UTC',
 ): Promise<Record<string, unknown>[]> {
-  const min = dayStart(dateFrom)
-  const max = dayAfter(dateTo ?? dateFrom)
+  const min = dayStart(dateFrom, tz)
+  const max = dayAfter(dateTo ?? dateFrom, tz)
 
   const url = new URL(`${BASE_API}/scheduled_events`)
   url.searchParams.set('user', userUri)
@@ -97,6 +127,7 @@ export async function getTodayEvents(
   token: string,
   connectionId: string,
   userUri: string,
+  tz: string = 'UTC',
 ): Promise<Record<string, unknown>[]> {
-  return getEventsInRange(token, connectionId, userUri)
+  return getEventsInRange(token, connectionId, userUri, undefined, undefined, tz)
 }

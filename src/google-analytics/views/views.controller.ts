@@ -14,6 +14,7 @@ export class GoogleAnalyticsViewsController {
     @Query('viewType') viewType: string,
     @Query('dateFrom') dateFrom: string | undefined,
     @Query('dateTo') dateTo: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     return this.gaViewsService.fetchLiveValue(
@@ -22,6 +23,7 @@ export class GoogleAnalyticsViewsController {
       req.authUser.id,
       dateFrom,
       dateTo,
+      tz,
     )
   }
 }

@@ -1,4 +1,9 @@
 import { Logger } from '@nestjs/common'
+import {
+  escapeDateLiteral,
+  escapeStringLiteral,
+  tzDateBucket,
+} from './hogql-utils'
 import type { PosthogCredentials } from '../../connection/credentials'
 
 export type RetentionPeriod = 'day' | 'week'
@@ -38,33 +43,44 @@ export interface RetentionRow {
  *
  * v1 simplifications (documented in plan, repeated here so the SQL author
  * can find them):
- *   - Cohort buckets pin to UTC `toDate()`. No per-user timezone. Acceptable
- *     because 90%+ of solo founders running this on small data won't notice
- *     a date shift; revisit when retention is actually used in production.
  *   - We don't filter the cohort window by `dateFrom` — instead we backfill
  *     `cohortCount` periods up to and including `dateTo`. That keeps the
  *     UX simple ("show me last 7 days of cohorts") regardless of how the
  *     global picker is set; the global range still bounds the *return*
  *     window so cells that haven't happened yet stay null.
- *   - Period boundaries: `day` → `toDate(timestamp)`. `week` → `toMonday(toDate(timestamp))`.
- *     Same convention PostHog's own retention uses.
+ *   - Period boundaries: `day` → `toDate(toTimeZone(timestamp, tz))`.
+ *     `week` → `toMonday(toDate(toTimeZone(timestamp, tz)))`. Same
+ *     convention PostHog's own retention uses, but tz-aware so a
+ *     "Monday" means the user's wall-clock Monday in their zone.
+ *
+ * HogQL quirks worth noting (same as funnel.ts/sources.ts):
+ *   - `toDate` is single-arg only; `toDate(ts, tz)` fails the parser.
+ *   - The function is `toTimeZone` (capital Z); `toTimezone` is rejected.
  */
 export function buildRetentionHogql(
   config: RetentionConfig,
   dateTo: string,
+  tz: string = 'UTC',
 ): { cohortQuery: string; returnsQuery: string } {
-  const safeStart = config.startEvent.replace(/'/g, "\\'")
-  const safeReturn = config.returnEvent.replace(/'/g, "\\'")
-  const safeTo = dateTo.replace(/'/g, '')
+  const safeStart = escapeStringLiteral(config.startEvent)
+  const safeReturn = escapeStringLiteral(config.returnEvent)
+  const safeTo = escapeDateLiteral(dateTo)
   const period = config.period
   const cohortCount = Math.max(1, Math.min(60, Math.floor(config.cohortCount)))
   const retentionPeriods = Math.max(1, Math.min(60, Math.floor(config.retentionPeriods)))
 
-  // Period bucket function — same expression used in both CTEs.
-  const bucketExpr =
-    period === 'week'
-      ? `toMonday(toDate(timestamp))`
-      : `toDate(timestamp)`
+  // Two flavours of `toDate(toTimeZone(...))` — the bare `timestamp`
+  // reference in the cohort CTE, and `e.timestamp` in the returns CTE
+  // that joins events twice. Computed once each; reused at every
+  // interpolation point.
+  const tzDate = tzDateBucket(tz)
+  const tzDateE = tzDateBucket(tz, 'e.timestamp')
+
+  // Period bucket function — same expression used in both CTEs. `week`
+  // pins to Mondays via `toMonday(...)`, mirroring PostHog's own
+  // retention math.
+  const bucketExpr = period === 'week' ? `toMonday(${tzDate})` : tzDate
+  const bucketExprE = period === 'week' ? `toMonday(${tzDateE})` : tzDateE
 
   // Window math: how far back the cohort window opens. Driven by the bucket
   // unit so a 7-day cohortCount looks back 7 days; a 7-week one looks back
@@ -75,7 +91,7 @@ export function buildRetentionHogql(
   // CTE 1 — cohort: each user's *first* startEvent bucket.
   // We restrict to events at or before `dateTo` (no future events) and
   // within the lookback so we don't scan all-time data.
-  const cohortQuery = `SELECT person_id, min(${bucketExpr}) AS cohort_start FROM events WHERE event = '${safeStart}' AND toDate(timestamp) >= toDate('${safeTo}') - INTERVAL ${cohortLookback} ${intervalUnit} AND toDate(timestamp) <= toDate('${safeTo}') GROUP BY person_id`
+  const cohortQuery = `SELECT person_id, min(${bucketExpr}) AS cohort_start FROM events WHERE event = '${safeStart}' AND ${tzDate} >= toDate('${safeTo}') - INTERVAL ${cohortLookback} ${intervalUnit} AND ${tzDate} <= toDate('${safeTo}') GROUP BY person_id`
 
   // CTE 2 — returns: distinct users per (cohort, period-offset).
   // We join the cohort table to the returns event stream, compute the
@@ -87,7 +103,7 @@ export function buildRetentionHogql(
   // because HogQL's `WITH` support is patchy; inlined subqueries are the
   // safest cross-version pattern. Same trick `sources.ts` uses elsewhere.
   const diffUnit = period === 'week' ? 'week' : 'day'
-  const returnsQuery = `SELECT c.cohort_start AS cohort_start, dateDiff('${diffUnit}', c.cohort_start, ${bucketExpr}) AS period_offset, count(DISTINCT e.person_id) AS retained FROM events AS e INNER JOIN (${cohortQuery}) AS c ON e.person_id = c.person_id WHERE e.event = '${safeReturn}' AND toDate(e.timestamp) >= c.cohort_start AND toDate(e.timestamp) <= toDate('${safeTo}') AND dateDiff('${diffUnit}', c.cohort_start, ${bucketExpr.replace(/timestamp/g, 'e.timestamp')}) >= 0 AND dateDiff('${diffUnit}', c.cohort_start, ${bucketExpr.replace(/timestamp/g, 'e.timestamp')}) < ${retentionPeriods} GROUP BY cohort_start, period_offset ORDER BY cohort_start, period_offset`
+  const returnsQuery = `SELECT c.cohort_start AS cohort_start, dateDiff('${diffUnit}', c.cohort_start, ${bucketExprE}) AS period_offset, count(DISTINCT e.person_id) AS retained FROM events AS e INNER JOIN (${cohortQuery}) AS c ON e.person_id = c.person_id WHERE e.event = '${safeReturn}' AND ${tzDateE} >= c.cohort_start AND ${tzDateE} <= toDate('${safeTo}') AND dateDiff('${diffUnit}', c.cohort_start, ${bucketExprE}) >= 0 AND dateDiff('${diffUnit}', c.cohort_start, ${bucketExprE}) < ${retentionPeriods} GROUP BY cohort_start, period_offset ORDER BY cohort_start, period_offset`
 
   return { cohortQuery, returnsQuery }
 }
@@ -111,8 +127,9 @@ export async function fetchPosthogRetention(
   config: RetentionConfig,
   dateTo: string,
   logger: Logger,
+  tz: string = 'UTC',
 ): Promise<{ cohorts: RetentionRow[]; periodLabel: RetentionPeriod }> {
-  const { cohortQuery, returnsQuery } = buildRetentionHogql(config, dateTo)
+  const { cohortQuery, returnsQuery } = buildRetentionHogql(config, dateTo, tz)
 
   // Cohort sizes. We wrap the inline cohort CTE in an outer aggregate.
   const sizesHogql = `SELECT cohort_start, count(DISTINCT person_id) FROM (${cohortQuery}) GROUP BY cohort_start ORDER BY cohort_start`

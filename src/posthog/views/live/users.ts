@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common'
+import { escapeDateLiteral, tzDateBucket } from './hogql-utils'
 import type { PosthogCredentials } from '../../connection/credentials'
 
 export interface PosthogUserRow {
@@ -29,14 +30,17 @@ export async function fetchPosthogUsersList(
   dateTo: string,
   limit: number,
   logger: Logger,
+  tz: string = 'UTC',
 ): Promise<PosthogUserRow[]> {
-  const safeFrom = dateFrom.replace(/'/g, '')
-  const safeTo = dateTo.replace(/'/g, '')
+  const safeFrom = escapeDateLiteral(dateFrom)
+  const safeTo = escapeDateLiteral(dateTo)
   const safeLimit = Math.max(1, Math.min(500, Math.floor(limit)))
+  const tzDate = tzDateBucket(tz)
 
   // Parens around BETWEEN are load-bearing — see fetchPosthogSourcesByBucket
-  // for the precedence-bug story.
-  const hogql = `SELECT distinct_id, any(properties.$initial_referring_domain) AS src, dateDiff('second', min(timestamp), max(timestamp)) AS session_sec, max(timestamp) AS last_seen FROM events WHERE event = '$pageview' AND (toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY distinct_id ORDER BY last_seen DESC LIMIT ${safeLimit}`
+  // for the precedence-bug story. `tzDateBucket` handles the `toDate` +
+  // `toTimeZone` chain HogQL needs (toDate is single-arg in HogQL).
+  const hogql = `SELECT distinct_id, any(properties.$initial_referring_domain) AS src, dateDiff('second', min(timestamp), max(timestamp)) AS session_sec, max(timestamp) AS last_seen FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY distinct_id ORDER BY last_seen DESC LIMIT ${safeLimit}`
 
   const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
     method: 'POST',

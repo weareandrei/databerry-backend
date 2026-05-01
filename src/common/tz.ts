@@ -21,6 +21,19 @@ export interface ZonedFields {
 }
 
 /**
+ * Sanitize an IANA timezone string for safe injection into a HogQL/SQL
+ * string literal. IANA names use only `[A-Za-z0-9_/+-]`; anything else
+ * (quotes, spaces, control chars) is treated as injection and falls back
+ * to UTC.
+ *
+ * Returns `'UTC'` for `undefined`, `null`, or any non-matching input —
+ * the entire codebase treats `'UTC'` as the safe default.
+ */
+export function safeTzLiteral(tz: string | undefined | null): string {
+  return typeof tz === 'string' && /^[A-Za-z0-9_/+-]+$/.test(tz) ? tz : 'UTC'
+}
+
+/**
  * Decompose a UTC `Date` into year/month/day/hour as observed in `tz`.
  * Returns hour=0 for midnight (we normalize Intl's "24" edge case).
  */
@@ -82,8 +95,8 @@ export function gaDateHourKeyInTz(date: Date, tz: string): string {
 }
 
 /** "YYYY-MM-DDTHH:00:00" of `date` as observed in `tz` (matches PostHog
- *  `toStartOfHour(toTimezone(timestamp, tz))` output — `toStartOfHour` is
- *  single-arg in HogQL, so we apply the timezone via `toTimezone` first.
+ *  `toStartOfHour(toTimeZone(timestamp, tz))` output — `toStartOfHour` is
+ *  single-arg in HogQL, so we apply the timezone via `toTimeZone` first.
  *  The returned DateTime renders no tz suffix and uses ISO-style `T`
  *  separator, which this key generator mirrors verbatim. */
 export function phHourlyKeyInTz(date: Date, tz: string): string {

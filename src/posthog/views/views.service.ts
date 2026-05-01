@@ -1,6 +1,17 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common'
+import {
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
 import { ConnectionMissingException } from '../../common/integration-errors'
+import { buildViewFetchContext } from '../../common/view-fetch-context'
+import {
+  escapeDateLiteral,
+  escapeStringLiteral,
+  tzDateBucket,
+} from './live/hogql-utils'
 import { getPosthogCredentials, type PosthogCredentials } from '../connection/credentials'
 import {
   fetchPosthogFunnel,
@@ -66,14 +77,12 @@ export class PosthogViewsService {
     userId: string,
     dateFrom?: string,
     dateTo?: string,
+    tz: string = 'UTC',
   ): Promise<{ value: string | null; unavailable?: boolean }> {
-    const todayStr = new Date().toISOString().split('T')[0]
-    const from = dateFrom ?? todayStr
-    const to = dateTo ?? from
-    const isSingleDay = from === to
+    const { from, to, isSingleDay, tz: tzLit } = buildViewFetchContext(dateFrom, dateTo, tz)
 
     this.logger.log(
-      `\n  ► fetchLiveValue (posthog)\n  connectionId : ${connectionId}\n  viewId       : ${viewId}\n  dateFrom     : ${from}\n  dateTo       : ${to}`,
+      `fetchLiveValue (posthog)  connectionId=${connectionId}  viewId=${viewId}  ${from}→${to}  tz=${tzLit}`,
     )
 
     const client = this.supabaseService.getClient()
@@ -81,20 +90,21 @@ export class PosthogViewsService {
     const eventName = (config.eventName as string | undefined) ?? ''
 
     if (!eventName) {
-      this.logger.warn(`  ⚠ No eventName in view config — returning 0`)
+      this.logger.warn('No eventName in view config — returning 0')
       return { value: '0' }
     }
 
-    const safeEvent = eventName.replace(/'/g, "\\'")
-    const safeFrom = from.replace(/'/g, '')
-    const safeTo = to.replace(/'/g, '')
+    const safeEvent = escapeStringLiteral(eventName)
+    const safeFrom = escapeDateLiteral(from)
+    const safeTo = escapeDateLiteral(to)
     // Parens around BETWEEN are load-bearing — HogQL's AND binds tighter
     // than BETWEEN, so without them the parser reads
     // `(event = X AND toDate(timestamp)) BETWEEN …` and crashes on the
-    // string-AND-Date type mismatch.
-    const hogqlQuery = `SELECT count() FROM events WHERE event = '${safeEvent}' AND (toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}'))`
+    // string-AND-Date type mismatch. `tzDateBucket` returns the
+    // `toDate(toTimeZone(...))` chain HogQL needs.
+    const hogqlQuery = `SELECT count() FROM events WHERE event = '${safeEvent}' AND (${tzDateBucket(tzLit)} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}'))`
 
-    this.logger.log(`  → querying PostHog HogQL: ${hogqlQuery}`)
+    this.logger.debug(`PostHog HogQL: ${hogqlQuery}`)
 
     const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
       method: 'POST',
@@ -107,15 +117,17 @@ export class PosthogViewsService {
 
     if (!res.ok) {
       const body = await res.json().catch(() => ({}))
-      this.logger.error(`  ✗ PostHog query API ${res.status}\n  body: ${JSON.stringify(body)}`)
-      throw new Error(`PostHog query API error ${res.status}`)
+      this.logger.error(`PostHog query API ${res.status}: ${JSON.stringify(body)}`)
+      // Surfaces as 500 to the frontend; the user-facing message is
+      // generic ("Couldn't load this view.") via `viewErrorMessage`.
+      throw new InternalServerErrorException(`PostHog query API error ${res.status}`)
     }
 
     const json = (await res.json()) as { results?: [[number]] }
     const count = json.results?.[0]?.[0] ?? 0
     const value = String(count)
 
-    this.logger.log(`  ✓ range count: ${value}`)
+    this.logger.log(`fetchLiveValue → ${value}`)
 
     // Only persist to views_values for single-day queries (daily table).
     if (isSingleDay) {
@@ -146,13 +158,12 @@ export class PosthogViewsService {
     userId: string,
     dateFrom?: string,
     dateTo?: string,
+    tz: string = 'UTC',
   ): Promise<{ steps: FunnelStepRow[]; unavailable?: boolean }> {
-    const todayStr = new Date().toISOString().split('T')[0]
-    const from = dateFrom ?? todayStr
-    const to = dateTo ?? from
+    const { from, to, tz: tzLit } = buildViewFetchContext(dateFrom, dateTo, tz)
 
     this.logger.log(
-      `\n  ► fetchFunnel (posthog)\n  connectionId : ${connectionId}\n  viewId       : ${viewId}\n  dateFrom     : ${from}\n  dateTo       : ${to}`,
+      `fetchFunnel (posthog)  connectionId=${connectionId}  viewId=${viewId}  ${from}→${to}  tz=${tzLit}`,
     )
 
     const { config, ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
@@ -163,11 +174,11 @@ export class PosthogViewsService {
     const window = (config.conversionWindowSeconds as number | undefined) ?? 86400 * 7
 
     if (steps.length < 2) {
-      this.logger.warn(`  ⚠ Funnel needs ≥2 steps; got ${steps.length}`)
+      this.logger.warn(`Funnel needs ≥2 steps; got ${steps.length}`)
       return { steps: [] }
     }
 
-    return fetchPosthogFunnel(ph, steps, window, from, to, this.logger)
+    return fetchPosthogFunnel(ph, steps, window, from, to, this.logger, tzLit)
   }
 
   /**
@@ -182,16 +193,16 @@ export class PosthogViewsService {
     userId: string,
     _dateFrom?: string,
     dateTo?: string,
+    tz: string = 'UTC',
   ): Promise<{
     cohorts: RetentionRow[]
     periodLabel: RetentionPeriod
     unavailable?: boolean
   }> {
-    const todayStr = new Date().toISOString().split('T')[0]
-    const to = dateTo ?? todayStr
+    const { to, tz: tzLit } = buildViewFetchContext(undefined, dateTo, tz)
 
     this.logger.log(
-      `\n  ► fetchRetention (posthog)\n  connectionId : ${connectionId}\n  viewId       : ${viewId}\n  dateTo       : ${to}`,
+      `fetchRetention (posthog)  connectionId=${connectionId}  viewId=${viewId}  dateTo=${to}  tz=${tzLit}`,
     )
 
     const { config, ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
@@ -203,7 +214,7 @@ export class PosthogViewsService {
       retentionPeriods: (config.retentionPeriods as number | undefined) ?? 7,
     }
 
-    return fetchPosthogRetention(ph, retentionConfig, to, this.logger)
+    return fetchPosthogRetention(ph, retentionConfig, to, this.logger, tzLit)
   }
 
   /**
@@ -216,17 +227,16 @@ export class PosthogViewsService {
     userId: string,
     dateFrom?: string,
     dateTo?: string,
+    tz: string = 'UTC',
   ): Promise<{ users: PosthogUserRow[]; unavailable?: boolean }> {
-    const todayStr = new Date().toISOString().split('T')[0]
-    const from = dateFrom ?? todayStr
-    const to = dateTo ?? from
+    const { from, to, tz: tzLit } = buildViewFetchContext(dateFrom, dateTo, tz)
 
     this.logger.log(
-      `\n  ► fetchUsers (posthog)\n  connectionId : ${connectionId}\n  viewId       : ${viewId}\n  dateFrom     : ${from}\n  dateTo       : ${to}`,
+      `fetchUsers (posthog)  connectionId=${connectionId}  viewId=${viewId}  ${from}→${to}  tz=${tzLit}`,
     )
 
     const { ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
-    const users = await fetchPosthogUsersList(ph, from, to, 500, this.logger)
+    const users = await fetchPosthogUsersList(ph, from, to, 500, this.logger, tzLit)
     return { users }
   }
 }

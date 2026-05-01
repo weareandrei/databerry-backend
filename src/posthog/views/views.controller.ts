@@ -14,6 +14,7 @@ export class PosthogViewsController {
     @Query('viewId') viewId: string,
     @Query('dateFrom') dateFrom: string | undefined,
     @Query('dateTo') dateTo: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     return this.posthogViewsService.fetchLiveValue(
@@ -22,6 +23,7 @@ export class PosthogViewsController {
       req.authUser.id,
       dateFrom,
       dateTo,
+      tz,
     )
   }
 
@@ -37,6 +39,7 @@ export class PosthogViewsController {
     @Query('viewId') viewId: string,
     @Query('dateFrom') dateFrom: string | undefined,
     @Query('dateTo') dateTo: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     return this.posthogViewsService.fetchFunnel(
@@ -45,6 +48,7 @@ export class PosthogViewsController {
       req.authUser.id,
       dateFrom,
       dateTo,
+      tz,
     )
   }
 
@@ -60,6 +64,7 @@ export class PosthogViewsController {
     @Query('viewId') viewId: string,
     @Query('dateFrom') dateFrom: string | undefined,
     @Query('dateTo') dateTo: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     return this.posthogViewsService.fetchRetention(
@@ -68,6 +73,7 @@ export class PosthogViewsController {
       req.authUser.id,
       dateFrom,
       dateTo,
+      tz,
     )
   }
 
@@ -81,6 +87,7 @@ export class PosthogViewsController {
     @Query('viewId') viewId: string,
     @Query('dateFrom') dateFrom: string | undefined,
     @Query('dateTo') dateTo: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     return this.posthogViewsService.fetchUsers(
@@ -89,6 +96,7 @@ export class PosthogViewsController {
       req.authUser.id,
       dateFrom,
       dateTo,
+      tz,
     )
   }
 }

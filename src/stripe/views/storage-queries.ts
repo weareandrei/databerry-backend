@@ -1,10 +1,27 @@
 import type { SupabaseService } from '../../supabase/supabase.service'
+import { localMidnightUtc } from '../../common/tz'
 import {
   subItemsTouchProducts,
   type PersistedSubItem,
 } from '../sync/mrr.helper'
 
 type Client = ReturnType<SupabaseService['getClient']>
+
+/**
+ * `YYYY-MM-DD` + 1 day, as `YYYY-MM-DD`. Used as the exclusive upper bound
+ * of a charge-date range — together with `localMidnightUtc` this gives us
+ * a half-open `[from, toExclusive)` interval whose endpoints sit at the
+ * user's local midnight rather than UTC midnight.
+ */
+function addOneDay(yyyymmdd: string): string {
+  const [y, m, d] = yyyymmdd.split('-').map(n => parseInt(n, 10))
+  // Date.UTC handles month/year rollover for us.
+  const next = new Date(Date.UTC(y, m - 1, d + 1))
+  const yy = next.getUTCFullYear()
+  const mm = String(next.getUTCMonth() + 1).padStart(2, '0')
+  const dd = String(next.getUTCDate()).padStart(2, '0')
+  return `${yy}-${mm}-${dd}`
+}
 
 export interface ChargeRow {
   amount: number
@@ -114,9 +131,15 @@ export async function fetchAccountCharges(
   dateFrom: string,
   dateTo: string,
   productIds: string[] = [],
+  tz: string = 'UTC',
 ): Promise<ChargeRow[]> {
-  const fromISO = `${dateFrom}T00:00:00Z`
-  const toExclusiveISO = nextDayISO(dateTo)
+  // tz-aware bounds: "today" means midnight-to-midnight in the user's
+  // timezone, expressed as UTC instants. For UTC users this collapses to
+  // the legacy `${dateFrom}T00:00:00Z` form; for everyone else a charge
+  // created at 11pm Bucharest local on Apr 30 still falls inside Apr 30
+  // even though its UTC stamp is Apr 30 20:00.
+  const fromISO = localMidnightUtc(dateFrom, tz).toISOString()
+  const toExclusiveISO = localMidnightUtc(addOneDay(dateTo), tz).toISOString()
 
   if (productIds.length === 0) {
     // Fast path — no product filter, sum charges directly.
@@ -171,11 +194,10 @@ export async function fetchAccountCharges(
   }))
 }
 
-function nextDayISO(dateStr: string): string {
-  const d = new Date(`${dateStr}T00:00:00Z`)
-  d.setUTCDate(d.getUTCDate() + 1)
-  return d.toISOString()
-}
+// `nextDayISO` was the UTC-only predecessor of
+// `localMidnightUtc(addOneDay(dateTo), tz)`. Removed once `tz` was threaded
+// through every charge-range read; if you find yourself wanting it back,
+// you almost certainly mean the tz-aware form.
 
 // ──────────────────────────────────────────────────────────────────────────
 // SaaS-metric reads (MRR, active subs, top customers, churn). All operate on
@@ -256,13 +278,16 @@ export async function fetchTopCustomers(
   dateFrom: string,
   dateTo: string,
   limit = 10,
+  tz: string = 'UTC',
 ): Promise<TopCustomerRow[]> {
   // We need the per-charge `customer_id` alongside the (filtered) amount.
   // `fetchAccountCharges` returns ChargeRow which intentionally hides
   // customer_id (it's bucket-by-day-only). Re-implement the two paths
   // narrowly here with `customer_id` included.
-  const fromISO = `${dateFrom}T00:00:00Z`
-  const toExclusiveISO = nextDayISO(dateTo)
+  //
+  // tz-aware bounds: see comment in `fetchAccountCharges`.
+  const fromISO = localMidnightUtc(dateFrom, tz).toISOString()
+  const toExclusiveISO = localMidnightUtc(addOneDay(dateTo), tz).toISOString()
 
   const sumByCustomer = new Map<string, number>()
 

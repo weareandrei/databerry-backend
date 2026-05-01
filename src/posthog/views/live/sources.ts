@@ -1,4 +1,10 @@
 import { Logger } from '@nestjs/common'
+import {
+  escapeDateLiteral,
+  escapeStringLiteral,
+  tzDateBucket,
+  tzWrappedTimestamp,
+} from './hogql-utils'
 import type { PosthogCredentials } from '../../connection/credentials'
 
 export type BucketGranularity = 'hourly' | 'daily'
@@ -10,31 +16,23 @@ export interface SourceBucketRow {
 }
 
 /**
- * Sanitize an IANA timezone string for safe injection into a HogQL string
- * literal. IANA names use only `[A-Za-z0-9_/+-]`; anything else (quotes,
- * spaces, control chars) is treated as injection and falls back to UTC.
+ * Hour-bucket expression in `tz`. HogQL's `toStartOfHour` is single-arg
+ * only — and `toDate` and `toTimeZone` have their own quirks documented
+ * in `hogql-utils.ts`. We convert `timestamp` to the target zone first,
+ * then truncate. The returned DateTime serializes to the same wall-clock
+ * string the caller expects — `phHourlyKeyInTz` produces matching keys.
  */
-function safeTzLiteral(tz: string | undefined): string {
-  return typeof tz === 'string' && /^[A-Za-z0-9_/+-]+$/.test(tz) ? tz : 'UTC'
-}
-
-/**
- * Hour-bucket expression in `tzLit`. We can't use `toStartOfHour(ts, tz)` —
- * unlike ClickHouse's `toDate`, `toStartOfHour` is single-arg in HogQL and
- * the 2-arg call fails validation ("Function 'toStartOfHour' expects 1
- * argument, found 2"). Convert the timestamp to the target zone first, then
- * truncate. The returned DateTime serializes to the same wall-clock string
- * the caller expects — `phHourlyKeyInTz` produces matching bucket keys.
- */
-function hourBucketExpr(tzLit: string): string {
-  return `toStartOfHour(toTimezone(timestamp, '${tzLit}'))`
+function hourBucketExpr(tz: string): string {
+  return `toStartOfHour(${tzWrappedTimestamp(tz)})`
 }
 
 /**
  * Posthog sources-by-bucket (via HogQL).
  * bucketKey format: "YYYY-MM-DD HH:00:00" for hourly, "YYYY-MM-DD" for daily,
- * both rendered in `tz` (passed through to ClickHouse `toStartOfHour`/`toDate`
- * as the second argument). Default `tz='UTC'` preserves the legacy shape.
+ * both rendered in `tz`. We can't pass `tz` as a second arg to
+ * `toStartOfHour`/`toDate` (HogQL is 1-arg only) — instead we wrap with
+ * `toTimeZone(timestamp, tz)` and truncate. Default `tz='UTC'` preserves the
+ * legacy shape (toTimeZone(ts, 'UTC') is a no-op for a UTC-stored column).
  */
 export async function fetchPosthogSourcesByBucket(
   ph: PosthogCredentials,
@@ -44,14 +42,11 @@ export async function fetchPosthogSourcesByBucket(
   logger: Logger,
   tz: string = 'UTC',
 ): Promise<SourceBucketRow[]> {
-  const tzLit = safeTzLiteral(tz)
-  const timeExpr =
-    granularity === 'hourly'
-      ? hourBucketExpr(tzLit)
-      : `toDate(timestamp, '${tzLit}')`
+  const tzDate = tzDateBucket(tz)
+  const timeExpr = granularity === 'hourly' ? hourBucketExpr(tz) : tzDate
 
-  const safeFrom = dateFrom.replace(/'/g, '')
-  const safeTo = dateTo.replace(/'/g, '')
+  const safeFrom = escapeDateLiteral(dateFrom)
+  const safeTo = escapeDateLiteral(dateTo)
 
   // `$initial_referring_domain` is the standard Posthog property for session source.
   //
@@ -61,9 +56,9 @@ export async function fetchPosthogSourcesByBucket(
   // tries to AND a string with a Date and bombs out with
   // "Illegal type (Date) of 2 argument of function and".
   //
-  // The BETWEEN bound also runs in `tz` so a "today" range maps to the
-  // user's local day, not UTC.
-  const hogql = `SELECT ${timeExpr} AS bucket, properties.$initial_referring_domain AS src, count() FROM events WHERE event = '$pageview' AND (toDate(timestamp, '${tzLit}') BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket, src ORDER BY bucket`
+  // The BETWEEN bound also runs in `tz` (via the toTimeZone wrap inside
+  // `tzDateBucket`) so a "today" range maps to the user's local day, not UTC.
+  const hogql = `SELECT ${timeExpr} AS bucket, properties.$initial_referring_domain AS src, count() FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket, src ORDER BY bucket`
 
   const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
     method: 'POST',
@@ -102,19 +97,16 @@ export async function fetchPosthogEventCountByBucket(
   logger: Logger,
   tz: string = 'UTC',
 ): Promise<{ bucketKey: string; value: number }[]> {
-  const tzLit = safeTzLiteral(tz)
-  const timeExpr =
-    granularity === 'hourly'
-      ? hourBucketExpr(tzLit)
-      : `toDate(timestamp, '${tzLit}')`
+  const tzDate = tzDateBucket(tz)
+  const timeExpr = granularity === 'hourly' ? hourBucketExpr(tz) : tzDate
 
-  const safeEvent = eventName.replace(/'/g, "\\'")
-  const safeFrom = dateFrom.replace(/'/g, '')
-  const safeTo = dateTo.replace(/'/g, '')
+  const safeEvent = escapeStringLiteral(eventName)
+  const safeFrom = escapeDateLiteral(dateFrom)
+  const safeTo = escapeDateLiteral(dateTo)
 
-  // See note in fetchPosthogSourcesByBucket: the parens around BETWEEN are
+  // See note in fetchPosthogSourcesByBucket: parens around BETWEEN are
   // load-bearing because HogQL's AND binds tighter than BETWEEN.
-  const hogql = `SELECT ${timeExpr} AS bucket, count() FROM events WHERE event = '${safeEvent}' AND (toDate(timestamp, '${tzLit}') BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket ORDER BY bucket`
+  const hogql = `SELECT ${timeExpr} AS bucket, count() FROM events WHERE event = '${safeEvent}' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket ORDER BY bucket`
 
   const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
     method: 'POST',

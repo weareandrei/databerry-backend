@@ -1,4 +1,10 @@
 import { Logger } from '@nestjs/common'
+import {
+  escapeDateLiteral,
+  escapeStringLiteral,
+  tzDateBucket,
+  tzWrappedTimestamp,
+} from './hogql-utils'
 import type { PosthogCredentials } from '../../connection/credentials'
 
 export interface FunnelStepConfig {
@@ -37,6 +43,14 @@ export interface FunnelStepRow {
  * `distinct_id` aliases through `person_id` once people are identified, and
  * Posthog's UI does the same.
  *
+ * Two HogQL/ClickHouse quirks force the casts below:
+ *   1. PostHog's `events.timestamp` is `DateTime64(6, 'UTC')`, which
+ *      `windowFunnel` rejects ("Illegal type DateTime64(6, 'UTC') of first
+ *      argument…"). We cast to plain `DateTime` first.
+ *   2. HogQL's `toDate` is single-arg only. To honour a per-user `tz` for
+ *      day-bucketing we wrap with `toTimeZone(timestamp, tz)` before
+ *      truncating — same pattern as `sources.ts` uses post-fix.
+ *
  * Splitting the build out as a pure function keeps the SQL unit-testable
  * without I/O — same trick as `mrr.helper.ts` on the Stripe side.
  */
@@ -45,16 +59,25 @@ export function buildFunnelHogql(
   conversionWindowSeconds: number,
   dateFrom: string,
   dateTo: string,
+  tz: string = 'UTC',
 ): string {
-  const safeFrom = dateFrom.replace(/'/g, '')
-  const safeTo = dateTo.replace(/'/g, '')
+  const safeFrom = escapeDateLiteral(dateFrom)
+  const safeTo = escapeDateLiteral(dateTo)
   const safeWindow = Math.max(1, Math.floor(conversionWindowSeconds))
-  const safeSteps = steps.map(s => s.eventName.replace(/'/g, "\\'"))
-  const stepConds = safeSteps.map(e => `event = '${e}'`).join(', ')
+  const stepConds = steps
+    .map(s => `event = '${escapeStringLiteral(s.eventName)}'`)
+    .join(', ')
 
-  // Parens around BETWEEN are load-bearing — see fetchPosthogSourcesByBucket
-  // for the HogQL precedence story.
-  return `SELECT step, count() FROM (SELECT person_id, windowFunnel(${safeWindow})(timestamp, ${stepConds}) AS step FROM events WHERE (toDate(timestamp) BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY person_id) WHERE step > 0 GROUP BY step ORDER BY step`
+  // Build once — interpolated in two places below.
+  const tzTs = tzWrappedTimestamp(tz)
+  const tzDate = tzDateBucket(tz)
+
+  // Parens around BETWEEN are load-bearing — HogQL's AND binds tighter
+  // than BETWEEN, so without them the parser reads
+  // `(event = X AND toDate(timestamp)) BETWEEN …` and crashes on the
+  // string-AND-Date type mismatch. `toDateTime(...)` fixes windowFunnel's
+  // refusal of `DateTime64`.
+  return `SELECT step, count() FROM (SELECT person_id, windowFunnel(${safeWindow})(toDateTime(${tzTs}), ${stepConds}) AS step FROM events WHERE (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY person_id) WHERE step > 0 GROUP BY step ORDER BY step`
 }
 
 /**
@@ -72,6 +95,7 @@ export async function fetchPosthogFunnel(
   dateFrom: string,
   dateTo: string,
   logger: Logger,
+  tz: string = 'UTC',
 ): Promise<{ steps: FunnelStepRow[] }> {
   if (steps.length < 2) {
     // Two-step minimum is enforced in the picker; this is a safety net so a
@@ -79,7 +103,7 @@ export async function fetchPosthogFunnel(
     return { steps: [] }
   }
 
-  const hogql = buildFunnelHogql(steps, conversionWindowSeconds, dateFrom, dateTo)
+  const hogql = buildFunnelHogql(steps, conversionWindowSeconds, dateFrom, dateTo, tz)
   logger.log(`  → posthog funnel HogQL: ${hogql}`)
 
   const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {

@@ -15,16 +15,20 @@ export class SupabaseAuthGuard implements CanActivate {
 
     const token = authHeader.slice(7)
 
-    let user: any
+    // `auth.getUser` returns `{ data, error }` rather than throwing; we
+    // collapse both shapes (network throw / auth-rejection) into a single
+    // `UnauthorizedException` so the controller doesn't have to care which
+    // one happened.
     try {
       const { data, error } = await this.supabaseService.getClient().auth.getUser(token)
-      if (error || !data.user) throw new Error('invalid')
-      user = data.user
-    } catch {
+      if (error || !data.user) {
+        throw new UnauthorizedException('Invalid or expired token')
+      }
+      request.authUser = data.user
+      return true
+    } catch (err) {
+      if (err instanceof UnauthorizedException) throw err
       throw new UnauthorizedException('Invalid or expired token')
     }
-
-    request.authUser = user
-    return true
   }
 }

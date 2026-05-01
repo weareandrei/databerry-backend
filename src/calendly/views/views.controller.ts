@@ -14,6 +14,7 @@ export class CalendlyViewsController {
     @Query('viewType') viewType: string,
     @Query('dateFrom') dateFrom: string | undefined,
     @Query('dateTo') dateTo: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     return this.calendlyViewsService.fetchLiveValue(
@@ -22,6 +23,7 @@ export class CalendlyViewsController {
       req.authUser.id,
       dateFrom,
       dateTo,
+      tz,
     )
   }
 
@@ -30,6 +32,7 @@ export class CalendlyViewsController {
     @Query('connectionId') connectionId: string,
     @Query('dateFrom') dateFrom: string | undefined,
     @Query('dateTo') dateTo: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     const meetings = await this.calendlyViewsService.fetchMeetingsList(
@@ -37,6 +40,7 @@ export class CalendlyViewsController {
       req.authUser.id,
       dateFrom,
       dateTo,
+      tz,
     )
     return { meetings }
   }

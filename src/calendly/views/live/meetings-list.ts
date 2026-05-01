@@ -14,8 +14,9 @@ export interface CalendlyMeeting {
 
 /**
  * calendly_meetings_list
- * Returns full meeting details (with invitees) for all active events in [dateFrom, dateTo].
- * When both args are omitted, returns today's events (UTC).
+ * Returns full meeting details (with invitees) for all active events in
+ * [dateFrom, dateTo]. Day boundaries are evaluated in `tz` (default UTC).
+ * When both date args are omitted, returns today's events (in `tz`).
  */
 export async function computeMeetingsList(
   token: string,
@@ -24,8 +25,9 @@ export async function computeMeetingsList(
   logger: Logger,
   dateFrom?: string,
   dateTo?: string,
+  tz: string = 'UTC',
 ): Promise<CalendlyMeeting[]> {
-  const events = await getEventsInRange(token, connectionId, userUri, dateFrom, dateTo)
+  const events = await getEventsInRange(token, connectionId, userUri, dateFrom, dateTo, tz)
   const meetings: CalendlyMeeting[] = []
 
   for (const event of events) {
