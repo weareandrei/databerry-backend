@@ -1,18 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
 import { makeStripeGetter, type StripeGetter } from '../views/stripe-api.helpers'
-import { makeStripeGetterForAccount } from './account-getter.helper'
+import { ensureSyncedThrough } from './ensure-synced.helper'
 import {
-  bumpLastSyncedAt,
   setBackfillStatus,
   upsertAccount,
 } from './persist.helper'
-import {
-  syncCharges,
-  syncCustomers,
-  syncProducts,
-  syncSubscriptions,
-} from './sync-range.helper'
 import type { StripeAccountRow } from './types'
 
 const BACKFILL_DAYS = 90
@@ -151,31 +144,25 @@ export class StripeBackfillService {
       await setBackfillStatus(client, stripeAccountId, 'in_progress')
       this.logger.log(`  → status=in_progress  account=${stripeAccountId}`)
 
-      const get = await makeStripeGetterForAccount(client, stripeAccountId)
-
-      // Products first — picker UI depends on it and we want it live before
-      // the slow charges pass finishes. Pass the logger through so each page
-      // gets logged; this is the single biggest source of "why is the picker
-      // empty?" mystery and we want a paper trail.
-      this.logger.log(`  → syncProducts BEGIN  account=${stripeAccountId}`)
-      const productCount = await syncProducts(client, stripeAccountId, get, this.logger)
-      this.logger.log(`  → syncProducts DONE   account=${stripeAccountId}  count=${productCount}`)
-
       const now = Math.floor(Date.now() / 1000)
       const since = now - BACKFILL_DAYS * 86_400
 
-      this.logger.log(
-        `  → syncCharges BEGIN   account=${stripeAccountId}  since=${new Date(since * 1000).toISOString()}`,
-      )
-      const chargeCount = await syncCharges(
+      // Heavy passes are all on for a backfill — first-time setup needs the
+      // full catalogue (picker), customer table (top-customers tile), and
+      // subscription set (MRR/churn).
+      const result = await ensureSyncedThrough(
         client,
         stripeAccountId,
-        get,
         since,
         now,
+        {
+          includeProducts: true,
+          includeCustomers: true,
+          includeSubscriptions: true,
+          triggeredBy: 'backfill',
+        },
         this.logger,
       )
-      this.logger.log(`  → syncCharges DONE    account=${stripeAccountId}  count=${chargeCount}`)
 
       const { error: throughErr } = await client
         .from('stripe_accounts')
@@ -185,22 +172,9 @@ export class StripeBackfillService {
         this.logger.warn(`  ⚠ failed to set backfilled_through: ${throughErr.message}`)
       }
 
-      // SaaS metrics passes — order matters: customers first so the
-      // top-customers tile can resolve names alongside the existing charge
-      // data, subscriptions second since they're the heaviest pass and
-      // furthest from "user sees something useful immediately".
-      this.logger.log(`  → syncCustomers BEGIN  account=${stripeAccountId}`)
-      const customerCount = await syncCustomers(client, stripeAccountId, get, this.logger)
-      this.logger.log(`  → syncCustomers DONE   account=${stripeAccountId}  count=${customerCount}`)
-
-      this.logger.log(`  → syncSubscriptions BEGIN  account=${stripeAccountId}`)
-      const subCount = await syncSubscriptions(client, stripeAccountId, get, this.logger)
-      this.logger.log(`  → syncSubscriptions DONE   account=${stripeAccountId}  count=${subCount}`)
-
       await setBackfillStatus(client, stripeAccountId, 'complete')
-      await bumpLastSyncedAt(client, stripeAccountId)
       this.logger.log(
-        `  ✓ backfillAccount END    account=${stripeAccountId}  products=${productCount}  charges=${chargeCount}  customers=${customerCount}  subs=${subCount}  window=${BACKFILL_DAYS}d`,
+        `  ✓ backfillAccount END    account=${stripeAccountId}  products=${result.productCount}  charges=${result.chargeCount}  customers=${result.customerCount}  subs=${result.subCount}  window=${BACKFILL_DAYS}d`,
       )
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -238,6 +212,88 @@ export class StripeBackfillService {
   kickBackfill(stripeAccountId: string): void {
     // Fire-and-forget — explicit `void` so eslint/no-floating-promises is happy
     void this.backfillAccount(stripeAccountId)
+  }
+
+  /**
+   * Connection-creation entrypoint. Replaces a bare `kickBackfill` for the
+   * connect path because of the account-dedup bug: when a user connects a
+   * second connection to an already-backfilled `stripe_accounts` row,
+   * `kickBackfill` short-circuits on `backfill_status='complete'` and
+   * pulls nothing — even if the last sync was hours or days ago.
+   *
+   * This method:
+   *   - First-time / previously errored accounts → run a normal 90d backfill.
+   *   - Already-completed accounts → fill the gap from `last_synced_at` to
+   *     now via `ensureSyncedThrough` (charges + subs, full set, since the
+   *     reconnect is a "settle the picture" event for the user).
+   *
+   * Fire-and-forget. Errors are caught + logged; failures don't propagate
+   * to the connection-creation request — the user already has a working
+   * connection, the sync is opportunistic.
+   */
+  kickBackfillOnConnect(stripeAccountId: string): void {
+    void this.runReconnectSync(stripeAccountId)
+  }
+
+  private async runReconnectSync(stripeAccountId: string): Promise<void> {
+    const client = this.supabaseService.getClient()
+    try {
+      const { data: existing } = await client
+        .from('stripe_accounts')
+        .select('backfill_status, last_synced_at')
+        .eq('id', stripeAccountId)
+        .maybeSingle()
+
+      if (!existing) {
+        this.logger.warn(
+          `  ⚠ kickBackfillOnConnect: ${stripeAccountId} row missing — caller must upsertAccount first`,
+        )
+        return
+      }
+
+      // Not finished a first-time backfill yet → use the lifecycle path.
+      if (existing.backfill_status !== 'complete') {
+        await this.backfillAccount(stripeAccountId)
+        return
+      }
+
+      // Already complete. Fill any gap since the last sync. Cap at 24h so
+      // a long-stale `last_synced_at` doesn't degrade into a near-full
+      // backfill via the live-sync path; 24h matches what reconcile would
+      // catch anyway, and going further back is a manual-reload concern.
+      const lastSyncedAt = (existing.last_synced_at as string | null) ?? null
+      const now = Math.floor(Date.now() / 1000)
+      const lastSyncedUnix = lastSyncedAt
+        ? Math.floor(Date.parse(lastSyncedAt) / 1000)
+        : 0
+      const since = Math.max(lastSyncedUnix, now - 24 * 3600)
+
+      this.logger.log(
+        `\n  ► kickBackfillOnConnect (gap-fill)  account=${stripeAccountId}  since=${new Date(
+          since * 1000,
+        ).toISOString()}`,
+      )
+
+      const result = await ensureSyncedThrough(
+        client,
+        stripeAccountId,
+        since,
+        now,
+        {
+          includeSubscriptions: true,
+          triggeredBy: 'reconnect',
+        },
+        this.logger,
+      )
+      this.logger.log(
+        `  ✓ kickBackfillOnConnect DONE  account=${stripeAccountId}  charges=${result.chargeCount}  subs=${result.subCount}`,
+      )
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      this.logger.error(
+        `  ✗ kickBackfillOnConnect FAILED  account=${stripeAccountId}  msg="${msg}"`,
+      )
+    }
   }
 
   /**

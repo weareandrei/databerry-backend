@@ -258,6 +258,10 @@ export interface TopCustomerRow {
   customerId: string
   name: string | null
   email: string | null
+  /** ISO 3166-1 alpha-2 (e.g. 'RO'). Null when Stripe never collected an
+   *  address for the customer, or the address has no country. */
+  addressCountry: string | null
+  addressCity: string | null
   amountCents: number
 }
 
@@ -349,19 +353,27 @@ export async function fetchTopCustomers(
     .sort((a, b) => b[1] - a[1])
     .slice(0, limit)
 
-  // Resolve names/emails in a single round trip.
+  // Resolve names/emails/location in a single round trip.
   const ids = ranked.map(([cid]) => cid)
   const { data: custRows, error: custErr } = await client
     .from('stripe_customers')
-    .select('id, name, email')
+    .select('id, name, email, address_country, address_city')
     .in('id', ids)
   if (custErr) throw new Error(`stripe_customers read: ${custErr.message}`)
 
-  const byId = new Map<string, { name: string | null; email: string | null }>()
+  interface CustomerMeta {
+    name: string | null
+    email: string | null
+    addressCountry: string | null
+    addressCity: string | null
+  }
+  const byId = new Map<string, CustomerMeta>()
   for (const c of custRows ?? []) {
     byId.set(c.id as string, {
       name: (c.name as string | null) ?? null,
       email: (c.email as string | null) ?? null,
+      addressCountry: (c.address_country as string | null) ?? null,
+      addressCity: (c.address_city as string | null) ?? null,
     })
   }
 
@@ -371,6 +383,8 @@ export async function fetchTopCustomers(
       customerId,
       name: meta?.name ?? null,
       email: meta?.email ?? null,
+      addressCountry: meta?.addressCountry ?? null,
+      addressCity: meta?.addressCity ?? null,
       amountCents,
     }
   })

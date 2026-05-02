@@ -235,10 +235,14 @@ export class ConnectionsService {
       })
       if (error) throw new Error(error.message)
 
-      // Fire-and-forget 90-day backfill. Multiple connections to the same
-      // account dedup via stripe_accounts (`backfillAccount` short-circuits
-      // when complete or in-progress).
-      this.stripeBackfillService.kickBackfill(accountRow.id)
+      // Fire-and-forget. First-time accounts get a full 90-day backfill;
+      // accounts already linked via another connection (same
+      // `stripe_account_id`) get a gap-fill from `last_synced_at` to now,
+      // so the dashboard reflects anything that's happened since the
+      // previous sync. The bare `kickBackfill` short-circuits in the
+      // already-complete case and was the source of the "I reconnected
+      // but my dashboard is still $0" bug.
+      this.stripeBackfillService.kickBackfillOnConnect(accountRow.id)
     } else if (type === 'calendly') {
       // Credentials are inserted directly by CalendlyService.handleOAuthCallback — no-op here
     } else if (type === 'vercel') {

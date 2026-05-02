@@ -20,14 +20,93 @@ import type {
 type Client = ReturnType<SupabaseService['getClient']>
 
 /**
- * Pull every charge in [createdGte, createdLt) for a Stripe account, resolve
- * line items, and persist. Used by both backfill (90 days) and reconcile
- * (last 48h). Idempotent — repeat runs over the same range produce the same
- * end state.
+ * Fetch + upsert any customers referenced by recent charges that aren't
+ * already in `stripe_customers`. The bulk `customers.list()` endpoint
+ * silently omits customers attached to deleted test clocks (and likely
+ * other lifecycle states), so charges can reference customer IDs that
+ * the wide-sweep pass misses. Direct retrieval works regardless.
  *
- * Pagination: 100 charges/page, `expand[]=data.invoice` to inline invoice
- * objects (avoids per-charge invoice round-trips). For charges with no
- * invoice, falls back to a Checkout Session lookup (one extra call).
+ * Idempotent. No-op when every referenced customer is already in DB
+ * (the typical steady-state case after the first run).
+ */
+async function fillMissingCustomers(
+  client: Client,
+  stripeAccountId: string,
+  get: StripeGetter,
+  ids: string[],
+  logger?: Logger,
+): Promise<number> {
+  if (ids.length === 0) return 0
+
+  const { data: existing, error } = await client
+    .from('stripe_customers')
+    .select('id')
+    .eq('stripe_account_id', stripeAccountId)
+    .in('id', ids)
+  if (error) {
+    logger?.warn(
+      `    ⚠ fillMissingCustomers existence check failed: ${error.message}`,
+    )
+    return 0
+  }
+  const present = new Set((existing ?? []).map(r => r.id as string))
+  const missing = ids.filter(id => !present.has(id))
+  if (missing.length === 0) return 0
+
+  logger?.log(
+    `    fillMissingCustomers  account=${stripeAccountId}  referenced=${ids.length}  missing=${missing.length}`,
+  )
+
+  // Per-id retrieve. We deliberately don't parallelise — the 1× per-charge
+  // overhead is bounded (typical accounts have far fewer customers than
+  // charges, and the typical steady-state case has `missing.length === 0`).
+  // Sequential keeps the Stripe rate-limit profile simple.
+  const fetched: StripeCustomerRow[] = []
+  for (const id of missing) {
+    try {
+      const c = (await get(`customers/${id}`)) as unknown as
+        StripeCustomerRow & { deleted?: boolean }
+      // Stripe returns `{ id, deleted: true }` for tombstoned customers —
+      // `upsertCustomers` already filters those by `c.deleted`, but skipping
+      // here too saves the round-trip of pushing them through the persist
+      // layer just to be filtered.
+      if (c.deleted) continue
+      fetched.push(c)
+    } catch (err) {
+      logger?.warn(
+        `    ⚠ customer fetch ${id} failed: ${String(err)}`,
+      )
+    }
+  }
+
+  await upsertCustomers(client, stripeAccountId, fetched)
+  return fetched.length
+}
+
+/**
+ * Pull every charge in [createdGte, createdLt) for a Stripe account, resolve
+ * line items, and persist. Used by backfill (90 days), reconcile (last 7d),
+ * reconnect gap-fills, and live-on-mount syncs. Idempotent — repeat runs
+ * over the same range produce the same end state.
+ *
+ * Pagination: 100 charges/page. **No `expand[]`** on the list call — we
+ * deliberately leave `charge.invoice` as a bare string ID and let
+ * `resolveChargeLineItems` round-trip per-charge to fetch the invoice
+ * with the proper `expand[]=lines.data.price`. This costs one extra
+ * Stripe call per invoiced charge but it's the only way to get prices
+ * as objects — `data.invoice.lines.data.price` is 5 levels deep,
+ * exceeding Stripe's 4-level expansion cap.
+ *
+ * History: an earlier optimization tried `expand[]=data.invoice` to
+ * inline the invoice and skip a round-trip. That left
+ * `lines.data[i].price` as a string ID (since deeper expansion isn't
+ * allowed), and `mapInvoiceLines` silently dropped every line. Visible
+ * symptom: MRR worked (subs table, no line-item join) but Gross Volume /
+ * Top Customers / Total Gross Revenue all read $0 (line-item-joined).
+ * Don't add the expansion back without a different shape for resolution.
+ *
+ * For charges with no invoice (raw PaymentIntents), falls back to a
+ * Checkout Session lookup (one extra call per such charge — rare).
  *
  * Returns the count of charges processed for logging.
  */
@@ -43,11 +122,18 @@ export async function syncCharges(
   let hasMore = true
   let startingAfter: string | undefined
 
+  // Collected as we walk the charges so that, after persisting them all,
+  // we can ensure every customer they reference has a row in
+  // `stripe_customers`. Stripe's bulk `customers.list` endpoint omits
+  // customers attached to deleted test clocks (and probably other states),
+  // so without this gap-fill, charges can reference customer IDs the
+  // top-customers tile can't resolve to a name. See `fillMissingCustomers`.
+  const referencedCustomerIds = new Set<string>()
+
   while (hasMore) {
     const params: Record<string, string> = {
       'created[gte]': String(createdGte),
       'created[lt]': String(createdLt),
-      'expand[]': 'data.invoice',
       limit: '100',
     }
     if (startingAfter) params['starting_after'] = startingAfter
@@ -58,12 +144,24 @@ export async function syncCharges(
     for (const charge of charges) {
       // Persist charge row first (FK target for line items).
       await upsertCharge(client, stripeAccountId, charge)
+      if (charge.customer) referencedCustomerIds.add(charge.customer)
 
       // Only succeeded charges contribute to revenue tiles, but we still
       // resolve line items for refunded charges (so future refund support
       // has the attribution it needs).
       const lineItems = await resolveChargeLineItems(get, charge, logger)
-      await replaceLineItems(client, charge.id, stripeAccountId, lineItems)
+      try {
+        await replaceLineItems(client, charge.id, stripeAccountId, lineItems)
+        logger?.log(
+          `    replaceLineItems  charge=${charge.id}  inserted=${lineItems.length}`,
+        )
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        logger?.error(
+          `    ✗ replaceLineItems FAILED  charge=${charge.id}  msg="${msg}"`,
+        )
+        throw err
+      }
 
       processed++
     }
@@ -73,6 +171,18 @@ export async function syncCharges(
       startingAfter = charges[charges.length - 1].id
     }
   }
+
+  // Fill in any customer rows the bulk customer sync would have missed.
+  // No-op when every referenced customer is already in DB (the steady-
+  // state case). The cost is bounded: 1 existence check + N retrieves
+  // where N == count of newly-referenced customers in this sync window.
+  await fillMissingCustomers(
+    client,
+    stripeAccountId,
+    get,
+    Array.from(referencedCustomerIds),
+    logger,
+  )
 
   return processed
 }

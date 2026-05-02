@@ -60,6 +60,11 @@ export async function upsertCustomers(
       stripe_account_id: stripeAccountId,
       name: c.name ?? null,
       email: c.email ?? null,
+      // `address` is null when the customer never provided one (no Checkout
+      // billing-address collection, no Customer Portal update). Default
+      // to NULL on both columns; the tile collapses missing segments.
+      address_country: c.address?.country ?? null,
+      address_city: c.address?.city ?? null,
       created: new Date(c.created * 1000).toISOString(),
     }))
 
@@ -213,6 +218,12 @@ export async function replaceLineItems(
  *   - terminal statuses (`'complete'` / `'error'`) clear it — the row is no
  *     longer "claimed" by an in-flight worker.
  *   - `'pending'` also clears it (used by retry).
+ *
+ * Does NOT bump `last_synced_at` — that's owned exclusively by
+ * `ensureSyncedThrough`, which only advances it on a *fully* successful
+ * sync. Bumping it here would clobber that contract: reaching status
+ * 'complete' tells you the lifecycle finished, but the timestamp comes
+ * from the data sync.
  */
 export async function setBackfillStatus(
   client: Client,
@@ -227,7 +238,6 @@ export async function setBackfillStatus(
   }
   if (status === 'complete') {
     update.backfill_error = null
-    update.last_synced_at = new Date().toISOString()
     update.backfill_started_at = null
   }
   if (status === 'pending') {

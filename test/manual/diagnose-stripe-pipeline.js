@@ -74,6 +74,19 @@ async function step1_stripeHasData() {
     const newest = new Date(charges.data[0].created * 1000).toISOString()
     const oldest = new Date(charges.data[charges.data.length - 1].created * 1000).toISOString()
     console.log(`  Charge timestamp range: ${oldest}  →  ${newest}`)
+
+    // Critical: do these charges have an `invoice` field at all? When the
+    // backend sync sees `charge.invoice=null` it skips line-item resolution,
+    // so dashboards filtered by tracked_product_ids show $0.
+    const sample = charges.data[0]
+    const invoiceField = sample.invoice
+    console.log(`  Sample charge: ${sample.id}`)
+    console.log(`    invoice          : ${JSON.stringify(invoiceField)}`)
+    console.log(`    payment_intent   : ${sample.payment_intent}`)
+    console.log(`    description      : ${sample.description ?? '<none>'}`)
+    const withInvoice = charges.data.filter(c => c.invoice).length
+    console.log(`    charges (sample of ${charges.data.length}) WITH invoice: ${withInvoice}`)
+    console.log(`    charges (sample of ${charges.data.length}) WITHOUT invoice: ${charges.data.length - withInvoice}`)
   } else {
     console.log('  ⚠ No charges in Stripe — seeding never ran or hit a different account.')
   }
@@ -230,6 +243,125 @@ async function step6_allStripeShapedViews() {
   }
 }
 
+async function step7_lineItemsBreakdown() {
+  divider('7. stripe_line_items breakdown (the new diagnosis)')
+
+  // 7a — total rows for the target account
+  const total = await safeCount('stripe_line_items', q =>
+    q.eq('stripe_account_id', STRIPE_ACCT),
+  )
+  console.log(`  total line_items for account: ${total}`)
+  if (typeof total === 'number' && total === 0) {
+    console.log('  ⚠ ZERO line items. This is the smoking gun for the')
+    console.log('    Gross Volume / Top Customers / Total Gross Revenue tiles.')
+    console.log('    With a product filter active, those tiles join through')
+    console.log('    stripe_line_items — so 0 rows means $0 across the board.')
+  }
+
+  // 7b — charge-level coverage: how many charges have line items, how many don't
+  const { data: charges } = await supabase
+    .from('stripe_charges')
+    .select('id, amount, currency, status, customer_id, invoice_id, created')
+    .eq('stripe_account_id', STRIPE_ACCT)
+    .order('created', { ascending: false })
+    .limit(40)
+
+  if (!charges || charges.length === 0) {
+    console.log('  no charges in DB to analyse')
+    return
+  }
+
+  const ids = charges.map(c => c.id)
+  const { data: liRows } = await supabase
+    .from('stripe_line_items')
+    .select('charge_id, product_id, amount')
+    .in('charge_id', ids)
+
+  const liByCharge = new Map()
+  for (const li of liRows ?? []) {
+    const arr = liByCharge.get(li.charge_id) ?? []
+    arr.push(li)
+    liByCharge.set(li.charge_id, arr)
+  }
+
+  let withLines = 0
+  let withoutLines = 0
+  for (const c of charges) {
+    const lis = liByCharge.get(c.id) ?? []
+    if (lis.length > 0) withLines++
+    else withoutLines++
+  }
+  console.log(`  charges with line items   : ${withLines}/${charges.length}`)
+  console.log(`  charges WITHOUT line items: ${withoutLines}/${charges.length}`)
+
+  // 7c — product distribution across all line items
+  const productAgg = new Map()
+  for (const li of liRows ?? []) {
+    const cur = productAgg.get(li.product_id) ?? { count: 0, total: 0 }
+    cur.count++
+    cur.total += Number(li.amount)
+    productAgg.set(li.product_id, cur)
+  }
+  if (productAgg.size > 0) {
+    console.log('  by product_id:')
+    for (const [pid, { count, total }] of productAgg.entries()) {
+      console.log(`    ${pid}  count=${count}  total=${(total / 100).toFixed(2)}`)
+    }
+  }
+
+  // 7d — sample 5 charges with their line item rows side by side
+  console.log('  sample charges (5 most recent):')
+  for (const c of charges.slice(0, 5)) {
+    const lis = liByCharge.get(c.id) ?? []
+    const amt = (c.amount / 100).toFixed(2)
+    console.log(
+      `    ${c.created}  ${amt} ${c.currency.toUpperCase()}  ${c.id}  inv=${c.invoice_id ?? '-'}  cust=${c.customer_id ?? '-'}`,
+    )
+    if (lis.length === 0) {
+      console.log('      → NO line items in DB')
+    } else {
+      for (const li of lis) {
+        console.log(
+          `      • product=${li.product_id}  amount=${(li.amount / 100).toFixed(2)}`,
+        )
+      }
+    }
+  }
+
+  // 7e — cross-check tracked_product_ids against actual line-item products
+  const { data: stripeConns } = await supabase
+    .from('connections')
+    .select('id, name, type')
+    .in('type', ['stripe', 'stripe_manual'])
+    .order('created_at', { ascending: false })
+  for (const conn of stripeConns ?? []) {
+    const credTable =
+      conn.type === 'stripe' ? 'connections_stripe' : 'connections_stripe_manual'
+    const { data: cred } = await supabase
+      .from(credTable)
+      .select('stripe_account_id, tracked_product_ids')
+      .eq('connection_id', conn.id)
+      .maybeSingle()
+    if (!cred || cred.stripe_account_id !== STRIPE_ACCT) continue
+    const tracked = cred.tracked_product_ids ?? []
+    const observed = Array.from(productAgg.keys())
+    const missing = tracked.filter(t => !observed.includes(t))
+    const orphaned = observed.filter(o => !tracked.includes(o))
+    console.log(`  conn ${conn.id} (${conn.name}):`)
+    console.log(`    tracked_product_ids: ${JSON.stringify(tracked)}`)
+    if (tracked.length === 0) {
+      console.log('    → empty filter (tracks ALL products)')
+    } else {
+      console.log(`    tracked but no line items observed: ${JSON.stringify(missing)}`)
+      console.log(`    line items observed but NOT tracked: ${JSON.stringify(orphaned)}`)
+      if (missing.length === tracked.length && tracked.length > 0) {
+        console.log('    ⚠ NONE of the tracked products have line items in DB —')
+        console.log('      explains why this connection sees $0.')
+      }
+    }
+  }
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -239,6 +371,7 @@ async function main() {
   await step4_recentCharges()
   await step5_connectionsAndViews()
   await step6_allStripeShapedViews()
+  await step7_lineItemsBreakdown()
   console.log('')
 }
 

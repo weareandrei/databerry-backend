@@ -126,9 +126,11 @@ export class StripeOAuthService {
     }
 
     // Credentials are now in place — safe to kick the fire-and-forget backfill.
-    // If the account was already backfilled by a previous connection, this
-    // no-ops via the `backfill_status='complete'` short-circuit.
-    this.backfillService.kickBackfill(accountRow.id)
+    // For first-time accounts this runs the full 90-day backfill; for
+    // accounts already linked via another connection (same `stripe_account_id`)
+    // it gap-fills from `last_synced_at` to now so the user immediately
+    // sees anything that's happened since the last sync.
+    this.backfillService.kickBackfillOnConnect(accountRow.id)
 
     this.logger.log(`  ✓ Stripe connection created\n  connection_id : ${connection.id}`)
     return { connectionId: connection.id }
