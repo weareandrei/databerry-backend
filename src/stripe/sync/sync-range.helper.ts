@@ -150,17 +150,41 @@ export async function syncCharges(
       // resolve line items for refunded charges (so future refund support
       // has the attribution it needs).
       const lineItems = await resolveChargeLineItems(get, charge, logger)
-      try {
-        await replaceLineItems(client, charge.id, stripeAccountId, lineItems)
-        logger?.log(
-          `    replaceLineItems  charge=${charge.id}  inserted=${lineItems.length}`,
+
+      // Critical defence against "reconcile silently wipes everything".
+      // `replaceLineItems` is DELETE-then-INSERT; if the resolver came up
+      // empty (because the resolver code is stale, or invoice_payments
+      // hit a transient error, or any number of reasons we may not yet
+      // know), we'd nuke the existing rows and replace them with nothing.
+      // That's how the team woke up to an empty `stripe_line_items` table
+      // after a deploy lag: an old version of this code returned `[]` for
+      // every charge, and the nightly reconcile dutifully deleted-then-
+      // inserted-nothing for all of them.
+      //
+      // Rule: only call `replaceLineItems` when we actually resolved
+      // something to replace WITH. Empty results are treated as "couldn't
+      // resolve, leave existing alone". The trade-off — if a charge's
+      // invoice legitimately loses all its line items in Stripe, our DB
+      // keeps stale rows — is overwhelmingly preferable to wiping data.
+      // A separate manual `repair-line-items.js` exists for the rare
+      // genuine-empty case.
+      if (lineItems.length > 0) {
+        try {
+          await replaceLineItems(client, charge.id, stripeAccountId, lineItems)
+          logger?.log(
+            `    replaceLineItems  charge=${charge.id}  inserted=${lineItems.length}`,
+          )
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          logger?.error(
+            `    ✗ replaceLineItems FAILED  charge=${charge.id}  msg="${msg}"`,
+          )
+          throw err
+        }
+      } else {
+        logger?.warn(
+          `    replaceLineItems SKIP  charge=${charge.id}  resolver returned 0 — existing rows preserved`,
         )
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        logger?.error(
-          `    ✗ replaceLineItems FAILED  charge=${charge.id}  msg="${msg}"`,
-        )
-        throw err
       }
 
       processed++
