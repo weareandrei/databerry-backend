@@ -8,5 +8,9 @@ import { ViewsModule } from '../views/views.module'
   imports: [SupabaseModule, ViewsModule],
   controllers: [ProjectsController],
   providers: [ProjectsService],
+  // Exported so other modules (e.g. ChatModule's tool layer) can
+  // call `getProjects(userId)` directly instead of round-tripping
+  // through the HTTP controller.
+  exports: [ProjectsService],
 })
 export class ProjectsModule {}

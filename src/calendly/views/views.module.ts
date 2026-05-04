@@ -8,5 +8,8 @@ import { ViewsModule } from '../../views/views.module'
   imports: [CalendlyConnectionModule, ViewsModule],
   controllers: [CalendlyViewsController],
   providers: [CalendlyViewsService],
+  // Exported so ChatModule's tool handlers can fetch the meetings
+  // list in-process.
+  exports: [CalendlyViewsService],
 })
 export class CalendlyViewsModule {}

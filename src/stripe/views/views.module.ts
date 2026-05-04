@@ -8,5 +8,8 @@ import { ViewsModule } from '../../views/views.module'
   imports: [SupabaseModule, ViewsModule],
   controllers: [StripeViewsController],
   providers: [StripeViewsService],
+  // Exported so ChatModule's tool handlers can fetch live values /
+  // chart data / top customers in-process (no HTTP round-trip).
+  exports: [StripeViewsService],
 })
 export class StripeViewsModule {}

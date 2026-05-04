@@ -8,5 +8,9 @@ import { StripeSyncModule } from '../stripe/sync/sync.module'
   imports: [PosthogModule, StripeSyncModule],
   controllers: [ConnectionsController],
   providers: [ConnectionsService],
+  // Exported so ChatModule's tool layer can list a user's
+  // connections in-process. Same per-user scoping as the controller
+  // — `getConnections(userId)` filters by user.
+  exports: [ConnectionsService],
 })
 export class ConnectionsModule {}

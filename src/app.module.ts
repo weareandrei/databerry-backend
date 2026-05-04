@@ -15,6 +15,7 @@ import { SchedulerModule } from './scheduler/scheduler.module'
 import { UserSettingsModule } from './user-settings/user-settings.module'
 import { ProjectSettingsModule } from './project-settings/project-settings.module'
 import { ProjectOverviewModule } from './project-overview/project-overview.module'
+import { ChatModule } from './chat/chat.module'
 
 @Module({
   imports: [
@@ -34,6 +35,7 @@ import { ProjectOverviewModule } from './project-overview/project-overview.modul
     UserSettingsModule,
     ProjectSettingsModule,
     ProjectOverviewModule,
+    ChatModule,
   ],
 })
 export class AppModule {}
