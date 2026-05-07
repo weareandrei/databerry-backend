@@ -78,7 +78,11 @@ async function migrate() {
     // Pull every row + the parent `connections.user_id` so we know
     // which key to derive. `inner` join — orphaned rows would
     // already be unusable, so skipping them is the right move.
-    const selectCols = ['id', 'connection_id', ...columns, 'connections!inner(user_id)'].join(', ')
+    // Key off `connection_id` (always present, FK to `connections`)
+    // rather than `id` — `connections_vercel` doesn't have an `id`
+    // column, and using `connection_id` is consistent across every
+    // credential table anyway.
+    const selectCols = ['connection_id', ...columns, 'connections!inner(user_id)'].join(', ')
     const { data, error } = await client
       .from(table)
       .select(selectCols)
@@ -97,8 +101,9 @@ async function migrate() {
       totalRows++
       const conn = row.connections
       const userId = (Array.isArray(conn) ? conn[0] : conn) as { user_id?: string } | undefined
+      const connectionId = row.connection_id as string
       if (!userId?.user_id) {
-        console.warn(`  ⚠ skipped row id=${row.id as string} — missing parent user_id`)
+        console.warn(`  ⚠ skipped connection_id=${connectionId} — missing parent user_id`)
         totalSkipped++
         continue
       }
@@ -119,13 +124,13 @@ async function migrate() {
           const encrypted = encryptForUser(raw, uid)
           const roundTrip = decryptForUser(encrypted, uid)
           if (roundTrip !== raw) {
-            console.error(`  ✗ row id=${row.id as string} col=${col}: round-trip mismatch`)
+            console.error(`  ✗ connection_id=${connectionId} col=${col}: round-trip mismatch`)
             totalFailed++
             continue
           }
           updates[col] = encrypted
         } catch (err) {
-          console.error(`  ✗ row id=${row.id as string} col=${col}: ${(err as Error).message}`)
+          console.error(`  ✗ connection_id=${connectionId} col=${col}: ${(err as Error).message}`)
           totalFailed++
           continue
         }
@@ -139,17 +144,19 @@ async function migrate() {
       const { error: updateErr } = await client
         .from(table)
         .update(updates)
-        .eq('id', row.id as string)
+        .eq('connection_id', connectionId)
 
       if (updateErr) {
-        console.error(`  ✗ update failed for row id=${row.id as string}: ${updateErr.message}`)
+        console.error(
+          `  ✗ update failed for connection_id=${connectionId}: ${updateErr.message}`,
+        )
         totalFailed++
         continue
       }
 
       totalEncrypted++
       console.log(
-        `  ✓ row id=${row.id as string} encrypted ${Object.keys(updates).length} col(s)`,
+        `  ✓ connection_id=${connectionId} encrypted ${Object.keys(updates).length} col(s)`,
       )
     }
   }

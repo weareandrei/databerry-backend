@@ -45,7 +45,7 @@ const TABLES: { table: string; columns: string[] }[] = [
 
 interface Offender {
   table: string
-  rowId: string
+  connectionId: string
   column: string
   preview: string
 }
@@ -54,16 +54,22 @@ async function verify(): Promise<Offender[]> {
   const offenders: Offender[] = []
 
   for (const { table, columns } of TABLES) {
-    const selectCols = ['id', ...columns].join(', ')
+    // Key off `connection_id` — always present, consistent across all
+    // credential tables. `connections_vercel` doesn't have an `id`
+    // column at all.
+    const selectCols = ['connection_id', ...columns].join(', ')
     const { data, error } = await client
       .from(table)
       .select(selectCols)
 
     if (error) {
       console.error(`✗ failed to list rows for ${table}: ${error.message}`)
-      // Treat as a verification failure — caller's `process.exit(2)`
-      // will run.
-      offenders.push({ table, rowId: '<query failed>', column: '*', preview: error.message })
+      offenders.push({
+        table,
+        connectionId: '<query failed>',
+        column: '*',
+        preview: error.message,
+      })
       continue
     }
     if (!data) continue
@@ -76,7 +82,7 @@ async function verify(): Promise<Offender[]> {
         if (!isEncrypted(raw)) {
           offenders.push({
             table,
-            rowId: row.id as string,
+            connectionId: row.connection_id as string,
             column: col,
             // Don't print the actual plaintext credential — just
             // enough to recognise it. First 4 chars + "…".
@@ -98,7 +104,9 @@ verify()
     }
     console.error(`\n✗ Found ${offenders.length} plaintext column(s):`)
     for (const o of offenders) {
-      console.error(`  • ${o.table}.id=${o.rowId}  column=${o.column}  preview="${o.preview}"`)
+      console.error(
+        `  • ${o.table}  connection_id=${o.connectionId}  column=${o.column}  preview="${o.preview}"`,
+      )
     }
     console.error(
       '\nRun `encrypt-existing-credentials.ts` to migrate them, then re-run this verifier.',
