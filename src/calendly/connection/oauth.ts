@@ -31,7 +31,12 @@ export class CalendlyOAuthService {
       .from('calendly_oauth_state')
       .insert({ state, user_id: userId, code_verifier: codeVerifier })
 
-    if (error) throw new Error('Failed to store OAuth state: ' + error.message)
+    if (error) {
+      this.logger.error(
+        `Failed to store Calendly OAuth state for user ${userId}: ${error.message}`,
+      )
+      throw new Error('Failed to store OAuth state: ' + error.message)
+    }
 
     const url = new URL(`${this.authBase}/oauth/authorize`)
     url.searchParams.set('response_type', 'code')
@@ -47,6 +52,13 @@ export class CalendlyOAuthService {
   async handleOAuthCallback(code: string, state: string): Promise<string> {
     const client = this.supabaseService.getClient()
 
+    // Tiny helper so each failure path stays a one-liner, and the
+    // wire shape (`?calendly=error&reason=<code>`) is impossible to
+    // get wrong by hand. Reason codes match
+    // `OAuthFailureReason` from `stripe/connection/oauth.ts`.
+    const errorRedirect = (reason: string) =>
+      `${this.frontendUrl}/hub/connections?calendly=error&reason=${reason}`
+
     const { data: stateRow } = await client
       .from('calendly_oauth_state')
       .select('*')
@@ -54,7 +66,8 @@ export class CalendlyOAuthService {
       .maybeSingle()
 
     if (!stateRow) {
-      return `${this.frontendUrl}/hub/connections?calendly=error`
+      this.logger.warn(`Calendly OAuth state not found (state=${state})`)
+      return errorRedirect('state_invalid')
     }
 
     const userId = stateRow.user_id as string
@@ -76,8 +89,8 @@ export class CalendlyOAuthService {
 
       if (!tokenRes.ok) {
         const body = await tokenRes.json().catch(() => ({}))
-        this.logger.error('Token exchange failed', body)
-        return `${this.frontendUrl}/hub/connections?calendly=error`
+        this.logger.error('Calendly token exchange failed', body)
+        return errorRedirect('token_exchange')
       }
 
       const tokens = (await tokenRes.json()) as {
@@ -92,7 +105,13 @@ export class CalendlyOAuthService {
         headers: { Authorization: `Bearer ${tokens.access_token}` },
       })
 
-      if (!meRes.ok) throw new Error('Failed to fetch Calendly user info')
+      if (!meRes.ok) {
+        const detail = await meRes.text().catch(() => '')
+        this.logger.error(
+          `Calendly /users/me failed (${meRes.status}): ${detail.slice(0, 200)}`,
+        )
+        return errorRedirect('account_resolve')
+      }
       const me = (await meRes.json()) as {
         resource: { uri: string; current_organization: string }
       }
@@ -103,7 +122,12 @@ export class CalendlyOAuthService {
         .select()
         .single()
 
-      if (connErr) throw new Error('Failed to create connection: ' + connErr.message)
+      if (connErr) {
+        this.logger.error(
+          `Calendly: failed to create connection row for user ${userId}: ${connErr.message}`,
+        )
+        return errorRedirect('credentials_save')
+      }
 
       const { error: credErr } = await client.from('connections_calendly').insert({
         connection_id: conn.id,
@@ -114,7 +138,15 @@ export class CalendlyOAuthService {
         organization_uri: me.resource.current_organization,
       })
 
-      if (credErr) throw new Error('Failed to store credentials: ' + credErr.message)
+      if (credErr) {
+        this.logger.error(
+          `Calendly: failed to insert credentials for connection ${conn.id}: ${credErr.message}`,
+        )
+        // Roll back the parent row so we don't leave an orphan
+        // `connections` record with no creds.
+        await client.from('connections').delete().eq('id', conn.id)
+        return errorRedirect('credentials_save')
+      }
 
       this.logger.log(`Calendly connected for user ${userId}`)
       return `${this.frontendUrl}/hub/connections?calendly=connected`

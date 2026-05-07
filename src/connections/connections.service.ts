@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common'
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common'
 import { createHash, randomBytes } from 'crypto'
 import { SupabaseService } from '../supabase/supabase.service'
 import { PosthogCredentialsService } from '../posthog/connection/credentials'
@@ -23,6 +28,15 @@ export interface UpdateConnectionProjectDto {
 
 @Injectable()
 export class ConnectionsService {
+  // Every Supabase failure path used to throw a raw `new Error(error.message)`
+  // with no log line, so when a connection-create silently 500'd in
+  // production the only artifact was an opaque message in the
+  // frontend toast. Adding a `Logger.warn` immediately before each
+  // throw gives us a server-side audit trail (operation name + user
+  // + raw Supabase error) while still surfacing a sanitized message
+  // to the client.
+  private readonly logger = new Logger(ConnectionsService.name)
+
   constructor(
     private readonly supabaseService: SupabaseService,
     private readonly posthogCredentialsService: PosthogCredentialsService,
@@ -37,7 +51,10 @@ export class ConnectionsService {
       .eq('user_id', userId)
       .order('created_at', { ascending: true })
 
-    if (error) throw new Error(error.message)
+    if (error) {
+      this.logger.warn(`getConnections failed for user ${userId}: ${error.message}`)
+      throw new Error(error.message)
+    }
     return data.map(this.toCamel)
   }
 
@@ -70,7 +87,12 @@ export class ConnectionsService {
       .select()
       .single()
 
-    if (error) throw new Error(error.message)
+    if (error) {
+      this.logger.warn(
+        `createConnection: base insert failed (type=${dto.type}, user=${userId}): ${error.message}`,
+      )
+      throw new Error(error.message)
+    }
 
     // 2. Insert type-specific config table
     if (dto.config || dto.type === 'webhook') {
@@ -124,7 +146,12 @@ export class ConnectionsService {
       .eq('id', connectionId)
       .eq('user_id', userId)
 
-    if (error) throw new Error(error.message)
+    if (error) {
+      this.logger.warn(
+        `deleteConnection failed (id=${connectionId}, user=${userId}): ${error.message}`,
+      )
+      throw new Error(error.message)
+    }
   }
 
   async getPosthogEventDefinitions(connectionId: string, userId: string) {
@@ -146,7 +173,12 @@ export class ConnectionsService {
       .select()
       .single()
 
-    if (error) throw new Error(error.message)
+    if (error) {
+      this.logger.warn(
+        `createWebhookKey insert failed (connection=${connectionId}): ${error.message}`,
+      )
+      throw new Error(error.message)
+    }
 
     return {
       id: data.id,
@@ -167,7 +199,12 @@ export class ConnectionsService {
       .eq('connection_id', connectionId)
       .order('created_at', { ascending: true })
 
-    if (error) throw new Error(error.message)
+    if (error) {
+      this.logger.warn(
+        `getWebhookKeys failed (connection=${connectionId}): ${error.message}`,
+      )
+      throw new Error(error.message)
+    }
     return data.map(row => ({
       id: row.id,
       name: row.name,
@@ -187,7 +224,12 @@ export class ConnectionsService {
       .eq('id', keyId)
       .eq('connection_id', connectionId)
 
-    if (error) throw new Error(error.message)
+    if (error) {
+      this.logger.warn(
+        `revokeWebhookKey failed (connection=${connectionId}, key=${keyId}): ${error.message}`,
+      )
+      throw new Error(error.message)
+    }
   }
 
   private async insertTypeConfig(
@@ -203,12 +245,22 @@ export class ConnectionsService {
         project_id: config.projectId,
         host: config.host ?? 'https://app.posthog.com',
       })
-      if (error) throw new Error(error.message)
+      if (error) {
+        this.logger.warn(
+          `insertTypeConfig (posthog) failed (connection=${connectionId}): ${error.message}`,
+        )
+        throw new Error(error.message)
+      }
     } else if (type === 'webhook') {
       const { error } = await client.from('connections_webhook').insert({
         connection_id: connectionId,
       })
-      if (error) throw new Error(error.message)
+      if (error) {
+        this.logger.warn(
+          `insertTypeConfig (webhook) failed (connection=${connectionId}): ${error.message}`,
+        )
+        throw new Error(error.message)
+      }
     } else if (type === 'stripe_manual') {
       // Resolve the Stripe account ID first so the row links to stripe_accounts
       // immediately. This also validates the API key (a bad key surfaces here
@@ -218,7 +270,61 @@ export class ConnectionsService {
         throw new BadRequestException('Stripe API key is required to create this connection.')
       }
 
-      const accountRow = await this.stripeBackfillService.resolveAccountFromApiKey(apiKey)
+      // Pre-flight prefix check — catches the most common copy-paste
+      // mistake (publishable key in the secret-key field) BEFORE we
+      // hit Stripe. The /v1/account call below would catch it too,
+      // but with a less actionable message; this short-circuit names
+      // the exact gotcha. Valid prefixes per Stripe docs: `sk_*` for
+      // standard secret keys, `rk_*` for restricted keys.
+      const trimmed = apiKey.trim()
+      if (trimmed.startsWith('pk_')) {
+        this.logger.warn(
+          `Stripe Manual connection rejected: publishable key prefix (pk_) detected`,
+        )
+        throw new BadRequestException(
+          "That looks like a Publishable key (starts with `pk_`). Stripe needs a Secret key " +
+            'for read access — either a Restricted key (`rk_*`, recommended) or a standard ' +
+            'Secret key (`sk_*`). Get one from dashboard.stripe.com → Developers → API keys.',
+        )
+      }
+      if (trimmed.startsWith('whsec_')) {
+        this.logger.warn(
+          `Stripe Manual connection rejected: webhook secret prefix (whsec_) detected`,
+        )
+        throw new BadRequestException(
+          "That looks like a webhook signing secret (starts with `whsec_`). We need a " +
+            'Restricted key (`rk_*`) or Secret key (`sk_*`) instead. Create one in ' +
+            'dashboard.stripe.com → Developers → API keys.',
+        )
+      }
+      if (!trimmed.startsWith('sk_') && !trimmed.startsWith('rk_')) {
+        this.logger.warn(
+          `Stripe Manual connection rejected: unrecognised key prefix`,
+        )
+        throw new BadRequestException(
+          "This doesn't look like a Stripe Secret or Restricted key. Valid keys start with " +
+            '`sk_` or `rk_`. Create one at dashboard.stripe.com → Developers → API keys.',
+        )
+      }
+
+      // Now hand off to /v1/account. If the key is structurally
+      // valid but rejected (rotated, deleted, scoped wrong), the
+      // getter throws `UnauthorizedException` with Stripe's own
+      // error message — also user-readable.
+      let accountRow
+      try {
+        accountRow = await this.stripeBackfillService.resolveAccountFromApiKey(apiKey)
+      } catch (err) {
+        // Surface a tighter framing than Stripe's raw "Invalid API Key
+        // provided" — most users hitting this case rotated a key and
+        // pasted the old one.
+        const message =
+          err instanceof Error && err.message
+            ? `Stripe didn't accept this key: ${err.message}. Double-check it's the most recent version (rotating a key invalidates the old one).`
+            : "Stripe didn't accept this key. Double-check it's correct and try again."
+        this.logger.warn(`Stripe Manual /v1/account failed: ${String(err)}`)
+        throw new BadRequestException(message)
+      }
 
       // ORDER MATTERS. The credential row FKs into `stripe_accounts.id`,
       // so the parent row must exist first — otherwise the insert below
@@ -233,7 +339,12 @@ export class ConnectionsService {
         api_key: apiKey,
         stripe_account_id: accountRow.id,
       })
-      if (error) throw new Error(error.message)
+      if (error) {
+        this.logger.warn(
+          `insertTypeConfig (stripe_manual) failed (connection=${connectionId}, stripe_account=${accountRow.id}): ${error.message}`,
+        )
+        throw new Error(error.message)
+      }
 
       // Fire-and-forget. First-time accounts get a full 90-day backfill;
       // accounts already linked via another connection (same
@@ -252,7 +363,12 @@ export class ConnectionsService {
         project_id: config.projectId,
         project_name: config.projectName,
       })
-      if (error) throw new Error(error.message)
+      if (error) {
+        this.logger.warn(
+          `insertTypeConfig (vercel) failed (connection=${connectionId}): ${error.message}`,
+        )
+        throw new Error(error.message)
+      }
     }
   }
 

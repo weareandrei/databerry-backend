@@ -49,13 +49,26 @@ export class GoogleAnalyticsOAuthService {
   async handleOAuthCallback(code: string, state: string, redirectUri: string): Promise<string> {
     const client = this.supabaseService.getClient()
 
+    // Tiny helper so each failure path stays a one-liner. Reason
+    // codes match `OAuthFailureReason` from
+    // `stripe/connection/oauth.ts`. Note we keep the existing
+    // `no-properties` and `select-property` flows untouched — those
+    // are *successful* terminal states (not errors), they just need
+    // the user to do one more thing on our side. Only the error
+    // paths grow `&reason=…`.
+    const errorRedirect = (reason: string) =>
+      `${this.frontendUrl}/hub/connections?google_analytics=error&reason=${reason}`
+
     const { data: stateRow } = await client
       .from('google_analytics_oauth_state')
       .select('*')
       .eq('state', state)
       .maybeSingle()
 
-    if (!stateRow) return `${this.frontendUrl}/hub/connections?google_analytics=error`
+    if (!stateRow) {
+      this.logger.warn(`GA OAuth state not found (state=${state})`)
+      return errorRedirect('state_invalid')
+    }
 
     const userId = stateRow.user_id as string
 
@@ -73,7 +86,7 @@ export class GoogleAnalyticsOAuthService {
       })
       if (!tokenRes.ok) {
         this.logger.error('GA token exchange failed', await tokenRes.text())
-        return `${this.frontendUrl}/hub/connections?google_analytics=error`
+        return errorRedirect('token_exchange')
       }
 
       const tokens = (await tokenRes.json()) as {
@@ -83,7 +96,16 @@ export class GoogleAnalyticsOAuthService {
       }
 
       const tokenExpiry = new Date(Date.now() + tokens.expires_in * 1000).toISOString()
-      const properties = await this.listPropertiesWithToken(tokens.access_token)
+
+      let properties: GAProperty[]
+      try {
+        properties = await this.listPropertiesWithToken(tokens.access_token)
+      } catch (err) {
+        this.logger.error(
+          `GA listProperties failed for user ${userId}: ${String(err)}`,
+        )
+        return errorRedirect('account_resolve')
+      }
 
       const { data: conn, error: connErr } = await client
         .from('connections')
@@ -91,11 +113,16 @@ export class GoogleAnalyticsOAuthService {
         .select()
         .single()
 
-      if (connErr) throw new Error('Failed to create connection: ' + connErr.message)
+      if (connErr) {
+        this.logger.error(
+          `GA: failed to create connection row for user ${userId}: ${connErr.message}`,
+        )
+        return errorRedirect('credentials_save')
+      }
 
       const firstProperty = properties.length === 1 ? properties[0] : null
 
-      await client.from('connections_google_analytics').insert({
+      const { error: credErr } = await client.from('connections_google_analytics').insert({
         connection_id: conn.id,
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
@@ -103,6 +130,15 @@ export class GoogleAnalyticsOAuthService {
         property_id: firstProperty?.id ?? null,
         property_name: firstProperty?.displayName ?? null,
       })
+
+      if (credErr) {
+        this.logger.error(
+          `GA: failed to insert credentials for connection ${conn.id}: ${credErr.message}`,
+        )
+        // Roll back the parent row so we don't leave an orphan.
+        await client.from('connections').delete().eq('id', conn.id)
+        return errorRedirect('credentials_save')
+      }
 
       this.logger.log(`GA connected for user ${userId}, propertyId=${firstProperty?.id ?? 'none yet'}`)
 

@@ -1,11 +1,13 @@
-import { Controller, Get, Query, Req, Res, UseGuards } from '@nestjs/common'
+import { Controller, Get, Logger, Query, Req, Res, UseGuards } from '@nestjs/common'
 import type { Response } from 'express'
 import { SupabaseAuthGuard } from '../../auth/supabase-auth.guard'
-import { StripeOAuthService } from './oauth'
+import { OAuthCallbackError, StripeOAuthService } from './oauth'
 import { getPrimaryFrontendUrl } from '../../common/frontend-url'
 
 @Controller('stripe')
 export class StripeConnectionController {
+  private readonly logger = new Logger(StripeConnectionController.name)
+
   constructor(private readonly stripeOAuthService: StripeOAuthService) {}
 
   /** Protected — frontend calls this to get the Stripe Connect OAuth URL. */
@@ -25,8 +27,16 @@ export class StripeConnectionController {
   ) {
     const frontendUrl = getPrimaryFrontendUrl()
 
+    // Stripe sets `?error=access_denied` when the user clicks "Cancel"
+    // on the consent screen — distinguish that from server-side
+    // failures so the frontend can show "you cancelled" rather than
+    // "something broke".
     if (oauthError) {
-      return res.redirect(`${frontendUrl}/hub/connections?stripe=error&reason=${oauthError}`)
+      const reason = oauthError === 'access_denied' ? 'cancelled' : 'token_exchange'
+      this.logger.warn(`Stripe OAuth callback received error=${oauthError}`)
+      return res.redirect(
+        `${frontendUrl}/hub/connections?stripe=error&reason=${reason}`,
+      )
     }
 
     try {
@@ -36,8 +46,21 @@ export class StripeConnectionController {
       return res.redirect(
         `${frontendUrl}/hub/connections?stripe=select-products&connectionId=${connectionId}`,
       )
-    } catch {
-      return res.redirect(`${frontendUrl}/hub/connections?stripe=error`)
+    } catch (err) {
+      // `OAuthCallbackError` carries a structured reason code. Anything
+      // else is unclassified — fall back to `unknown`. Either way the
+      // service has already logged the actual cause; this redirect is
+      // just for the user-facing message.
+      const reason: string =
+        err instanceof OAuthCallbackError ? err.reason : 'unknown'
+      this.logger.warn(
+        `Stripe OAuth callback failed with reason=${reason}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      )
+      return res.redirect(
+        `${frontendUrl}/hub/connections?stripe=error&reason=${reason}`,
+      )
     }
   }
 }

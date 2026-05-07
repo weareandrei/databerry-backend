@@ -8,6 +8,32 @@ import { SupabaseService } from '../../supabase/supabase.service'
 import { StripeBackfillService } from '../sync/backfill.service'
 import { makeStripeGetter } from '../views/stripe-api.helpers'
 
+/**
+ * Reason codes shared with the frontend `useOAuthCallback` hook —
+ * see `frontend/hooks/useOAuthCallback.ts`'s REASONS map. The
+ * controller catches an `OAuthCallbackError` and forwards the code
+ * via `?stripe=error&reason=<code>` so the frontend can show a
+ * tailored message. Same enum used for Calendly / Google Analytics
+ * to keep the message map per-provider but the wire codes uniform.
+ */
+export type OAuthFailureReason =
+  | 'cancelled'
+  | 'state_invalid'
+  | 'token_exchange'
+  | 'account_resolve'
+  | 'credentials_save'
+  | 'unknown'
+
+export class OAuthCallbackError extends Error {
+  constructor(
+    public readonly reason: OAuthFailureReason,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'OAuthCallbackError'
+  }
+}
+
 @Injectable()
 export class StripeOAuthService {
   private readonly logger = new Logger(StripeOAuthService.name)
@@ -43,7 +69,8 @@ export class StripeOAuthService {
     try {
       userId = Buffer.from(state, 'base64').toString('utf8')
     } catch {
-      throw new BadRequestException('Invalid state parameter')
+      this.logger.warn(`Stripe OAuth state decode failed (state=${state})`)
+      throw new OAuthCallbackError('state_invalid', 'Invalid state parameter')
     }
 
     this.logger.log(`\n  ► handleOAuthCallback\n  userId : ${userId}`)
@@ -65,7 +92,7 @@ export class StripeOAuthService {
 
     if (!tokenRes.ok || tokenData.error) {
       this.logger.error(`  ✗ Stripe OAuth token exchange failed\n  ${JSON.stringify(tokenData)}`)
-      throw new BadRequestException('Stripe OAuth failed')
+      throw new OAuthCallbackError('token_exchange', 'Stripe OAuth token exchange failed')
     }
 
     const stripeAccountId = tokenData.stripe_user_id as string
@@ -95,7 +122,10 @@ export class StripeOAuthService {
       this.logger.error(
         `  ✗ /v1/account failed for ${stripeAccountId}: ${String(err)} — aborting OAuth flow`,
       )
-      throw new InternalServerErrorException('Failed to resolve Stripe account')
+      throw new OAuthCallbackError(
+        'account_resolve',
+        'Failed to resolve Stripe account',
+      )
     }
 
     await this.backfillService.upsertAccountRow(accountRow)
@@ -108,7 +138,7 @@ export class StripeOAuthService {
 
     if (connError) {
       this.logger.error(`  ✗ Failed to insert connection\n  ${connError.message}`)
-      throw new Error(connError.message)
+      throw new OAuthCallbackError('credentials_save', connError.message)
     }
 
     const { error: stripeError } = await client.from('connections_stripe').insert({
@@ -122,7 +152,7 @@ export class StripeOAuthService {
     if (stripeError) {
       await client.from('connections').delete().eq('id', connection.id)
       this.logger.error(`  ✗ Failed to insert connections_stripe\n  ${stripeError.message}`)
-      throw new Error(stripeError.message)
+      throw new OAuthCallbackError('credentials_save', stripeError.message)
     }
 
     // Credentials are now in place — safe to kick the fire-and-forget backfill.

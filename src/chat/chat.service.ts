@@ -26,7 +26,12 @@ import { StripeViewsService } from '../stripe/views/views.service'
 import { CalendlyViewsService } from '../calendly/views/views.service'
 import { buildTools, type ChatTool, type ToolCtx, type ToolDeps } from './tools'
 
-const MODEL = 'claude-opus-4-5'
+// Sonnet 4.5 instead of Opus 4.5: ~5× cheaper across input + output
+// tokens, still extremely capable at tool-using chat. Opus is overkill
+// for "answer a question about your Stripe MRR" — Sonnet handles
+// multi-tool reasoning fine. Bump to Opus only if we see Sonnet
+// missing tool calls or producing worse summaries.
+const MODEL = 'claude-sonnet-4-5'
 const MAX_AGENT_TURNS = 5
 
 export interface ToolCallTrace {
@@ -202,7 +207,17 @@ export class ChatService {
     for (let i = 0; i < MAX_AGENT_TURNS; i++) {
       const response = await this.anthropic.messages.create({
         model: MODEL,
-        max_tokens: 2048,
+        // Caps the assistant's reply length. 1024 tokens ≈ ~750
+        // English words — comfortably more than any Q&A response
+        // needs, and ½ the previous 2048 cap. Output tokens are the
+        // priciest line item, so this directly trims cost on long
+        // answers without affecting normal ones.
+        max_tokens: 1024,
+        // 0.3 = mostly deterministic. The model is doing factual
+        // data lookups via tools, not creative writing — we don't
+        // want it inventing numbers, and we want repeated questions
+        // to give consistent answers.
+        temperature: 0.3,
         system,
         tools: this.toolDefinitions,
         messages: currentMessages,

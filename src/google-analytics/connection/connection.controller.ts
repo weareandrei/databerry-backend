@@ -1,8 +1,19 @@
-import { Body, Controller, Get, Patch, Query, Req, Res, UseGuards } from '@nestjs/common'
+import {
+  Body,
+  Controller,
+  Get,
+  Logger,
+  Patch,
+  Query,
+  Req,
+  Res,
+  UseGuards,
+} from '@nestjs/common'
 import type { Request } from 'express'
 import { SupabaseAuthGuard } from '../../auth/supabase-auth.guard'
 import { GoogleAnalyticsOAuthService } from './oauth'
 import { GoogleAnalyticsPropertiesService } from './properties'
+import { getPrimaryFrontendUrl } from '../../common/frontend-url'
 import type { AuthenticatedRequest } from '../../common/types'
 
 /** Derive the backend's own public base URL from request headers. */
@@ -19,6 +30,8 @@ function backendBaseUrl(req: Request): string {
 
 @Controller('google-analytics')
 export class GoogleAnalyticsConnectionController {
+  private readonly logger = new Logger(GoogleAnalyticsConnectionController.name)
+
   constructor(
     private readonly oauthService: GoogleAnalyticsOAuthService,
     private readonly propertiesService: GoogleAnalyticsPropertiesService,
@@ -37,9 +50,21 @@ export class GoogleAnalyticsConnectionController {
   async oauthCallback(
     @Query('code') code: string,
     @Query('state') state: string,
+    @Query('error') oauthError: string | undefined,
     @Req() req: Request,
     @Res() res: any,
   ) {
+    // Google sends `?error=access_denied` when the user clicks
+    // "Cancel" on the consent screen. Distinguish that from server-
+    // side failures so the frontend can show the right message.
+    if (oauthError) {
+      const frontendUrl = getPrimaryFrontendUrl()
+      const reason = oauthError === 'access_denied' ? 'cancelled' : 'token_exchange'
+      this.logger.warn(`GA OAuth callback received error=${oauthError}`)
+      return res.redirect(
+        `${frontendUrl}/hub/connections?google_analytics=error&reason=${reason}`,
+      )
+    }
     const redirectUri = `${backendBaseUrl(req)}/google-analytics/oauth/callback`
     const redirectUrl = await this.oauthService.handleOAuthCallback(code, state, redirectUri)
     res.redirect(redirectUrl)
