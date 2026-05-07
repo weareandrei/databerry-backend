@@ -7,6 +7,11 @@ import {
   IntegrationUpstreamException,
 } from '../../common/integration-errors'
 import { getPrimaryFrontendUrl } from '../../common/frontend-url'
+import {
+  decryptForUser,
+  encryptForUser,
+  isEncrypted,
+} from '../../common/crypto/encryption'
 
 export interface GAProperty {
   id: string
@@ -122,10 +127,14 @@ export class GoogleAnalyticsOAuthService {
 
       const firstProperty = properties.length === 1 ? properties[0] : null
 
+      // Encrypt OAuth tokens with the per-user envelope before write.
+      // See `common/crypto/encryption.ts` for the algorithm rationale.
+      // We have `userId` in scope from the OAuth state row, which is
+      // exactly what the per-user key derivation needs.
       const { error: credErr } = await client.from('connections_google_analytics').insert({
         connection_id: conn.id,
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
+        access_token: encryptForUser(tokens.access_token, userId),
+        refresh_token: encryptForUser(tokens.refresh_token, userId),
         token_expiry: tokenExpiry,
         property_id: firstProperty?.id ?? null,
         property_name: firstProperty?.displayName ?? null,
@@ -159,9 +168,15 @@ export class GoogleAnalyticsOAuthService {
   async ensureFreshToken(connectionId: string): Promise<string> {
     const client = this.supabaseService.getClient()
 
+    // Pull the parent connection's `user_id` alongside the credentials
+    // — the per-user encryption envelope needs the UUID to derive the
+    // decryption key. The `connections!inner(user_id)` syntax is
+    // PostgREST's "embed-via-FK" notation; the `inner` flavour means
+    // we get null instead of an empty array if the FK is dangling
+    // (which we already special-case as `!data` below).
     const { data, error } = await client
       .from('connections_google_analytics')
-      .select('access_token, refresh_token, token_expiry')
+      .select('access_token, refresh_token, token_expiry, connections!inner(user_id)')
       .eq('connection_id', connectionId)
       .maybeSingle()
 
@@ -183,13 +198,37 @@ export class GoogleAnalyticsOAuthService {
       throw new NotFoundException('Google Analytics credentials not found')
     }
 
+    // Supabase returns embedded one-to-one relations as either an
+    // array or a plain object depending on uniqueness inference;
+    // normalise.
+    const userId = (
+      Array.isArray(data.connections) ? data.connections[0] : data.connections
+    )?.user_id as string | undefined
+    if (!userId) {
+      this.logger.error(`GA credentials orphaned (no user_id) for connection ${connectionId}`)
+      throw new NotFoundException('Google Analytics credentials not found')
+    }
+
+    // Decrypt-on-read with a plaintext fallback for rows that pre-date
+    // the encryption migration. The migration script flips every row
+    // to `v1:` afterwards; once we're confident no plaintext rows
+    // remain, this fallback can be removed in a follow-up.
+    const accessTokenRaw = data.access_token as string
+    const refreshTokenRaw = data.refresh_token as string
+    const accessToken = isEncrypted(accessTokenRaw)
+      ? decryptForUser(accessTokenRaw, userId)
+      : accessTokenRaw
+    const refreshToken = isEncrypted(refreshTokenRaw)
+      ? decryptForUser(refreshTokenRaw, userId)
+      : refreshTokenRaw
+
     const expiry = new Date(data.token_expiry as string)
     const buffer = new Date(Date.now() + 5 * 60 * 1000)
 
     if (expiry > buffer) {
       const minsLeft = Math.round((expiry.getTime() - Date.now()) / 60_000)
       this.logger.log(`GA token still fresh for ${connectionId} (${minsLeft}m left, no refresh)`)
-      return data.access_token as string
+      return accessToken
     }
 
     this.logger.log(`Refreshing GA token for connection ${connectionId}`)
@@ -200,7 +239,7 @@ export class GoogleAnalyticsOAuthService {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
           grant_type: 'refresh_token',
-          refresh_token: data.refresh_token as string,
+          refresh_token: refreshToken,
           client_id: this.clientId,
           client_secret: this.clientSecret,
         }),
@@ -253,10 +292,14 @@ export class GoogleAnalyticsOAuthService {
     const tokens = (await res.json()) as { access_token: string; expires_in: number }
     const newExpiry = new Date(Date.now() + tokens.expires_in * 1000).toISOString()
 
+    // Re-encrypt the rotated access_token before write — Google's
+    // refresh response only returns a new access_token (refresh_token
+    // is re-used), so we only update the one column. `userId` is
+    // already in scope from the join above.
     await client
       .from('connections_google_analytics')
       .update({
-        access_token: tokens.access_token,
+        access_token: encryptForUser(tokens.access_token, userId),
         token_expiry: newExpiry,
       })
       .eq('connection_id', connectionId)

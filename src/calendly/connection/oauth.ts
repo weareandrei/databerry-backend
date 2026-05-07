@@ -7,6 +7,11 @@ import {
   IntegrationUpstreamException,
 } from '../../common/integration-errors'
 import { getPrimaryFrontendUrl } from '../../common/frontend-url'
+import {
+  decryptForUser,
+  encryptForUser,
+  isEncrypted,
+} from '../../common/crypto/encryption'
 
 @Injectable()
 export class CalendlyOAuthService {
@@ -129,10 +134,13 @@ export class CalendlyOAuthService {
         return errorRedirect('credentials_save')
       }
 
+      // Encrypt OAuth tokens with the per-user envelope before write —
+      // see `common/crypto/encryption.ts` for the algorithm rationale.
+      // `userId` is in scope from the OAuth state row above.
       const { error: credErr } = await client.from('connections_calendly').insert({
         connection_id: conn.id,
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
+        access_token: encryptForUser(tokens.access_token, userId),
+        refresh_token: encryptForUser(tokens.refresh_token, userId),
         expires_at: expiresAt,
         user_uri: me.resource.uri,
         organization_uri: me.resource.current_organization,
@@ -158,9 +166,12 @@ export class CalendlyOAuthService {
   async ensureFreshToken(connectionId: string): Promise<string> {
     const client = this.supabaseService.getClient()
 
+    // Pull `user_id` alongside the credentials — needed to derive the
+    // per-user decryption key. See GA `ensureFreshToken` for the same
+    // pattern.
     const { data, error } = await client
       .from('connections_calendly')
-      .select('access_token, refresh_token, expires_at')
+      .select('access_token, refresh_token, expires_at, connections!inner(user_id)')
       .eq('connection_id', connectionId)
       .maybeSingle()
 
@@ -176,11 +187,29 @@ export class CalendlyOAuthService {
       throw new NotFoundException('Calendly credentials not found')
     }
 
+    const userId = (
+      Array.isArray(data.connections) ? data.connections[0] : data.connections
+    )?.user_id as string | undefined
+    if (!userId) {
+      this.logger.error(`Calendly credentials orphaned (no user_id) for connection ${connectionId}`)
+      throw new NotFoundException('Calendly credentials not found')
+    }
+
+    // Decrypt with plaintext fallback for pre-migration rows.
+    const accessTokenRaw = data.access_token as string
+    const refreshTokenRaw = data.refresh_token as string
+    const accessToken = isEncrypted(accessTokenRaw)
+      ? decryptForUser(accessTokenRaw, userId)
+      : accessTokenRaw
+    const refreshToken = isEncrypted(refreshTokenRaw)
+      ? decryptForUser(refreshTokenRaw, userId)
+      : refreshTokenRaw
+
     const expiresAt = new Date(data.expires_at as string)
     const bufferTime = new Date(Date.now() + 5 * 60 * 1000)
 
     if (expiresAt > bufferTime) {
-      return data.access_token as string
+      return accessToken
     }
 
     this.logger.log(`Refreshing Calendly token for connection ${connectionId}`)
@@ -192,7 +221,7 @@ export class CalendlyOAuthService {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
           grant_type: 'refresh_token',
-          refresh_token: data.refresh_token as string,
+          refresh_token: refreshToken,
           client_id: this.clientId,
           client_secret: this.clientSecret,
         }),
@@ -240,11 +269,13 @@ export class CalendlyOAuthService {
 
     // Calendly *rotates* refresh tokens on each successful refresh, so we
     // must persist the new one — unlike Google, which reuses the original.
+    // Re-encrypt both with the per-user envelope. `userId` is in scope
+    // from the join above.
     await client
       .from('connections_calendly')
       .update({
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
+        access_token: encryptForUser(tokens.access_token, userId),
+        refresh_token: encryptForUser(tokens.refresh_token, userId),
         expires_at: newExpiresAt,
       })
       .eq('connection_id', connectionId)

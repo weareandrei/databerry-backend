@@ -1,6 +1,7 @@
 import { Logger, NotFoundException, UnauthorizedException } from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
 import { ConnectionMissingException } from '../../common/integration-errors'
+import { decryptForUser, isEncrypted } from '../../common/crypto/encryption'
 
 // Single shared logger for every Stripe HTTP call. Tagged so it's easy to
 // grep for: `[StripeAPI]`. Every request and every failure gets one line.
@@ -47,7 +48,11 @@ export async function getApiKey(
     .maybeSingle()
 
   if (!data) throw new NotFoundException('Stripe manual credentials not found')
-  return data.api_key as string
+
+  // Decrypt-on-read with plaintext fallback for pre-migration rows.
+  // `userId` is in scope from the ownership check above.
+  const raw = data.api_key as string
+  return isEncrypted(raw) ? decryptForUser(raw, userId) : raw
 }
 
 /**
@@ -127,15 +132,28 @@ export async function getApiKeyInternal(
   connectionId: string,
   supabaseService: SupabaseService,
 ): Promise<string> {
+  // Pull `user_id` via a join so we can derive the per-user
+  // decryption key — internal callers (scheduler / sync) don't have
+  // a `userId` in scope. The credential row's owning connection
+  // always has one.
   const { data } = await supabaseService
     .getClient()
     .from('connections_stripe_manual')
-    .select('api_key')
+    .select('api_key, connections!inner(user_id)')
     .eq('connection_id', connectionId)
     .maybeSingle()
 
   if (!data) throw new Error('Stripe manual credentials not found')
-  return data.api_key as string
+
+  const userId = (
+    Array.isArray(data.connections) ? data.connections[0] : data.connections
+  )?.user_id as string | undefined
+  if (!userId) {
+    throw new Error('Stripe manual credentials orphaned (no user_id)')
+  }
+
+  const raw = data.api_key as string
+  return isEncrypted(raw) ? decryptForUser(raw, userId) : raw
 }
 
 /** Paginates through Stripe charges from `createdGte` (optionally up to `createdLt`) and returns the total sum in cents. */

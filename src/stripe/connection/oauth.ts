@@ -7,6 +7,7 @@ import {
 import { SupabaseService } from '../../supabase/supabase.service'
 import { StripeBackfillService } from '../sync/backfill.service'
 import { makeStripeGetter } from '../views/stripe-api.helpers'
+import { encryptForUser } from '../../common/crypto/encryption'
 
 /**
  * Reason codes shared with the frontend `useOAuthCallback` hook —
@@ -141,11 +142,14 @@ export class StripeOAuthService {
       throw new OAuthCallbackError('credentials_save', connError.message)
     }
 
+    // Encrypt OAuth tokens with the per-user envelope before write —
+    // see `common/crypto/encryption.ts` for the algorithm rationale.
+    // `userId` is decoded from the OAuth state at the top of this method.
     const { error: stripeError } = await client.from('connections_stripe').insert({
       connection_id: connection.id,
       stripe_account_id: stripeAccountId,
-      access_token: accessToken,
-      refresh_token: refreshToken ?? null,
+      access_token: encryptForUser(accessToken, userId),
+      refresh_token: refreshToken ? encryptForUser(refreshToken, userId) : null,
       scope: scope ?? null,
     })
 

@@ -1,5 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { SupabaseService } from '../../supabase/supabase.service'
+import { decryptForUser, isEncrypted } from '../../common/crypto/encryption'
 
 export interface PosthogEventDefinition {
   id: string
@@ -21,17 +22,30 @@ export async function getPosthogCredentials(
   connectionId: string,
   supabaseService: SupabaseService,
 ): Promise<PosthogCredentials | null> {
+  // Pull `user_id` via FK join so we can derive the per-user
+  // decryption key — see `common/crypto/encryption.ts` for rationale.
+  // Some callers (scheduler, lifecycle hooks) don't have a `userId`
+  // in scope, so the join is the only source.
   const { data: ph, error } = await supabaseService
     .getClient()
     .from('connections_posthog')
-    .select('api_key, project_id, host')
+    .select('api_key, project_id, host, connections!inner(user_id)')
     .eq('connection_id', connectionId)
     .single()
 
   if (error || !ph) return null
 
+  const userId = (
+    Array.isArray(ph.connections) ? ph.connections[0] : ph.connections
+  )?.user_id as string | undefined
+  if (!userId) return null  // orphaned creds — treat as missing
+
+  // Decrypt-on-read with plaintext fallback for pre-migration rows.
+  const apiKeyRaw = ph.api_key as string
+  const apiKey = isEncrypted(apiKeyRaw) ? decryptForUser(apiKeyRaw, userId) : apiKeyRaw
+
   return {
-    apiKey: ph.api_key as string,
+    apiKey,
     projectId: ph.project_id as string,
     host: (ph.host as string) ?? 'https://app.posthog.com',
   }

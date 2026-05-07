@@ -8,6 +8,7 @@ import { createHash, randomBytes } from 'crypto'
 import { SupabaseService } from '../supabase/supabase.service'
 import { PosthogCredentialsService } from '../posthog/connection/credentials'
 import { StripeBackfillService } from '../stripe/sync/backfill.service'
+import { encryptForUser } from '../common/crypto/encryption'
 
 export interface CreateConnectionDto {
   name: string
@@ -96,7 +97,7 @@ export class ConnectionsService {
 
     // 2. Insert type-specific config table
     if (dto.config || dto.type === 'webhook') {
-      await this.insertTypeConfig(dto.type, data.id, dto.config ?? {}, client)
+      await this.insertTypeConfig(dto.type, data.id, dto.config ?? {}, client, userId)
     }
 
     // Re-fetch with join so webhookId is included in the response
@@ -237,11 +238,14 @@ export class ConnectionsService {
     connectionId: string,
     config: Record<string, unknown>,
     client: ReturnType<SupabaseService['getClient']>,
+    userId: string,
   ) {
     if (type === 'posthog') {
+      // Encrypt the api_key with the per-user envelope before write.
+      // See `common/crypto/encryption.ts` for the algorithm rationale.
       const { error } = await client.from('connections_posthog').insert({
         connection_id: connectionId,
-        api_key: config.apiKey,
+        api_key: encryptForUser(config.apiKey as string, userId),
         project_id: config.projectId,
         host: config.host ?? 'https://app.posthog.com',
       })
@@ -334,9 +338,13 @@ export class ConnectionsService {
       // find credentials when it runs.
       await this.stripeBackfillService.upsertAccountRow(accountRow)
 
+      // Encrypt the api_key with the per-user envelope. The plaintext
+      // `apiKey` was just used above to validate against /v1/account
+      // and resolve the account row, so we know it's good before
+      // committing the encrypted form.
       const { error } = await client.from('connections_stripe_manual').insert({
         connection_id: connectionId,
-        api_key: apiKey,
+        api_key: encryptForUser(apiKey, userId),
         stripe_account_id: accountRow.id,
       })
       if (error) {
@@ -357,9 +365,10 @@ export class ConnectionsService {
     } else if (type === 'calendly') {
       // Credentials are inserted directly by CalendlyService.handleOAuthCallback — no-op here
     } else if (type === 'vercel') {
+      // Encrypt the api_token with the per-user envelope before write.
       const { error } = await client.from('connections_vercel').insert({
         connection_id: connectionId,
-        api_token: config.apiToken,
+        api_token: encryptForUser(config.apiToken as string, userId),
         project_id: config.projectId,
         project_name: config.projectName,
       })
