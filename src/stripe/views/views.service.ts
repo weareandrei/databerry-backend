@@ -21,9 +21,16 @@ import type { ChartPoint } from './stripe-api.helpers'
  *
  * `stripe_top_customers` is intentionally NOT here — it returns a list, not
  * a string, and rides its own controller route + service method.
+ *
+ * `stripe_revenue_today` was merged into `stripe_gross` (the polymorphic
+ * type that also serves the chart variant via `fetchChartData`). For the
+ * value-mode flavour, the frontend sends `stripe_gross` and the backend
+ * sums charges over the requested date range — same numeric output as the
+ * old `stripe_revenue_today`. See `migrate-view-types-2026-05.ts` for the
+ * one-shot DB rewrite that turned old rows into `stripe_gross + config.
+ * displayMode='value'`.
  */
 const LIVE_VALUE_TYPES = new Set([
-  'stripe_revenue_today',
   'stripe_gross_today',
   'stripe_gross',
   'stripe_mrr',

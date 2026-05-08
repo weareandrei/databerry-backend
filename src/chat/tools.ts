@@ -46,8 +46,12 @@ export interface ToolDeps {
 // different `viewType` values. Keep them separate or the model will
 // occasionally send a chart-only enum to the live-value tool and
 // the backend will 404.
+//
+// `stripe_revenue_today` was merged into `stripe_gross` (see
+// `migrate-view-types-2026-05.ts`). To get today's gross revenue, the
+// model should pass `stripe_gross` with no dateFrom/dateTo (defaults to
+// today). The semantics are identical.
 const STRIPE_LIVE_METRICS = [
-  'stripe_revenue_today',
   'stripe_gross_today',
   'stripe_gross',
   'stripe_mrr',

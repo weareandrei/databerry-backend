@@ -28,6 +28,31 @@ export class PosthogViewsController {
   }
 
   /**
+   * Time-series for `daily_counter` views in chart mode
+   * (`config.displayMode === 'chart'`). Returns `{ points: ChartPoint[] }`
+   * matching the Stripe + GA chart endpoints — `<ViewCardChart>` accepts
+   * any of them.
+   */
+  @Get('chart-data')
+  async getChartData(
+    @Query('connectionId') connectionId: string,
+    @Query('viewId') viewId: string,
+    @Query('dateFrom') dateFrom: string | undefined,
+    @Query('dateTo') dateTo: string | undefined,
+    @Query('tz') tz: string | undefined,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.posthogViewsService.fetchChartData(
+      connectionId,
+      viewId,
+      req.authUser.id,
+      dateFrom,
+      dateTo,
+      tz,
+    )
+  }
+
+  /**
    * Funnel — `{ steps: FunnelStepRow[] }`. One route per non-`live-value`
    * view type, mirroring the convention established by Stripe's
    * `/stripe/views/top-customers`. Keeps the wire shape per route specific

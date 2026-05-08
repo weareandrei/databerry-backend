@@ -26,4 +26,30 @@ export class GoogleAnalyticsViewsController {
       tz,
     )
   }
+
+  /**
+   * Time-series for `ga_users_today` / `ga_sessions_today` /
+   * `ga_pageviews_today` views in chart mode (`config.displayMode === 'chart'`).
+   * Mirrors `/stripe/views/chart-data` shape — `{ points: ChartPoint[] }`.
+   */
+  @Get('chart-data')
+  async getChartData(
+    @Query('connectionId') connectionId: string,
+    @Query('viewType') viewType: string,
+    @Query('dateFrom') dateFrom: string | undefined,
+    @Query('dateTo') dateTo: string | undefined,
+    @Query('mode') mode: 'daily' | 'weekly' | 'monthly' | undefined,
+    @Query('tz') tz: string | undefined,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.gaViewsService.fetchChartData(
+      connectionId,
+      viewType,
+      req.authUser.id,
+      dateFrom,
+      dateTo,
+      mode,
+      tz,
+    )
+  }
 }
