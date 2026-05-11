@@ -275,6 +275,37 @@ export class BillingService {
       return
     }
 
+    // Pre-verify diagnostics — emitted on EVERY event so the next
+    // signature failure has enough context to debug without code
+    // changes. Cheap (synchronous string ops) and only the first
+    // few chars of each secret/signature so production logs stay
+    // safe to share. The classic failure modes show up here:
+    //
+    //   1. `bodyIsBuffer=false`               → body parser ate the
+    //                                            raw bytes. Check
+    //                                            `rawBody: true` in
+    //                                            main.ts + that no
+    //                                            JSON middleware
+    //                                            runs before us.
+    //   2. `bodySize=0` or `=undefined`        → @RawBody() returned
+    //                                            empty. Same root
+    //                                            cause as #1.
+    //   3. `signaturePresent=false`            → Stripe didn't send
+    //                                            the header. Almost
+    //                                            always a misconfigured
+    //                                            proxy / CDN strip.
+    //   4. `secretPrefix` doesn't match the    → wrong env var. The
+    //      one in Stripe Dashboard               most common cause —
+    //                                            see comment below.
+    this.logger.debug(
+      `Billing webhook signature check  ` +
+        `bodyIsBuffer=${Buffer.isBuffer(rawBody)}  ` +
+        `bodySize=${rawBody?.length ?? 'undefined'}  ` +
+        `signaturePresent=${!!signature}  ` +
+        `signaturePrefix=${signature?.slice(0, 16) ?? 'n/a'}  ` +
+        `secretPrefix=${webhookSecret.slice(0, 12)}…`,
+    )
+
     let event: Stripe.Event
     try {
       event = this.getStripe().webhooks.constructEvent(
@@ -283,7 +314,16 @@ export class BillingService {
         webhookSecret,
       )
     } catch (err) {
-      this.logger.error(`Billing webhook signature verification failed: ${String(err)}`)
+      // Surface the Stripe error message verbatim — it usually
+      // names the failure mode ("No signatures found matching…"
+      // vs "Timestamp outside the tolerance zone…" vs etc.). The
+      // diagnostic line above already has the body / signature /
+      // secret-prefix context, so the two lines together fully
+      // pin down where to look.
+      this.logger.error(
+        `Billing webhook signature verification failed: ${String(err)}  ` +
+          `(see DEBUG diagnostic line above for body/secret state)`,
+      )
       throw new BadRequestException('Invalid Stripe signature')
     }
 
