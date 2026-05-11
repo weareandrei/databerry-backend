@@ -64,6 +64,7 @@ const TABLES: { table: string; columns: string[] }[] = [
   { table: 'connections_google_analytics', columns: ['access_token', 'refresh_token'] },
   { table: 'connections_posthog',          columns: ['api_key'] },
   { table: 'connections_vercel',           columns: ['api_token'] },
+  { table: 'connections_sentry',           columns: ['access_token', 'refresh_token'] },
 ]
 
 async function migrate() {

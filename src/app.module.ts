@@ -10,6 +10,7 @@ import { WebhooksModule } from './webhooks/webhooks.module'
 import { StripeModule } from './stripe/stripe.module'
 import { CalendlyModule } from './calendly/calendly.module'
 import { GoogleAnalyticsModule } from './google-analytics/google-analytics.module'
+import { SentryModule } from './sentry/sentry.module'
 import { VercelModule } from './vercel/vercel.module'
 import { SchedulerModule } from './scheduler/scheduler.module'
 import { UserSettingsModule } from './user-settings/user-settings.module'
@@ -17,6 +18,7 @@ import { ProjectSettingsModule } from './project-settings/project-settings.modul
 import { ProjectOverviewModule } from './project-overview/project-overview.module'
 import { ChatModule } from './chat/chat.module'
 import { ContactModule } from './contact/contact.module'
+import { BillingModule } from './billing/billing.module'
 
 @Module({
   imports: [
@@ -31,6 +33,7 @@ import { ContactModule } from './contact/contact.module'
     StripeModule,
     CalendlyModule,
     GoogleAnalyticsModule,
+    SentryModule,
     VercelModule,
     SchedulerModule,
     UserSettingsModule,
@@ -38,6 +41,7 @@ import { ContactModule } from './contact/contact.module'
     ProjectOverviewModule,
     ChatModule,
     ContactModule,
+    BillingModule,
   ],
 })
 export class AppModule {}

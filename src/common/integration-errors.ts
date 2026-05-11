@@ -6,7 +6,7 @@ import { HttpException, HttpStatus } from '@nestjs/common'
  * data comes from our own Supabase cache (no live OAuth call), and PostHog
  * uses a permanent personal API key that doesn't go through OAuth refresh.
  */
-export type IntegrationKey = 'google_analytics' | 'calendly'
+export type IntegrationKey = 'google_analytics' | 'calendly' | 'sentry'
 
 /**
  * Stable error codes returned in the `error` field of the response body.

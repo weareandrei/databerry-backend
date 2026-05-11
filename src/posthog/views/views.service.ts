@@ -11,6 +11,7 @@ import {
   escapeDateLiteral,
   escapeStringLiteral,
   tzDateBucket,
+  tzWrappedTimestamp,
 } from './live/hogql-utils'
 import { getPosthogCredentials, type PosthogCredentials } from '../connection/credentials'
 import {
@@ -191,8 +192,17 @@ export class PosthogViewsService {
     // For a single-day request we bucket by hour; for ranges, by day. The
     // bucket dimension stays inside the WHERE-filtered subquery so we don't
     // pull non-matching events into the timezone-bucketing math.
+    //
+    // Use `tzWrappedTimestamp` for the inner `toTimeZone(...)` instead of
+    // hand-rolling — the helper quotes the tz literal correctly. An
+    // earlier draft inlined `toTimeZone(timestamp, ${tzLit})` (no quotes
+    // around the tz string), which caused HogQL to parse the timezone
+    // name as a column reference and 500 the request — surfaced to the
+    // user as the "Couldn't load value" badge in daily mode while
+    // weekly/monthly worked fine (those go through `tzDateBucket`,
+    // which already routes through the helper).
     const bucketExpr = isSingleDay
-      ? `toHour(toTimeZone(timestamp, ${tzLit}))`
+      ? `toHour(${tzWrappedTimestamp(tzLit)})`
       : tzDateBucket(tzLit)
     const hogqlQuery =
       `SELECT ${bucketExpr} AS b, count() ` +
