@@ -155,24 +155,32 @@ export class SentryOAuthService {
         return errorRedirect('token_exchange')
       }
 
-      // Step 4b — resolve the org slug. Sentry's installation endpoint
-      // doesn't return the org slug in the token response, so we do a
-      // follow-up call to `/api/0/sentry-app-installations/{id}/`.
-      const installRes = await fetch(
-        `${this.baseApi}/sentry-app-installations/${installationId}/`,
-        { headers: { Authorization: `Bearer ${tokens.token}` } },
-      )
-      if (!installRes.ok) {
-        const detail = await installRes.text().catch(() => '')
+      // Step 4b — resolve the org slug. The install-details endpoint
+      // (`/api/0/sentry-app-installations/{id}/`) requires the
+      // integration to authenticate as itself (HTTP Basic with client
+      // credentials), NOT the user-scoped access token we just got —
+      // hitting it with the bearer returns 403. Easier route: ask
+      // `/api/0/organizations/` which orgs this token can see; the
+      // installation token is scoped to exactly one org (the installer's),
+      // so the response is a single-entry array whose `slug` is what
+      // we need. Uses the `org:read` scope our integration already
+      // requests, no extra permissions required.
+      const orgsRes = await fetch(`${this.baseApi}/organizations/`, {
+        headers: { Authorization: `Bearer ${tokens.token}` },
+      })
+      if (!orgsRes.ok) {
+        const detail = await orgsRes.text().catch(() => '')
         this.logger.error(
-          `Sentry install lookup failed (${installRes.status}): ${detail.slice(0, 200)}`,
+          `Sentry org lookup failed (${orgsRes.status}): ${detail.slice(0, 200)}`,
         )
         return errorRedirect('account_resolve')
       }
-      const installData = (await installRes.json()) as {
-        organization: { slug: string }
+      const orgs = (await orgsRes.json()) as Array<{ slug: string }>
+      if (!orgs.length) {
+        this.logger.error('Sentry org lookup returned an empty array')
+        return errorRedirect('account_resolve')
       }
-      const orgSlug = installData.organization.slug
+      const orgSlug = orgs[0].slug
 
       // Step 5 — persist. Same shape as `connections_calendly`.
       const { data: conn, error: connErr } = await client
