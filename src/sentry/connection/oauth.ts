@@ -155,32 +155,45 @@ export class SentryOAuthService {
         return errorRedirect('token_exchange')
       }
 
-      // Step 4b — resolve the org slug. The install-details endpoint
-      // (`/api/0/sentry-app-installations/{id}/`) requires the
-      // integration to authenticate as itself (HTTP Basic with client
-      // credentials), NOT the user-scoped access token we just got —
-      // hitting it with the bearer returns 403. Easier route: ask
-      // `/api/0/organizations/` which orgs this token can see; the
-      // installation token is scoped to exactly one org (the installer's),
-      // so the response is a single-entry array whose `slug` is what
-      // we need. Uses the `org:read` scope our integration already
-      // requests, no extra permissions required.
-      const orgsRes = await fetch(`${this.baseApi}/organizations/`, {
-        headers: { Authorization: `Bearer ${tokens.token}` },
-      })
-      if (!orgsRes.ok) {
-        const detail = await orgsRes.text().catch(() => '')
+      // Step 4b — resolve the org slug.
+      // First two attempts that DIDN'T work, so the next person who
+      // touches this doesn't repeat them:
+      //   1. `GET /sentry-app-installations/{id}/` with Bearer
+      //      <user-token> → 403. The user token's `org:read` scope
+      //      doesn't grant access to installation metadata endpoints.
+      //   2. `GET /organizations/` with Bearer <user-token> → 403.
+      //      `/organizations/` is a *user-context* listing — it
+      //      returns orgs the AUTHENTICATING USER has access to. The
+      //      Public Integration's OAuth access token isn't a user
+      //      token; it's tied to the installation, not a Sentry
+      //      account, so it has no user-context to enumerate.
+      // What works: the same install-details endpoint, authenticated
+      // with **HTTP Basic + the integration's client credentials**
+      // (client_id:client_secret). Sentry treats this as "the
+      // integration asking about its own installation" and returns
+      // the org wrapper we need.
+      const basicAuth = Buffer.from(
+        `${this.clientId}:${this.clientSecret}`,
+      ).toString('base64')
+      const installRes = await fetch(
+        `${this.baseApi}/sentry-app-installations/${installationId}/`,
+        { headers: { Authorization: `Basic ${basicAuth}` } },
+      )
+      if (!installRes.ok) {
+        const detail = await installRes.text().catch(() => '')
         this.logger.error(
-          `Sentry org lookup failed (${orgsRes.status}): ${detail.slice(0, 200)}`,
+          `Sentry install lookup failed (${installRes.status}): ${detail.slice(0, 200)}`,
         )
         return errorRedirect('account_resolve')
       }
-      const orgs = (await orgsRes.json()) as Array<{ slug: string }>
-      if (!orgs.length) {
-        this.logger.error('Sentry org lookup returned an empty array')
+      const installData = (await installRes.json()) as {
+        organization: { slug: string }
+      }
+      const orgSlug = installData.organization?.slug
+      if (!orgSlug) {
+        this.logger.error('Sentry install lookup response missing organization.slug')
         return errorRedirect('account_resolve')
       }
-      const orgSlug = orgs[0].slug
 
       // Step 5 — persist. Same shape as `connections_calendly`.
       const { data: conn, error: connErr } = await client
