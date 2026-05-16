@@ -47,11 +47,14 @@ export class SentryOAuthService {
   readonly redirectUri = `${process.env.WEBHOOK_BASE_URL ?? 'http://localhost:3001'}/sentry/oauth/callback`
   readonly frontendUrl = getPrimaryFrontendUrl()
   readonly baseApi = 'https://sentry.io/api/0'
-  // The "external install" page Sentry hosts for any org admin to
-  // install our (unpublished or published) public integration.
-  // `clientId` doubles as the integration's slug query param —
-  // matches what Sentry's settings page hands us.
   readonly authBase = 'https://sentry.io'
+  // Sentry's integration slug — the lowercase-hyphenated identifier of
+  // our Public Integration (e.g. `databerry`, not the long `client_id`
+  // hex string). Shown on the integration's settings page in Sentry as
+  // "Slug". Required for the install URL to resolve; falls back to
+  // `clientId` only so dev environments without it set fail with a
+  // clear 404 from Sentry rather than a missing-env crash on startup.
+  readonly slug = process.env.SENTRY_INTEGRATION_SLUG ?? process.env.SENTRY_CLIENT_ID!
 
   constructor(private readonly supabaseService: SupabaseService) {}
 
@@ -71,12 +74,10 @@ export class SentryOAuthService {
     }
 
     // Sentry's external-install URL — works for both published and
-    // unpublished integrations. The integration's slug is the value
-    // Sentry shows under "Slug" in the integration settings page; we
-    // use the client_id as the slug because Sentry happens to expose
-    // them as the same string in practice. If they ever diverge,
-    // introduce a `SENTRY_INTEGRATION_SLUG` env var.
-    const url = new URL(`${this.authBase}/sentry-apps/${this.clientId}/external-install/`)
+    // unpublished integrations. Uses the integration's slug (lowercase-
+    // hyphenated name), which is distinct from the OAuth `client_id` —
+    // see the `slug` field for env-var wiring.
+    const url = new URL(`${this.authBase}/sentry-apps/${this.slug}/external-install/`)
     url.searchParams.set('state', state)
 
     return url.toString()
