@@ -82,6 +82,24 @@ export class ProjectOverviewController {
     )
   }
 
+  @Get('countries')
+  async countries(
+    @Query('projectId') projectId: string,
+    @Query('dateFrom') dateFrom: string,
+    @Query('dateTo') dateTo: string,
+    @Query('limit') limit: string | undefined,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    const n = limit ? parseInt(limit, 10) : 50
+    return this.service.fetchCountries(
+      req.authUser.id,
+      projectId,
+      dateFrom,
+      dateTo,
+      isNaN(n) ? 50 : n,
+    )
+  }
+
   @Get('conversion-events')
   async conversionEvents(
     @Query('connectionId') connectionId: string,

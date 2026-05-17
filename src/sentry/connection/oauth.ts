@@ -155,43 +155,55 @@ export class SentryOAuthService {
         return errorRedirect('token_exchange')
       }
 
-      // Step 4b — resolve the org slug.
-      // First two attempts that DIDN'T work, so the next person who
-      // touches this doesn't repeat them:
-      //   1. `GET /sentry-app-installations/{id}/` with Bearer
-      //      <user-token> → 403. The user token's `org:read` scope
-      //      doesn't grant access to installation metadata endpoints.
-      //   2. `GET /organizations/` with Bearer <user-token> → 403.
-      //      `/organizations/` is a *user-context* listing — it
-      //      returns orgs the AUTHENTICATING USER has access to. The
-      //      Public Integration's OAuth access token isn't a user
-      //      token; it's tied to the installation, not a Sentry
-      //      account, so it has no user-context to enumerate.
-      // What works: the same install-details endpoint, authenticated
-      // with **HTTP Basic + the integration's client credentials**
-      // (client_id:client_secret). Sentry treats this as "the
-      // integration asking about its own installation" and returns
-      // the org wrapper we need.
-      const basicAuth = Buffer.from(
-        `${this.clientId}:${this.clientSecret}`,
-      ).toString('base64')
-      const installRes = await fetch(
+      // Step 4b — verify the install AND resolve the org slug in one
+      // shot, via a `PUT /sentry-app-installations/{id}/` with
+      // `{ status: 'installed' }`.
+      //
+      // Why this is necessary: our integration is configured with
+      // "Verify install" enabled (the default for Public Integrations).
+      // Until we PUT status='installed', Sentry leaves the
+      // installation in "Pending" — visible in their UI as
+      // "<Integration> - Pending" — and clips the access token's
+      // permissions enough that other lookup calls return 401/403.
+      //
+      // Failed attempts logged here so the next person doesn't repeat:
+      //   1. GET /sentry-app-installations/{id}/ + Bearer<user-token> → 403
+      //      (token's `org:read` scope ≠ installation metadata access)
+      //   2. GET /organizations/                  + Bearer<user-token> → 403
+      //      (the install token isn't a user token; no user context
+      //      to enumerate orgs from)
+      //   3. GET /sentry-app-installations/{id}/ + Basic<client_id:secret> → 401
+      //      (Sentry doesn't accept HTTP Basic on this endpoint)
+      //
+      // The PUT verify call doubles as the metadata fetch: Sentry
+      // returns the installation row in the response body, including
+      // `organization.slug` — saves us a follow-up GET.
+      const verifyRes = await fetch(
         `${this.baseApi}/sentry-app-installations/${installationId}/`,
-        { headers: { Authorization: `Basic ${basicAuth}` } },
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${tokens.token}`,
+          },
+          body: JSON.stringify({ status: 'installed' }),
+        },
       )
-      if (!installRes.ok) {
-        const detail = await installRes.text().catch(() => '')
+      if (!verifyRes.ok) {
+        const detail = await verifyRes.text().catch(() => '')
         this.logger.error(
-          `Sentry install lookup failed (${installRes.status}): ${detail.slice(0, 200)}`,
+          `Sentry install verify failed (${verifyRes.status}): ${detail.slice(0, 200)}`,
         )
         return errorRedirect('account_resolve')
       }
-      const installData = (await installRes.json()) as {
-        organization: { slug: string }
+      const installData = (await verifyRes.json()) as {
+        organization?: { slug: string }
       }
       const orgSlug = installData.organization?.slug
       if (!orgSlug) {
-        this.logger.error('Sentry install lookup response missing organization.slug')
+        this.logger.error(
+          'Sentry install verify response missing organization.slug',
+        )
         return errorRedirect('account_resolve')
       }
 

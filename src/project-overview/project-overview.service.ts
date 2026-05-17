@@ -19,6 +19,7 @@ import {
   listPosthogEventNames,
 } from '../posthog/views/live/sources'
 import { fetchPosthogUsersList } from '../posthog/views/live/users'
+import { fetchPosthogCountriesList } from '../posthog/views/live/countries'
 import { fetchStripeRevenueByBucketFromStorage } from '../stripe/views/live/revenue-by-bucket'
 import {
   getConnectionProductFilter,
@@ -83,6 +84,28 @@ export interface OverviewUser {
   sessionSec: number
   /** ISO-8601 timestamp of the user's most recent pageview. */
   lastSeen: string
+}
+
+export interface OverviewCountry {
+  /** ISO 3166-1 alpha-2 code (e.g. 'US', 'GB'). Stable key for flags. */
+  countryCode: string
+  /** Display name. May be empty when PostHog didn't denormalise the name. */
+  countryName: string
+  /** Distinct-visitor count from this country in the range. */
+  visitors: number
+  /** Share of the panel total (0–1). Precomputed server-side. */
+  share: number
+}
+
+export interface OverviewCountriesResponse {
+  countries: OverviewCountry[]
+  /**
+   * `null` when no provider is connected, `'google_analytics'` when GA
+   * is the project's traffic source (currently unsupported for the
+   * per-country rollup — same rationale as the legacy users panel),
+   * `'posthog'` for successful queries.
+   */
+  provider: 'google_analytics' | 'posthog' | null
 }
 
 export interface OverviewUsersResponse {
@@ -749,6 +772,58 @@ export class ProjectOverviewService {
     } catch (err) {
       this.logger.warn(`fetchUsers PostHog error: ${String(err)}`)
       return { users: [], provider: 'posthog' }
+    }
+  }
+
+  /**
+   * Per-country visitor breakdown for the overview Countries tab.
+   * Same provider routing as `fetchUsers` (PostHog only — GA support
+   * deferred). `share` is precomputed server-side so the panel
+   * doesn't have to recompute the denominator on every render.
+   */
+  async fetchCountries(
+    userId: string,
+    projectId: string,
+    dateFrom: string,
+    dateTo: string,
+    limit = 50,
+  ): Promise<OverviewCountriesResponse> {
+    this.logger.log(
+      `\n  ► fetchCountries  projectId=${projectId} ${dateFrom}→${dateTo}  limit=${limit}`,
+    )
+
+    const provider = await this.pickTrafficProvider(userId, projectId)
+    if (!provider) return { countries: [], provider: null }
+    if (provider.type === 'google_analytics') {
+      // GA exposes geoip via `country` dimension but the panel uses
+      // ISO-2 codes for flag rendering; map-from-display-name is
+      // ambiguous (UK vs GB, USA vs US, etc.). Deferred until we add
+      // a GA-native countries query.
+      return { countries: [], provider: 'google_analytics' }
+    }
+
+    try {
+      const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+      if (!ph) return { countries: [], provider: 'posthog' }
+
+      const rows = await fetchPosthogCountriesList(
+        ph,
+        dateFrom,
+        dateTo,
+        limit,
+        this.logger,
+      )
+      const totalVisitors = rows.reduce((sum, r) => sum + r.visitors, 0)
+      const countries: OverviewCountry[] = rows.map(r => ({
+        countryCode: r.countryCode,
+        countryName: r.countryName,
+        visitors: r.visitors,
+        share: totalVisitors > 0 ? r.visitors / totalVisitors : 0,
+      }))
+      return { countries, provider: 'posthog' }
+    } catch (err) {
+      this.logger.warn(`fetchCountries PostHog error: ${String(err)}`)
+      return { countries: [], provider: 'posthog' }
     }
   }
 
