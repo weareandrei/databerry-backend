@@ -155,54 +155,51 @@ export class SentryOAuthService {
         return errorRedirect('token_exchange')
       }
 
-      // Step 4b — verify the install AND resolve the org slug in one
-      // shot, via a `PUT /sentry-app-installations/{id}/` with
-      // `{ status: 'installed' }`.
+      // Step 4b — resolve the org slug via a plain GET on the
+      // install-details endpoint. Now that "Verify install" is
+      // unchecked in Sentry's integration settings, the install
+      // auto-completes during the OAuth code exchange and the
+      // access token's full scopes (`org:read`, `event:read`) are
+      // immediately available — so a GET with Bearer works.
       //
-      // Why this is necessary: our integration is configured with
-      // "Verify install" enabled (the default for Public Integrations).
-      // Until we PUT status='installed', Sentry leaves the
-      // installation in "Pending" — visible in their UI as
-      // "<Integration> - Pending" — and clips the access token's
-      // permissions enough that other lookup calls return 401/403.
-      //
-      // Failed attempts logged here so the next person doesn't repeat:
-      //   1. GET /sentry-app-installations/{id}/ + Bearer<user-token> → 403
-      //      (token's `org:read` scope ≠ installation metadata access)
-      //   2. GET /organizations/                  + Bearer<user-token> → 403
-      //      (the install token isn't a user token; no user context
-      //      to enumerate orgs from)
-      //   3. GET /sentry-app-installations/{id}/ + Basic<client_id:secret> → 401
-      //      (Sentry doesn't accept HTTP Basic on this endpoint)
-      //
-      // The PUT verify call doubles as the metadata fetch: Sentry
-      // returns the installation row in the response body, including
-      // `organization.slug` — saves us a follow-up GET.
-      const verifyRes = await fetch(
+      // History — every other variant we tried, and WHY it didn't
+      // work, so the next person doesn't repeat any of them:
+      //   1. GET /sentry-app-installations/{id}/ + Bearer<user-token>
+      //      → 403 WHILE install was Pending. Install in Pending
+      //        clipped the token's permissions. Fixed by unchecking
+      //        "Verify install" in Sentry (NOT by code).
+      //   2. GET /organizations/ + Bearer<user-token>
+      //      → 403. `/organizations/` is a *user-context* listing;
+      //        an installation token has no user identity to
+      //        enumerate orgs from.
+      //   3. GET /sentry-app-installations/{id}/ + Basic<client_id:secret>
+      //      → 401. Sentry doesn't accept HTTP Basic on this
+      //        endpoint, regardless of install state.
+      //   4. PUT /sentry-app-installations/{id}/ {status:'installed'}
+      //      + Bearer<user-token>
+      //      → 401 ONCE the install is already 'installed'. The PUT
+      //        only succeeds when the install is in Pending state.
+      //        With "Verify install" off in Sentry's settings, every
+      //        install auto-completes — so this PUT is always against
+      //        an already-installed row.
+      const installRes = await fetch(
         `${this.baseApi}/sentry-app-installations/${installationId}/`,
-        {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${tokens.token}`,
-          },
-          body: JSON.stringify({ status: 'installed' }),
-        },
+        { headers: { Authorization: `Bearer ${tokens.token}` } },
       )
-      if (!verifyRes.ok) {
-        const detail = await verifyRes.text().catch(() => '')
+      if (!installRes.ok) {
+        const detail = await installRes.text().catch(() => '')
         this.logger.error(
-          `Sentry install verify failed (${verifyRes.status}): ${detail.slice(0, 200)}`,
+          `Sentry install lookup failed (${installRes.status}): ${detail.slice(0, 200)}`,
         )
         return errorRedirect('account_resolve')
       }
-      const installData = (await verifyRes.json()) as {
+      const installData = (await installRes.json()) as {
         organization?: { slug: string }
       }
       const orgSlug = installData.organization?.slug
       if (!orgSlug) {
         this.logger.error(
-          'Sentry install verify response missing organization.slug',
+          'Sentry install lookup response missing organization.slug',
         )
         return errorRedirect('account_resolve')
       }
