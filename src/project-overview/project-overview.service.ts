@@ -875,28 +875,35 @@ export class ProjectOverviewService {
 
   /**
    * Helper: sum stripe revenue across every Stripe connection (manual or
-   * Connect) explicitly assigned to this project (`project_id = projectId`).
+   * Connect) eligible for this project. "Eligible" = `project_id = :projectId`
+   * OR `project_id IS NULL` (Common, shared across all projects).
    *
-   * Common (`project_id IS NULL`) connections are NOT included — same
-   * data-leak rationale as `pickTrafficProvider`: a single Common Stripe
-   * connection would otherwise contribute IDENTICAL revenue totals to
-   * every project's overview, with the user having no idea why their
-   * three projects all show the same $X. If the user wants one Stripe
-   * connection to power multiple projects, they create one connection
-   * per project (each with its own product filter — that's the only
-   * sane way to split a single Stripe account's revenue across multiple
-   * project dashboards anyway).
+   * NOTE on the Common include (unlike `pickTrafficProvider` which now
+   * excludes Common): Stripe doesn't have the per-domain mixing problem
+   * that the traffic providers do — Stripe charges are inherently
+   * account-scoped (one Stripe account = one set of charges), and the
+   * per-account dedup below (`accountsCoveredUnfiltered`) keeps two
+   * Common-scoped connections pointing at the same Stripe account from
+   * double-counting. More importantly, the per-tile Stripe views
+   * (`stripe_gross`, `stripe_gross_today`, MRR, Top Customers) fetch
+   * via `connection_id` directly and ignore project scoping entirely —
+   * if we filtered Common out HERE, the overview chart's revenue line
+   * would silently disagree with every Stripe tile sitting next to it
+   * on the same project page ($0 chart vs $1,781 tile). Matching the
+   * tile behaviour wins over strict scoping for Stripe; users who
+   * want strict per-project Stripe revenue can split a single account
+   * into multiple connections with product filters (the storage layer
+   * already supports that — see comment below).
    *
    * Reads from Supabase (`stripe_charges` + optionally `stripe_line_items`),
-   * NOT the live Stripe API. Each connection's per-connection product
-   * filter is honoured — two connections for the same Stripe account
-   * filtered to different product subsets contribute different amounts
-   * to the same project (sum of both is the project's total). Two
-   * connections pointing at the same account with NO product filter
-   * produce duplicate rows for every charge — to avoid this, we dedup
-   * by `stripe_account_id` within the unfiltered set: only the first
-   * unfiltered connection per account contributes its rows. Filtered
-   * connections always contribute.
+   * NOT the live Stripe API. Each eligible connection's per-connection
+   * product filter is honoured — two connections for the same Stripe account
+   * filtered to different product subsets contribute different amounts to
+   * the same project (sum of both is the project's total). Two connections
+   * pointing at the same account with NO product filter produce duplicate
+   * rows for every charge — to avoid this, we dedup by `stripe_account_id`
+   * within the unfiltered set: only the first unfiltered connection per
+   * account contributes its rows. Filtered connections always contribute.
    */
   private async fetchStripeRevenueForProject(
     userId: string,
@@ -912,7 +919,7 @@ export class ProjectOverviewService {
       .select('id, type, project_id')
       .eq('user_id', userId)
       .in('type', ['stripe_manual', 'stripe'])
-      .eq('project_id', projectId)
+      .or(`project_id.eq.${projectId},project_id.is.null`)
 
     if (!conns || conns.length === 0) return []
 
@@ -957,6 +964,30 @@ export class ProjectOverviewService {
   /**
    * Assign GA source rows (keyed by gaKey) into the bucket grid.
    * When `providerType === 'posthog'`, interpret `bucketKey` using PostHog formats instead.
+   *
+   * Keying rule (must mirror `fetchSources`):
+   *   - Known integrations (`x`, `google`, `reddit`, …) use the
+   *     normalized key verbatim.
+   *   - The `'other'` catch-all is re-keyed PER DOMAIN as
+   *     `other:<lowercased-raw-source>` so each unknown referrer
+   *     becomes its own segment instead of being summed into a single
+   *     opaque "other" bar.
+   *
+   * Why this matters: the frontend's `assignChartColors` ranks
+   * source keys by total value to pick the red→orange→yellow palette
+   * (biggest = red). If every unknown collapsed into one `'other'`
+   * key, the chart would compare `'other'` (= sum of every unknown
+   * domain) against individual brand keys like `'x'` — and end up
+   * showing `x.com` as red while the actual biggest source (e.g.
+   * `tinylaunch.com`, hiding inside the merged `'other'` totals)
+   * rendered as a generic grey segment. The sources panel already
+   * re-keys per domain (see `fetchSources`), so the panel + chart
+   * disagreed about which source deserved which colour.
+   *
+   * The `'unset'` key (for GA's `(not set)` / PostHog `Not set`
+   * sentinels) is deliberately NOT split per domain — those are all
+   * "we don't know where this came from", and lumping them under a
+   * single row matches `normalizeSource`'s own contract.
    */
   private assignSourceRows(
     buckets: Bucket[],
@@ -980,10 +1011,15 @@ export class ProjectOverviewService {
       const idx = keyIndex.get(r.bucketKey)
       if (idx === undefined) continue
       const n = normalizeSource(r.source)
+      // Per-domain split for the `other` catch-all (see docstring).
+      const groupKey =
+        n.key === 'other'
+          ? `other:${(r.source ?? '').trim().toLowerCase() || 'other'}`
+          : n.key
       totals[idx] += r.value
-      const existing = sources[idx].get(n.key)
+      const existing = sources[idx].get(groupKey)
       if (existing) existing.value += r.value
-      else sources[idx].set(n.key, { label: n.label, color: n.color, value: r.value })
+      else sources[idx].set(groupKey, { label: n.label, color: n.color, value: r.value })
     }
   }
 

@@ -41,6 +41,10 @@ const LIVE_VALUE_TYPES = new Set([
 type ChartMode = 'daily' | 'weekly' | 'monthly'
 
 const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+const MONTH_LABELS = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+]
 
 /**
  * Stripe view endpoints — Supabase-backed read layer. The actual Stripe API
@@ -260,6 +264,15 @@ export class StripeViewsService {
         const truncate = from === todayStr
         return bucketByHour(rows, from, truncate)
       }
+      // Monthly mode buckets to ~5 weekly bars (labelled "May 1", "May 8"
+      // …) instead of 30-something day labels — those collapsed into an
+      // unreadable "Fri Sun Thu Wed Mon Tue Wed…" mush on a chart that's
+      // only ~600px wide. `weekly` still falls through to the per-day
+      // labels below (7 bars, one per weekday — readable on a week
+      // range).
+      if (mode === 'monthly') {
+        return bucketByWeek(rows, from, to)
+      }
       return bucketByDayLabels(rows, from, to)
     }
 
@@ -361,6 +374,45 @@ function bucketByDayLabels(rows: ChargeRow[], dateFrom: string, dateTo: string):
     const d = new Date(start)
     d.setUTCDate(start.getUTCDate() + i)
     return { label: DAY_LABELS[d.getUTCDay()], value }
+  })
+}
+
+/**
+ * Bucket charges into weekly bars for monthly mode. Week boundaries
+ * anchor at `dateFrom` — i.e. May 1–31 splits as [May 1–7, May 8–14,
+ * May 15–21, May 22–28, May 29–31] rather than aligning to ISO weeks
+ * (Mon-Sun). Anchoring at `dateFrom` keeps the bar count predictable
+ * (`Math.ceil(numDays / 7)` = 4 or 5) and the labels readable ("May 1",
+ * "May 8" …) regardless of which weekday the month starts on.
+ *
+ * The last bucket can be partial — for May 2026 (31 days) the May
+ * 29 bar covers 3 days. That's intentional: the user can see the
+ * trailing window even when it's smaller, instead of awkward smoothing.
+ */
+function bucketByWeek(rows: ChargeRow[], dateFrom: string, dateTo: string): ChartPoint[] {
+  const start = new Date(`${dateFrom}T00:00:00Z`)
+  const end = new Date(`${dateTo}T00:00:00Z`)
+  const numDays =
+    Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1
+  const numWeeks = Math.max(1, Math.ceil(numDays / 7))
+
+  const buckets = new Array<number>(numWeeks).fill(0)
+  for (const r of rows) {
+    const d = new Date(r.created)
+    const dayIndex = Math.floor(
+      (Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) -
+        Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate())) /
+        (1000 * 60 * 60 * 24),
+    )
+    if (dayIndex < 0 || dayIndex >= numDays) continue
+    const weekIndex = Math.floor(dayIndex / 7)
+    buckets[weekIndex] += r.amount
+  }
+
+  return buckets.map((value, w) => {
+    const d = new Date(start)
+    d.setUTCDate(start.getUTCDate() + w * 7)
+    return { label: `${MONTH_LABELS[d.getUTCMonth()]} ${d.getUTCDate()}`, value }
   })
 }
 
