@@ -5,11 +5,23 @@
  *   - 4 customers (vs 8) with new names so they don't collide with
  *     the previous batch
  *   - 9 plan steps (vs 25)
- *   - Spread over 21 days (vs 30)
+ *   - Spread over ~2-3 weeks
  *   - 2 active subscriptions (vs 5)
  *
  * Use it to top up an already-seeded account with additional activity
  * (different customers, different days) without doubling the volume.
+ *
+ * When re-running this script:
+ *   1. Replace the CUSTOMERS list with fresh names + emails (otherwise
+ *      Stripe creates duplicate customer rows — emails are not unique
+ *      keys for `customers.create`). The names below are unique to
+ *      each batch run; keep that convention.
+ *   2. Bump DAYS_BACK so the window spans roughly "last seed → today"
+ *      (`node test/manual/check-charge-dates.js` shows the most recent
+ *      charge date; subtract from today to size the window).
+ *   3. Trim PLAN so no step has `day > DAYS_BACK - 1` — otherwise the
+ *      Test Clock would have to advance into the future, which Stripe
+ *      doesn't allow.
  *
  * Run from the backend folder:
  *   node test/manual/stripe-test-charges-small.js
@@ -34,7 +46,7 @@ const PRODUCTS = {
   SUB: 'prod_UQSfxHRqtKUI7l', // 15 RON / month
 }
 
-const DAYS_BACK = 21
+const DAYS_BACK = 16
 
 function fail(msg) {
   console.error(`✗ ${msg}`)
@@ -53,39 +65,41 @@ if (!SECRET_KEY.startsWith('sk_test_')) {
 
 const stripe = new Stripe(SECRET_KEY, { stripeAccount: CONNECTED_ACCOUNT })
 
-// Distinct from the original 8 (Alice/Bob/…) so the dedupe script can
-// tell the two batches apart — these emails are unique to this run.
+// Distinct from the original 8 (Alice/Bob/…) AND from the previous
+// small batch (Nora/Pavel/Yuki/Lucas) so the dedupe script can tell
+// each batch apart — these emails are unique to this run (2026-05-18
+// gap-fill, covering ~May 3 → May 18 since the last seed on May 2).
 const CUSTOMERS = [
-  { name: 'Nora Dragomir',     email: 'nora@test.example' },
-  { name: 'Pavel Ionescu',     email: 'pavel@test.example' },
-  { name: 'Yuki Tanaka',       email: 'yuki@test.example' },
-  { name: 'Lucas Marchetti',   email: 'lucas@test.example' },
+  { name: 'Maria Voinea',      email: 'maria@test.example' },
+  { name: 'Diego Costa',       email: 'diego@test.example' },
+  { name: 'Aiko Mori',         email: 'aiko@test.example' },
+  { name: 'Tomas Lindgren',    email: 'tomas@test.example' },
 ]
 
 /**
- * Plan summary:
- *   - Nora: subscribed early, two one-time buys (one of each price)
- *   - Pavel: one-time only, no sub
- *   - Yuki: subscribed mid-month, one one-time buy
- *   - Lucas: two one-time buys, no sub
+ * Plan summary (fits inside DAYS_BACK=16, so no step has day ≥ 16):
+ *   - Maria: subscribed early, two one-time buys (one of each price)
+ *   - Diego: one-time only, no sub
+ *   - Aiko:  subscribed mid-window, one one-time buy
+ *   - Tomas: two one-time buys, no sub
  *
- * → 2 active subs (Nora, Yuki) → +30 RON MRR on top of whatever's there
- * → 7 one-time charges spread over the 21-day window
+ * → 2 active subs (Maria, Aiko) → +30 RON MRR on top of whatever's there
+ * → 7 one-time charges spread over the 16-day window
  */
 const PLAN = [
-  // Nora — early subscriber + mixed buys
-  { day: 3,  who: 0, action: 'subscribe' },
-  { day: 8,  who: 0, action: 'buy41' },
-  { day: 16, who: 0, action: 'buy25' },
-  // Pavel — one-time only
-  { day: 5,  who: 1, action: 'buy25' },
-  { day: 14, who: 1, action: 'buy41' },
-  // Yuki — sub + one buy
-  { day: 9,  who: 2, action: 'subscribe' },
-  { day: 18, who: 2, action: 'buy25' },
-  // Lucas — couple of one-time buys
-  { day: 6,  who: 3, action: 'buy41' },
-  { day: 20, who: 3, action: 'buy25' },
+  // Maria — early subscriber + mixed buys
+  { day: 1,  who: 0, action: 'subscribe' },
+  { day: 4,  who: 0, action: 'buy41' },
+  { day: 10, who: 0, action: 'buy25' },
+  // Diego — one-time only
+  { day: 2,  who: 1, action: 'buy25' },
+  { day: 11, who: 1, action: 'buy41' },
+  // Aiko — sub + one buy
+  { day: 6,  who: 2, action: 'subscribe' },
+  { day: 13, who: 2, action: 'buy25' },
+  // Tomas — couple of one-time buys
+  { day: 5,  who: 3, action: 'buy41' },
+  { day: 14, who: 3, action: 'buy25' },
 ]
 
 async function waitForClockReady(clockId, { timeoutMs = 60_000, intervalMs = 1_000 } = {}) {

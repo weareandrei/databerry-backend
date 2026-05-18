@@ -107,3 +107,42 @@ export function phHourlyKeyInTz(date: Date, tz: string): string {
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : String(n)
 }
+
+/**
+ * For a single-day hourly chart (24 candidate buckets), how many of
+ * those buckets should we actually render?
+ *
+ *   - 24 for any date the user considers in the past.
+ *   - `(currentLocalHour + 1)` for the date the user considers
+ *     "today" in `tz` — so an event at 11pm local doesn't get clipped
+ *     just because UTC hasn't crossed midnight yet.
+ *
+ * The old hand-rolled `new Date().getUTCHours() + 1` silently cut off
+ * the trailing hours of the day for any user not in UTC. Concretely:
+ * a user in Europe/Bucharest at 23:40 local (= 20:40 UTC) saw the
+ * chart end at "8pm" and lost any events between 9pm-midnight; if
+ * the event source bucketed by local hour (PostHog with `toTimeZone`,
+ * for example) the right-hand bars simply vanished.
+ *
+ * `now` is parameterised for testability — production calls leave it
+ * defaulted to "wall clock at the moment of the request".
+ */
+export function hourlyBucketCount(
+  /** "YYYY-MM-DD" of the day being rendered (in the user's tz). */
+  dateStr: string,
+  tz: string,
+  now: Date = new Date(),
+): number {
+  const todayInTz = dateStrInTz(now, tz)
+  if (dateStr !== todayInTz) return 24
+  return fieldsInTz(now, tz).hour + 1
+}
+
+/**
+ * Hour-of-day (0..23) of `date` as observed in `tz`. Thin convenience
+ * wrapper around `fieldsInTz` for the common "bucket this UTC
+ * timestamp by user-local hour" pattern in chart builders.
+ */
+export function hourInTz(date: Date, tz: string): number {
+  return fieldsInTz(date, tz).hour
+}

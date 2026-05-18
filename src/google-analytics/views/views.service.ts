@@ -4,6 +4,7 @@ import { ViewsService } from '../../views/views.service'
 import { buildViewFetchContext } from '../../common/view-fetch-context'
 import { metricForViewType, fetchRealtimeActiveUsers, fetchTodayMetric } from './live/metrics'
 import { fetchMetricByBucket, type BucketGranularity } from './live/sources'
+import { hourlyBucketCount } from '../../common/tz'
 
 type ChartMode = 'daily' | 'weekly' | 'monthly'
 
@@ -139,7 +140,7 @@ export class GoogleAnalyticsViewsService {
     //   hourly → "YYYYMMDDHH" (e.g. "2026050614")
     //   daily  → "YYYYMMDD"   (e.g. "20260506")
     const points = granularity === 'hourly'
-      ? bucketHourlyByGAKey(rows, from)
+      ? bucketHourlyByGAKey(rows, from, tz)
       : bucketDailyByGAKey(rows, from, to)
 
     return { points }
@@ -147,24 +148,30 @@ export class GoogleAnalyticsViewsService {
 }
 
 /**
- * Convert GA hourly rows (bucketKey="YYYYMMDDHH") into 24 ordered points
+ * Convert GA hourly rows (bucketKey="YYYYMMDDHH") into ordered points
  * with `12am`/`1am`/.../`11pm` labels — matches the Stripe hourly chart
  * output so `<ViewCardChart>` renders identically.
+ *
+ * Truncation uses the user's tz so the "no future bars" boundary matches
+ * the wall clock the user is looking at. The GA hour digits themselves
+ * are in PROPERTY-tz (not user-tz) — `runReport` only respects the GA4
+ * property's configured timezone, with no per-request tz override. That
+ * means rows AND truncation may be off by `userTz - propertyTz` for the
+ * trailing/leading hour. The project-overview service already warns
+ * when those two zones differ; we accept the residual misalignment here
+ * for the same reason (full fix would require a `dateHourMinute`
+ * dimension + backend rebucketing — out of scope for this view).
  */
 function bucketHourlyByGAKey(
   rows: { bucketKey: string; value: number }[],
   dateStr: string,
+  tz: string,
 ): { label: string; value: number }[] {
-  const todayStr = new Date().toISOString().split('T')[0]
-  const isToday = dateStr === todayStr
-  // Stripe's hourly chart truncates to "current hour + 1" for today; mirror
-  // it so today renders the same up-to-now shape across providers.
-  const hoursInBucket = isToday ? new Date().getUTCHours() + 1 : 24
+  const hoursInBucket = hourlyBucketCount(dateStr, tz)
 
   const buckets = new Array<number>(hoursInBucket).fill(0)
   for (const r of rows) {
-    // Last two chars are the hour (UTC, per GA property tz — see caveat
-    // in `fetchChartData`'s docstring).
+    // Last two chars are the hour (in GA property tz — see docstring).
     const hour = parseInt(r.bucketKey.slice(-2), 10)
     if (!Number.isNaN(hour) && hour < hoursInBucket) buckets[hour] += r.value
   }

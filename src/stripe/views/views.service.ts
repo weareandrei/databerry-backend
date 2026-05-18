@@ -14,6 +14,7 @@ import {
   type TopCustomerRow,
 } from './storage-queries'
 import type { ChartPoint } from './stripe-api.helpers'
+import { hourInTz, hourlyBucketCount } from '../../common/tz'
 
 /**
  * View types backed by `fetchLiveValue`. Centralised so the dispatch check
@@ -245,7 +246,7 @@ export class StripeViewsService {
     if (viewType === 'stripe_gross_today') {
       const today = new Date().toISOString().split('T')[0]
       const { rows } = await this.fetchChargesForConnection(connectionId, userId, today, today, tz)
-      return bucketByHour(rows, today, /* truncateAtNow= */ true)
+      return bucketByHour(rows, today, /* truncateAtNow= */ true, tz)
     }
 
     if (viewType === 'stripe_gross_week') {
@@ -262,7 +263,7 @@ export class StripeViewsService {
 
       if (mode === 'daily' || (!mode && from === to)) {
         const truncate = from === todayStr
-        return bucketByHour(rows, from, truncate)
+        return bucketByHour(rows, from, truncate, tz)
       }
       // Monthly mode buckets to ~5 weekly bars (labelled "May 1", "May 8"
       // …) instead of 30-something day labels — those collapsed into an
@@ -332,15 +333,24 @@ export class StripeViewsService {
 // truncation behaviour) so the frontend is unchanged.
 // ────────────────────────────────────────────────────────────────────────────
 
-function bucketByHour(rows: ChargeRow[], dateStr: string, truncateAtNow: boolean): ChartPoint[] {
-  const todayStartUtc = new Date()
-  todayStartUtc.setUTCHours(0, 0, 0, 0)
-  const isToday = dateStr === todayStartUtc.toISOString().split('T')[0]
-  const hoursInBucket = truncateAtNow && isToday ? new Date().getUTCHours() + 1 : 24
+/**
+ * Bucket charges into 24 hourly bars labelled `12am`/`1am`/.../`11pm`.
+ * Hours, "today" detection, and the right-edge truncation all key off
+ * the user's `tz` — so a user in Europe/Bucharest at 23:40 local sees
+ * the chart extend to "11pm" with the late-night charges counted,
+ * instead of getting clipped at "8pm" (= UTC's current hour). The
+ * previous UTC-based implementation silently dropped any charges in
+ * the trailing `userOffset` hours of the day.
+ *
+ * `truncateAtNow=false` is the path used by historical-day fetches —
+ * past days always render the full 24 bars.
+ */
+function bucketByHour(rows: ChargeRow[], dateStr: string, truncateAtNow: boolean, tz: string): ChartPoint[] {
+  const hoursInBucket = truncateAtNow ? hourlyBucketCount(dateStr, tz) : 24
 
   const buckets = new Array<number>(hoursInBucket).fill(0)
   for (const r of rows) {
-    const hour = new Date(r.created).getUTCHours()
+    const hour = hourInTz(new Date(r.created), tz)
     if (hour < hoursInBucket) buckets[hour] += r.amount
   }
   return buckets.map((value, h) => ({ label: fmtHour(h), value }))
@@ -382,12 +392,20 @@ function bucketByDayLabels(rows: ChargeRow[], dateFrom: string, dateTo: string):
  * anchor at `dateFrom` — i.e. May 1–31 splits as [May 1–7, May 8–14,
  * May 15–21, May 22–28, May 29–31] rather than aligning to ISO weeks
  * (Mon-Sun). Anchoring at `dateFrom` keeps the bar count predictable
- * (`Math.ceil(numDays / 7)` = 4 or 5) and the labels readable ("May 1",
- * "May 8" …) regardless of which weekday the month starts on.
+ * (`Math.ceil(numDays / 7)` = 4 or 5) regardless of which weekday the
+ * month starts on.
+ *
+ * Labels are RANGES (`"May 1 – 7"`, `"May 22 – 28"`) so a user reading
+ * the chart understands "this bar is a week's worth of activity" — the
+ * previous single-date labels (`"May 15"`) read as "a payment on May 15"
+ * and got flagged for confusion. When a week straddles a month boundary
+ * the end side spells out the month (`"Apr 28 – May 4"`) so it's
+ * unambiguous; same-month weeks use the compact form.
  *
  * The last bucket can be partial — for May 2026 (31 days) the May
- * 29 bar covers 3 days. That's intentional: the user can see the
- * trailing window even when it's smaller, instead of awkward smoothing.
+ * 29–31 bar covers 3 days. The label honours the actual end (capped at
+ * `dateTo`), not start+6 — so the user sees the true window, never a
+ * label promising days that aren't there.
  */
 function bucketByWeek(rows: ChargeRow[], dateFrom: string, dateTo: string): ChartPoint[] {
   const start = new Date(`${dateFrom}T00:00:00Z`)
@@ -410,9 +428,23 @@ function bucketByWeek(rows: ChargeRow[], dateFrom: string, dateTo: string): Char
   }
 
   return buckets.map((value, w) => {
-    const d = new Date(start)
-    d.setUTCDate(start.getUTCDate() + w * 7)
-    return { label: `${MONTH_LABELS[d.getUTCMonth()]} ${d.getUTCDate()}`, value }
+    const bucketStart = new Date(start)
+    bucketStart.setUTCDate(start.getUTCDate() + w * 7)
+    // End = start + 6 days, but clamp to `end` so the LAST (partial)
+    // week reads "May 29 – 31" instead of falsely promising "May 29 – Jun 4".
+    const naiveEnd = new Date(bucketStart)
+    naiveEnd.setUTCDate(bucketStart.getUTCDate() + 6)
+    const bucketEnd = naiveEnd.getTime() > end.getTime() ? end : naiveEnd
+
+    const sameMonth = bucketStart.getUTCMonth() === bucketEnd.getUTCMonth()
+    const startLabel = `${MONTH_LABELS[bucketStart.getUTCMonth()]} ${bucketStart.getUTCDate()}`
+    const endLabel = sameMonth
+      ? String(bucketEnd.getUTCDate())
+      : `${MONTH_LABELS[bucketEnd.getUTCMonth()]} ${bucketEnd.getUTCDate()}`
+    // En-dash (–) rather than hyphen (-) reads better in number-range
+    // labels at small font sizes. Matches the typographic convention
+    // used elsewhere in the app's date headers.
+    return { label: `${startLabel} – ${endLabel}`, value }
   })
 }
 

@@ -26,6 +26,7 @@ import {
   type RetentionRow,
 } from './live/retention'
 import { fetchPosthogUsersList, type PosthogUserRow } from './live/users'
+import { hourlyBucketCount } from '../../common/tz'
 
 interface LoadedView {
   config: Record<string, unknown>
@@ -234,7 +235,7 @@ export class PosthogViewsService {
     const rows = json.results ?? []
 
     const points = isSingleDay
-      ? bucketHourly(rows as [number, number][], from)
+      ? bucketHourly(rows as [number, number][], from, tzLit)
       : bucketDaily(rows as [string, number][], from, to)
 
     return { points }
@@ -337,19 +338,25 @@ export class PosthogViewsService {
 const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
 /**
- * Convert PostHog hourly rows ([hourOfDay, count]) into 24 ordered points
+ * Convert PostHog hourly rows ([hourOfDay, count]) into ordered points
  * with `12am`/`1am`/.../`11pm` labels. Mirrors the Stripe + GA hourly chart
  * shape so `<ViewCardChart>` renders identically across providers. For
- * "today" we truncate to current-hour-plus-one (matches the Stripe chart's
- * "no future bars" behaviour).
+ * "today" we truncate to current-hour-plus-one (no future bars).
+ *
+ * `tz` matters: the HogQL query above buckets events by
+ * `toHour(toTimeZone(timestamp, tz))` — i.e. user-local hour. So
+ * truncation must also use user-local hour, otherwise the trailing
+ * hours of the day get clipped for any user outside UTC. The previous
+ * implementation used `new Date().getUTCHours()`, which silently cut
+ * off everything past UTC noon for a +12 user and past UTC midnight for
+ * a +N>0 user once their local time crossed into "tomorrow" UTC.
  */
 function bucketHourly(
   rows: [number, number][],
   dateStr: string,
+  tz: string,
 ): { label: string; value: number }[] {
-  const todayStr = new Date().toISOString().split('T')[0]
-  const isToday = dateStr === todayStr
-  const hoursInBucket = isToday ? new Date().getUTCHours() + 1 : 24
+  const hoursInBucket = hourlyBucketCount(dateStr, tz)
 
   const buckets = new Array<number>(hoursInBucket).fill(0)
   for (const [h, c] of rows) {
