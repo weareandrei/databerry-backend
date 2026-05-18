@@ -255,14 +255,33 @@ export class ProjectOverviewService {
    * Decides which connection provides traffic/sources for a user+project.
    *
    * Priority:
-   *   1. explicit user setting (only if eligible for this project — i.e.
-   *      scoped to it or Common)
-   *   2. GA connection for this project (project-specific > Common)
-   *   3. PostHog connection for this project (project-specific > Common)
-   *   4. null
+   *   1. explicit user setting (the one the user picked in Settings as
+   *      "my default traffic source"). May be Common — that's the
+   *      *intentional* opt-in path for "this connection powers every
+   *      project of mine."
+   *   2. A connection scoped to THIS project (`project_id = projectId`)
+   *      — GA first, then PostHog.
+   *   3. null → frontend renders the "No analytics tool connected yet"
+   *      empty state with a CTA to the in-place picker (which can then
+   *      reassign an existing Common connection to this project).
    *
-   * "Common" = `project_id IS NULL` — a connection shared across all of the
-   * user's projects. Project-specific connections beat Common.
+   * Notes on the "Common" (`project_id IS NULL`) escape hatch:
+   *
+   *   The old behaviour auto-fell-back to ANY Common GA / PostHog
+   *   connection in step 2 (`.or('project_id.eq.X,project_id.is.null')`).
+   *   That silently leaked data across projects: PostHog has no per-
+   *   domain filter in our HogQL queries (events are commingled across
+   *   every site that points at the same PH project), so a single Common
+   *   PostHog showed IDENTICAL totals on every project's overview tab.
+   *   Users — quite reasonably — read "no GA connected" as "no data"
+   *   and were confused to see numbers anyway.
+   *
+   *   We now require an EXPLICIT decision per project. A Common
+   *   connection can still serve all projects via the preferred-setting
+   *   path (step 1) — but never by accident. The OAuth callback still
+   *   creates new GA/PostHog connections as Common; the user's next
+   *   step is to assign them via the TrafficConnectionPicker (which
+   *   already exists for the empty-state CTA).
    */
   private async pickTrafficProvider(
     userId: string,
@@ -270,32 +289,33 @@ export class ProjectOverviewService {
   ): Promise<TrafficProvider | null> {
     const settings = await this.userSettingsService.get(userId)
     const client = this.supabaseService.getClient()
-    const scopeFilter = `project_id.eq.${projectId},project_id.is.null`
 
     if (settings.preferredTrafficConnectionId) {
+      // Honour the historical scope rule — the preferred may be scoped
+      // to this project OR Common (the user explicitly chose "use this
+      // one everywhere"). Project-scoped-to-a-different-project is
+      // excluded by the `.or` filter.
       const { data } = await client
         .from('connections')
         .select('id, type, project_id')
         .eq('id', settings.preferredTrafficConnectionId)
         .eq('user_id', userId)
-        .or(scopeFilter)
+        .or(`project_id.eq.${projectId},project_id.is.null`)
         .maybeSingle()
       if (data && (data.type === 'google_analytics' || data.type === 'posthog')) {
         return { type: data.type as 'google_analytics' | 'posthog', connectionId: data.id as string }
       }
     }
 
-    // For each supported provider type, prefer a project-specific connection
-    // over Common. `.order(project_id desc, nullsFirst: false)` puts non-null
-    // (project-specific) rows first.
+    // Strict project-specific lookup. No `.or(project_id.is.null)` —
+    // see the docstring above for why Common is no longer an auto-pick.
     for (const type of ['google_analytics', 'posthog'] as const) {
       const { data } = await client
         .from('connections')
         .select('id, project_id')
         .eq('user_id', userId)
         .eq('type', type)
-        .or(scopeFilter)
-        .order('project_id', { ascending: false, nullsFirst: false })
+        .eq('project_id', projectId)
         .limit(1)
         .maybeSingle()
       if (data) return { type, connectionId: data.id as string }
@@ -855,18 +875,28 @@ export class ProjectOverviewService {
 
   /**
    * Helper: sum stripe revenue across every Stripe connection (manual or
-   * Connect) eligible for this project. "Eligible" = `project_id = :projectId`
-   * OR `project_id IS NULL` (Common, shared across all projects).
+   * Connect) explicitly assigned to this project (`project_id = projectId`).
+   *
+   * Common (`project_id IS NULL`) connections are NOT included — same
+   * data-leak rationale as `pickTrafficProvider`: a single Common Stripe
+   * connection would otherwise contribute IDENTICAL revenue totals to
+   * every project's overview, with the user having no idea why their
+   * three projects all show the same $X. If the user wants one Stripe
+   * connection to power multiple projects, they create one connection
+   * per project (each with its own product filter — that's the only
+   * sane way to split a single Stripe account's revenue across multiple
+   * project dashboards anyway).
    *
    * Reads from Supabase (`stripe_charges` + optionally `stripe_line_items`),
-   * NOT the live Stripe API. Each eligible connection's per-connection
-   * product filter is honoured — two connections for the same Stripe account
-   * filtered to different product subsets contribute different amounts to
-   * the same project (sum of both is the project's total). Two connections
-   * pointing at the same account with NO product filter produce duplicate
-   * rows for every charge — to avoid this, we dedup by `stripe_account_id`
-   * within the unfiltered set: only the first unfiltered connection per
-   * account contributes its rows. Filtered connections always contribute.
+   * NOT the live Stripe API. Each connection's per-connection product
+   * filter is honoured — two connections for the same Stripe account
+   * filtered to different product subsets contribute different amounts
+   * to the same project (sum of both is the project's total). Two
+   * connections pointing at the same account with NO product filter
+   * produce duplicate rows for every charge — to avoid this, we dedup
+   * by `stripe_account_id` within the unfiltered set: only the first
+   * unfiltered connection per account contributes its rows. Filtered
+   * connections always contribute.
    */
   private async fetchStripeRevenueForProject(
     userId: string,
@@ -882,7 +912,7 @@ export class ProjectOverviewService {
       .select('id, type, project_id')
       .eq('user_id', userId)
       .in('type', ['stripe_manual', 'stripe'])
-      .or(`project_id.eq.${projectId},project_id.is.null`)
+      .eq('project_id', projectId)
 
     if (!conns || conns.length === 0) return []
 

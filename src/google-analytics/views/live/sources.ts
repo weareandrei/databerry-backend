@@ -1,9 +1,16 @@
+import { Logger } from '@nestjs/common'
 import {
   IntegrationReauthRequiredException,
   IntegrationUpstreamException,
 } from '../../../common/integration-errors'
+import {
+  fmtOp,
+  fmtUpstreamFailure,
+  truncate,
+} from '../../../common/log-helpers'
 
 const DATA_BASE = 'https://analyticsdata.googleapis.com/v1beta'
+const logger = new Logger('GoogleAnalyticsDataAPI')
 
 export type BucketGranularity = 'hourly' | 'daily'
 
@@ -15,10 +22,17 @@ export interface SourceBucketRow {
 
 /**
  * Translate non-OK responses into the structured integration exceptions.
- * 401/403 → user must reconnect; everything else → upstream error. See
- * `metrics.ts` for the rationale; the previous code wrapped EVERY non-OK
- * as `UnauthorizedException`, which made transient property/quota errors
- * look like auth failures to the frontend.
+ *   401, or 403 without SERVICE_DISABLED → reauth required.
+ *   403 with SERVICE_DISABLED → Data API not enabled in the Cloud
+ *     project. NOT a credential issue (reconnecting won't fix it) —
+ *     surface as upstream + emit a one-line actionable log with the
+ *     activation URL. See `metrics.ts` for the full rationale and the
+ *     Admin-vs-Data API split.
+ *   Everything else → upstream error.
+ *
+ * The previous code wrapped EVERY non-OK as `UnauthorizedException`,
+ * which made transient property/quota errors look like auth failures
+ * to the frontend.
  */
 async function throwForResponse(
   connectionId: string,
@@ -26,17 +40,37 @@ async function throwForResponse(
   context: string,
 ): Promise<never> {
   const body = await res.text().catch(() => '')
+
+  if (res.status === 403 && body.includes('SERVICE_DISABLED')) {
+    const activationUrl = body.match(
+      /https:\/\/console\.developers\.google\.com\/apis\/api\/[^"\s]+/,
+    )?.[0]
+    logger.warn(
+      fmtOp('GA Data API is disabled in the OAuth Cloud project', {
+        connectionId,
+        context,
+        ...(activationUrl ? { enableAt: activationUrl } : {}),
+      }),
+    )
+    throw new IntegrationUpstreamException(
+      'google_analytics',
+      connectionId,
+      `${context}: Data API not enabled. Enable at: ${activationUrl ?? 'https://console.cloud.google.com/apis/library/analyticsdata.googleapis.com'}`,
+    )
+  }
+
+  logger.warn(fmtUpstreamFailure(context, res.status, body, { connectionId }))
   if (res.status === 401 || res.status === 403) {
     throw new IntegrationReauthRequiredException(
       'google_analytics',
       connectionId,
-      `${context}: ${body.slice(0, 200)}`,
+      `${context}: ${truncate(body, 200)}`,
     )
   }
   throw new IntegrationUpstreamException(
     'google_analytics',
     connectionId,
-    `${context} (${res.status}): ${body.slice(0, 200)}`,
+    `${context} (${res.status}): ${truncate(body, 200)}`,
   )
 }
 

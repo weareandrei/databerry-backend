@@ -15,14 +15,17 @@ export class GoogleAnalyticsPropertiesService {
   async getProperties(connectionId: string, userId: string): Promise<GAProperty[]> {
     await this.oauthService.verifyOwnership(connectionId, userId)
     const token = await this.oauthService.ensureFreshToken(connectionId)
-    return this.oauthService.listPropertiesWithToken(token)
+    return this.oauthService.listPropertiesWithToken(token, { userId, connectionId })
   }
 
   async saveProperty(connectionId: string, propertyId: string, userId: string): Promise<void> {
     await this.oauthService.verifyOwnership(connectionId, userId)
     const token = await this.oauthService.ensureFreshToken(connectionId)
 
-    const properties = await this.oauthService.listPropertiesWithToken(token)
+    const properties = await this.oauthService.listPropertiesWithToken(token, {
+      userId,
+      connectionId,
+    })
     const prop = properties.find(p => p.id === propertyId)
     if (!prop) throw new NotFoundException(`Property ${propertyId} not found or not accessible`)
 

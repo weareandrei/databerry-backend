@@ -12,6 +12,11 @@ import {
   encryptForUser,
   isEncrypted,
 } from '../../common/crypto/encryption'
+import {
+  fmtFailure,
+  fmtOp,
+  fmtUpstreamFailure,
+} from '../../common/log-helpers'
 
 /**
  * Sentry's OAuth flow is shaped a bit differently from Calendly /
@@ -136,7 +141,10 @@ export class SentryOAuthService {
       if (!tokenRes.ok) {
         const body = await tokenRes.text().catch(() => '')
         this.logger.error(
-          `Sentry token exchange failed (${tokenRes.status}): ${body.slice(0, 200)}`,
+          fmtUpstreamFailure('Sentry token exchange', tokenRes.status, body, {
+            userId,
+            installationId,
+          }),
         )
         return errorRedirect('token_exchange')
       }
@@ -189,7 +197,10 @@ export class SentryOAuthService {
       if (!installRes.ok) {
         const detail = await installRes.text().catch(() => '')
         this.logger.error(
-          `Sentry install lookup failed (${installRes.status}): ${detail.slice(0, 200)}`,
+          fmtUpstreamFailure('Sentry install lookup', installRes.status, detail, {
+            userId,
+            installationId,
+          }),
         )
         return errorRedirect('account_resolve')
       }
@@ -213,7 +224,7 @@ export class SentryOAuthService {
 
       if (connErr) {
         this.logger.error(
-          `Sentry: failed to create connection row for user ${userId}: ${connErr.message}`,
+          fmtFailure('Sentry create connection row', connErr, { userId }),
         )
         return errorRedirect('credentials_save')
       }
@@ -229,13 +240,22 @@ export class SentryOAuthService {
 
       if (credErr) {
         this.logger.error(
-          `Sentry: failed to insert credentials for connection ${conn.id}: ${credErr.message}`,
+          fmtFailure('Sentry insert credentials', credErr, {
+            userId,
+            connectionId: conn.id,
+          }),
         )
         await client.from('connections').delete().eq('id', conn.id)
         return errorRedirect('credentials_save')
       }
 
-      this.logger.log(`Sentry connected for user ${userId}, org ${orgSlug}`)
+      this.logger.log(
+        fmtOp('Sentry connected', {
+          userId,
+          connectionId: conn.id,
+          orgSlug,
+        }),
+      )
       return `${this.frontendUrl}/hub/connections?sentry=connected`
     } finally {
       await client.from('sentry_oauth_state').delete().eq('state', state)

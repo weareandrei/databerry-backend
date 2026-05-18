@@ -3,9 +3,36 @@ import {
   IntegrationReauthRequiredException,
   IntegrationUpstreamException,
 } from '../../../common/integration-errors'
+import {
+  fmtOp,
+  fmtUpstreamFailure,
+  truncate,
+} from '../../../common/log-helpers'
 
 const DATA_BASE = 'https://analyticsdata.googleapis.com/v1beta'
 const logger = new Logger('GoogleAnalyticsDataAPI')
+
+/**
+ * Google returns a 403 with `reason: "SERVICE_DISABLED"` when the Data
+ * API (`analyticsdata.googleapis.com`) is not enabled in the Cloud project
+ * that owns the OAuth client. This is DIFFERENT from the Admin API
+ * (`analyticsadmin.googleapis.com`) — they're enabled separately, so a
+ * user who enabled Admin (so they could pick a property) often still
+ * hits this on the first dashboard load.
+ *
+ * Crucially, this is NOT a credential problem — reconnecting the
+ * integration won't fix it; the user needs to click "Enable" in the
+ * Google Cloud Console. Surfacing it as `IntegrationReauthRequired`
+ * (the old behaviour) was misleading them into an OAuth re-dance that
+ * landed them right back in the same broken state.
+ */
+function isServiceDisabledBody(body: string): boolean {
+  return body.includes('SERVICE_DISABLED')
+}
+
+function extractActivationUrl(body: string): string | undefined {
+  return body.match(/https:\/\/console\.developers\.google\.com\/apis\/api\/[^"\s]+/)?.[0]
+}
 
 /**
  * Maps a GA view type to the GA Data API metric name.
@@ -25,12 +52,20 @@ export function metricForViewType(viewType: string): string {
 
 /**
  * Translate a non-OK response from the GA Data API into the right
- * structured exception. 401/403 → user must reconnect (refresh succeeded
- * but the granted access is gone, e.g. revoked at the property level).
- * Anything else → upstream failure: 404 (property not found), 429 (quota),
- * 5xx (Google outage). Calling these "Unauthorized" — as the previous code
- * did — was misleading the frontend into showing reauth UX for transient
- * problems that reconnecting wouldn't fix.
+ * structured exception.
+ *   401, or 403 without SERVICE_DISABLED → real auth failure; user must
+ *     reconnect (refresh succeeded but the granted access is gone, e.g.
+ *     property revoked).
+ *   403 with SERVICE_DISABLED → Data API not enabled in the Cloud
+ *     project. NOT a credential issue — surface as upstream so the
+ *     frontend doesn't render the misleading "Reconnect" banner.
+ *   Anything else → upstream failure: 404 (property not found), 429
+ *     (quota), 5xx (Google outage).
+ *
+ * Calling everything "Unauthorized" — as the very first version of this
+ * code did — flooded the frontend with reauth UX for transient
+ * problems that reconnecting wouldn't fix. This is the second pass at
+ * that classification.
  */
 async function throwForResponse(
   connectionId: string,
@@ -38,23 +73,40 @@ async function throwForResponse(
   context: string,
 ): Promise<never> {
   const body = await res.text().catch(() => '')
-  // Log here so the Google response body lands in the GA log stream alongside
-  // ensureFreshToken's logs — instead of relying on whichever upstream filter
-  // happens to print the exception message.
+
+  if (res.status === 403 && isServiceDisabledBody(body)) {
+    const activationUrl = extractActivationUrl(body)
+    // Single actionable log line — the user (reading Railway logs) sees
+    // exactly what's broken and where to fix it without parsing the
+    // Google JSON. Same shape as the Admin API hint in `connection/oauth.ts`.
+    logger.warn(
+      fmtOp('GA Data API is disabled in the OAuth Cloud project', {
+        connectionId,
+        context,
+        ...(activationUrl ? { enableAt: activationUrl } : {}),
+      }),
+    )
+    throw new IntegrationUpstreamException(
+      'google_analytics',
+      connectionId,
+      `${context}: Data API not enabled. Enable at: ${activationUrl ?? 'https://console.cloud.google.com/apis/library/analyticsdata.googleapis.com'}`,
+    )
+  }
+
   logger.warn(
-    `${context} for ${connectionId}: status=${res.status} body=${body.slice(0, 200)}`,
+    fmtUpstreamFailure(context, res.status, body, { connectionId }),
   )
   if (res.status === 401 || res.status === 403) {
     throw new IntegrationReauthRequiredException(
       'google_analytics',
       connectionId,
-      `${context}: ${body.slice(0, 200)}`,
+      `${context}: ${truncate(body, 200)}`,
     )
   }
   throw new IntegrationUpstreamException(
     'google_analytics',
     connectionId,
-    `${context} (${res.status}): ${body.slice(0, 200)}`,
+    `${context} (${res.status}): ${truncate(body, 200)}`,
   )
 }
 

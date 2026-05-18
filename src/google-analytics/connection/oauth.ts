@@ -12,6 +12,12 @@ import {
   encryptForUser,
   isEncrypted,
 } from '../../common/crypto/encryption'
+import {
+  fmtFailure,
+  fmtOp,
+  fmtUpstreamFailure,
+  type LogContext,
+} from '../../common/log-helpers'
 
 export interface GAProperty {
   id: string
@@ -90,7 +96,10 @@ export class GoogleAnalyticsOAuthService {
         }),
       })
       if (!tokenRes.ok) {
-        this.logger.error('GA token exchange failed', await tokenRes.text())
+        const body = await tokenRes.text().catch(() => '')
+        this.logger.error(
+          fmtUpstreamFailure('GA token exchange', tokenRes.status, body, { userId }),
+        )
         return errorRedirect('token_exchange')
       }
 
@@ -104,11 +113,9 @@ export class GoogleAnalyticsOAuthService {
 
       let properties: GAProperty[]
       try {
-        properties = await this.listPropertiesWithToken(tokens.access_token)
+        properties = await this.listPropertiesWithToken(tokens.access_token, { userId })
       } catch (err) {
-        this.logger.error(
-          `GA listProperties failed for user ${userId}: ${String(err)}`,
-        )
+        this.logger.error(fmtFailure('GA listProperties (post-OAuth)', err, { userId }))
         return errorRedirect('account_resolve')
       }
 
@@ -120,7 +127,7 @@ export class GoogleAnalyticsOAuthService {
 
       if (connErr) {
         this.logger.error(
-          `GA: failed to create connection row for user ${userId}: ${connErr.message}`,
+          fmtFailure('GA create connection row', connErr, { userId }),
         )
         return errorRedirect('credentials_save')
       }
@@ -142,14 +149,23 @@ export class GoogleAnalyticsOAuthService {
 
       if (credErr) {
         this.logger.error(
-          `GA: failed to insert credentials for connection ${conn.id}: ${credErr.message}`,
+          fmtFailure('GA insert credentials', credErr, {
+            userId,
+            connectionId: conn.id,
+          }),
         )
         // Roll back the parent row so we don't leave an orphan.
         await client.from('connections').delete().eq('id', conn.id)
         return errorRedirect('credentials_save')
       }
 
-      this.logger.log(`GA connected for user ${userId}, propertyId=${firstProperty?.id ?? 'none yet'}`)
+      this.logger.log(
+        fmtOp('GA connected', {
+          userId,
+          connectionId: conn.id,
+          propertyId: firstProperty?.id ?? 'none-yet',
+        }),
+      )
 
       if (!firstProperty && properties.length === 0) {
         return `${this.frontendUrl}/hub/connections?google_analytics=no-properties`
@@ -342,14 +358,41 @@ export class GoogleAnalyticsOAuthService {
     if (!data) throw new ConnectionMissingException('google_analytics', connectionId)
   }
 
-  async listPropertiesWithToken(token: string): Promise<GAProperty[]> {
+  /**
+   * Lists every GA4 property the bearer token has access to.
+   * `ctx` is logging-only — pass whatever identifiers the caller
+   * has (typically `{ userId, connectionId }`) so failures aren't
+   * orphaned. The function never throws: any failure logs and
+   * returns the partial results collected so far (or `[]`).
+   */
+  async listPropertiesWithToken(
+    token: string,
+    ctx: LogContext = {},
+  ): Promise<GAProperty[]> {
     const all: GAProperty[] = []
     try {
       const accRes = await fetch(`${ADMIN_BASE}/accounts`, {
         headers: { Authorization: `Bearer ${token}` },
       })
       if (!accRes.ok) {
-        this.logger.warn('Failed to list GA accounts: ' + (await accRes.text()))
+        const body = await accRes.text().catch(() => '')
+        this.logger.warn(
+          fmtUpstreamFailure('list GA accounts', accRes.status, body, ctx),
+        )
+        // Special-case the "Admin API not enabled in this Cloud
+        // project" 403 — Google's error body has a stable
+        // `reason: SERVICE_DISABLED` + an `activationUrl`. Surface
+        // a one-line actionable hint so a user reading Railway
+        // logs doesn't have to parse the JSON to know the fix.
+        if (accRes.status === 403 && body.includes('SERVICE_DISABLED')) {
+          const activationUrl = body.match(/https:\/\/console\.developers\.google\.com\/apis\/api\/[^"\s]+/)?.[0]
+          this.logger.warn(
+            fmtOp('GA Admin API is disabled in the OAuth Cloud project', {
+              ...ctx,
+              ...(activationUrl ? { enableAt: activationUrl } : {}),
+            }),
+          )
+        }
         return []
       }
       const accData = (await accRes.json()) as { accounts?: { name: string }[] }
@@ -359,7 +402,16 @@ export class GoogleAnalyticsOAuthService {
           `${ADMIN_BASE}/properties?filter=ancestor:${account.name}&pageSize=200`,
           { headers: { Authorization: `Bearer ${token}` } },
         )
-        if (!propRes.ok) continue
+        if (!propRes.ok) {
+          const body = await propRes.text().catch(() => '')
+          this.logger.warn(
+            fmtUpstreamFailure('list GA properties', propRes.status, body, {
+              ...ctx,
+              account: account.name,
+            }),
+          )
+          continue
+        }
         const propData = (await propRes.json()) as {
           properties?: { name: string; displayName: string }[]
         }
@@ -369,7 +421,7 @@ export class GoogleAnalyticsOAuthService {
         }
       }
     } catch (err) {
-      this.logger.error('Error listing GA properties', err)
+      this.logger.error(fmtFailure('list GA properties', err, ctx))
     }
     return all
   }
