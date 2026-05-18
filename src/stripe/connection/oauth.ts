@@ -21,6 +21,7 @@ export type OAuthFailureReason =
   | 'cancelled'
   | 'state_invalid'
   | 'token_exchange'
+  | 'client_mode_mismatch'
   | 'account_resolve'
   | 'credentials_save'
   | 'unknown'
@@ -92,6 +93,35 @@ export class StripeOAuthService {
     const tokenData = (await tokenRes.json()) as Record<string, unknown>
 
     if (!tokenRes.ok || tokenData.error) {
+      // Detect the canonical "your client_id and secret are in different
+      // modes" failure. Stripe returns `invalid_grant` with exactly this
+      // message when the `client_id` used during /authorize was issued
+      // for a different mode (test vs live) than the secret key used
+      // here. The Stripe Connect dashboard shows TWO `client_id`s side
+      // by side — one per mode — and it's surprisingly easy to grab the
+      // wrong one. The cross-mode failure looks identical to a "real"
+      // OAuth issue in the upstream response, so without this
+      // detection the user has no way to know what's wrong.
+      const errorDescription = String(tokenData.error_description ?? '')
+      const isClientModeMismatch =
+        tokenData.error === 'invalid_grant' &&
+        /authorization code provided does not belong to you/i.test(errorDescription)
+
+      if (isClientModeMismatch) {
+        const clientId = process.env.STRIPE_CLIENT_ID ?? ''
+        const secretPrefix = secretKey.slice(0, 8)
+        this.logger.error(
+          `  ✗ Stripe OAuth: STRIPE_CLIENT_ID and STRIPE_SECRET_KEY appear to be in different modes\n` +
+            `  client_id=${clientId}  secret_prefix=${secretPrefix}…\n` +
+            `  → check the Connect settings page in Stripe — there's one client_id per mode (test/live), ` +
+            `the secret key MUST match the mode of the client_id`,
+        )
+        throw new OAuthCallbackError(
+          'client_mode_mismatch',
+          'STRIPE_CLIENT_ID and STRIPE_SECRET_KEY are in different modes (test vs live)',
+        )
+      }
+
       this.logger.error(`  ✗ Stripe OAuth token exchange failed\n  ${JSON.stringify(tokenData)}`)
       throw new OAuthCallbackError('token_exchange', 'Stripe OAuth token exchange failed')
     }
