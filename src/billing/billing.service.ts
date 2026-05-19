@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common'
 import Stripe from 'stripe'
 import { SupabaseService } from '../supabase/supabase.service'
+import { getPrimaryFrontendUrl } from '../common/frontend-url'
 
 /**
  * Billing service — Databerry charging users for subscriptions.
@@ -36,8 +37,12 @@ import { SupabaseService } from '../supabase/supabase.service'
  *                                     endpoint (distinct from the
  *                                     Connect webhook secret used by
  *                                     `StripeWebhookService`)
- *   - FRONTEND_URL                  — base URL used to build success/cancel
- *                                     URLs (defaults to localhost in dev)
+ *   - FRONTEND_URL                  — comma-separated list of allowed
+ *                                     frontend origins (CORS). For success/
+ *                                     cancel redirects we use only the
+ *                                     FIRST entry via `getPrimaryFrontendUrl()`,
+ *                                     so the canonical redirect domain is
+ *                                     whichever URL you list first.
  */
 @Injectable()
 export class BillingService {
@@ -116,8 +121,16 @@ export class BillingService {
     // 2. Customer get-or-create
     const customerId = await this.getOrCreateCustomer(userId, userEmail)
 
-    // 3. Build + create Checkout Session
-    const appUrl = process.env.FRONTEND_URL ?? 'http://localhost:3000'
+    // 3. Build + create Checkout Session.
+    //
+    // `getPrimaryFrontendUrl()` takes the FIRST entry of the comma-
+    // separated FRONTEND_URL allowlist — see `common/frontend-url.ts`.
+    // The raw `process.env.FRONTEND_URL` would interpolate the whole
+    // comma-joined list ("https://www.databerry.app,https://databerry.app")
+    // straight into the Stripe success_url, producing the malformed
+    // redirect Stripe happily 302's the user into. Same helper the
+    // OAuth callback controllers use.
+    const appUrl = getPrimaryFrontendUrl()
     // `?upgraded={CHECKOUT_SESSION_ID}` — frontend uses presence of
     // the param to refresh `useAccount` after the redirect lands.
     // The session id itself isn't read; treating it as a flag.

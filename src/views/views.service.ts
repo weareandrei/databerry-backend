@@ -7,7 +7,19 @@ import { PosthogLifecycleService } from '../posthog/lifecycle/hog-function'
  * resolves the right provider per-request via `pickTrafficProvider`. Auto-
  * reattach skips these.
  */
-const COMPOSITE_VIEW_TYPES = new Set(['project_overview', 'project_overview_sources'])
+// Connection-less view types — server resolves the right provider per
+// request (via `pickTrafficProvider` for the chart half, the connection
+// table for revenue, etc.). Auto-reattach skips these because there's
+// no per-view connection FK to repair.
+//
+// `custom_chart` joins the existing pair as a standalone chart variant
+// (no paired sources panel) — same connection-less data resolution as
+// `project_overview`, different render lane on the frontend.
+const COMPOSITE_VIEW_TYPES = new Set([
+  'project_overview',
+  'project_overview_sources',
+  'custom_chart',
+])
 const COMPOSITE_CONNECTION_TYPE = 'composite'
 
 export interface CreateViewDto {
