@@ -26,6 +26,10 @@ import {
   type RetentionRow,
 } from './live/retention'
 import { fetchPosthogUsersList, type PosthogUserRow } from './live/users'
+import {
+  fetchPosthogEventCountByBucket,
+  listPosthogEventNames,
+} from './live/sources'
 import { hourlyBucketCount } from '../../common/tz'
 
 interface LoadedView {
@@ -71,6 +75,103 @@ export class PosthogViewsService {
     if (!ph) throw new NotFoundException('PostHog credentials not found')
 
     return { config: (view.config ?? {}) as Record<string, unknown>, ph }
+  }
+
+  /**
+   * Connection-only variant of `loadViewAndCreds` — used by callers
+   * that work with a PostHog connection directly without going
+   * through a view config (e.g. the Ask-AI chat tools, which let the
+   * user query events ad-hoc by name). Same ownership check; just
+   * skips the views-table lookup.
+   *
+   * Kept separate rather than making `viewId` optional on the
+   * combined helper so the type signatures stay honest about what
+   * each caller actually needs.
+   */
+  private async loadCredsForConnection(
+    connectionId: string,
+    userId: string,
+  ): Promise<PosthogCredentials> {
+    const client = this.supabaseService.getClient()
+    const { data: conn, error } = await client
+      .from('connections')
+      .select('id')
+      .eq('id', connectionId)
+      .eq('user_id', userId)
+      .single()
+    if (error || !conn) throw new ConnectionMissingException('posthog', connectionId)
+
+    const ph = await getPosthogCredentials(connectionId, this.supabaseService)
+    if (!ph) throw new NotFoundException('PostHog credentials not found')
+    return ph
+  }
+
+  /**
+   * List up to 200 distinct event names recently seen on the PostHog
+   * project backing this connection. Same payload the conversion-
+   * event picker uses, exposed for the chat tool so the model can
+   * discover the exact event name a user is asking about (HogQL is
+   * case-sensitive and there's no fuzzy-match operator we'd want
+   * to lean on for this).
+   *
+   * 200 is PostHog's `event_definitions/?limit=200` cap — anything
+   * more requires pagination we don't currently implement. In
+   * practice solo-founder projects emit a handful of named events
+   * plus PostHog's autocaptured `$pageview` / `$identify`, so 200
+   * is more headroom than necessary.
+   */
+  async listEventNamesForConnection(
+    connectionId: string,
+    userId: string,
+  ): Promise<string[]> {
+    const ph = await this.loadCredsForConnection(connectionId, userId)
+    return listPosthogEventNames(ph, this.logger)
+  }
+
+  /**
+   * Count occurrences of a specific PostHog event over `[dateFrom,
+   * dateTo]` (both inclusive, YYYY-MM-DD). Returns per-day buckets
+   * AND a precomputed total — the model can pick whichever shape
+   * suits the question ("how many in the last week" → total; "show
+   * me the trend" → buckets).
+   *
+   * Edge cases covered:
+   *   - Event name doesn't match any rows in PostHog → returns
+   *     `{ total: 0, buckets: [] }`. The chat layer surfaces this
+   *     as "no events found" rather than an error.
+   *   - dateFrom > dateTo → PostHog returns no rows; total = 0.
+   *     We deliberately don't validate here; the model handles
+   *     "did you mean a different range?" in its reply.
+   *   - Wide date range (e.g. 365 days) → PostHog handles bucketing
+   *     server-side; we just relay the rows. Cost concerns live in
+   *     PostHog's own query-cost model, not here.
+   *
+   * The underlying HogQL is the same one the conversion-rate view
+   * uses (`fetchPosthogEventCountByBucket`), so the bucket key
+   * format is "YYYY-MM-DD" in `tz`.
+   */
+  async fetchEventCountForChat(
+    connectionId: string,
+    userId: string,
+    eventName: string,
+    dateFrom: string,
+    dateTo: string | undefined,
+    tz: string = 'UTC',
+  ): Promise<{ total: number; buckets: { date: string; count: number }[] }> {
+    const ph = await this.loadCredsForConnection(connectionId, userId)
+    const { from, to, tz: tzLit } = buildViewFetchContext(dateFrom, dateTo, tz)
+    const rows = await fetchPosthogEventCountByBucket(
+      ph,
+      eventName,
+      from,
+      to,
+      'daily',
+      this.logger,
+      tzLit,
+    )
+    const buckets = rows.map(r => ({ date: r.bucketKey, count: r.value }))
+    const total = buckets.reduce((sum, b) => sum + b.count, 0)
+    return { total, buckets }
   }
 
   async fetchLiveValue(

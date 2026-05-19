@@ -23,6 +23,7 @@ import type { ProjectsService } from '../projects/projects.service'
 import type { ConnectionsService } from '../connections/connections.service'
 import type { StripeViewsService } from '../stripe/views/views.service'
 import type { CalendlyViewsService } from '../calendly/views/views.service'
+import type { PosthogViewsService } from '../posthog/views/views.service'
 
 export interface ToolCtx {
   userId: string
@@ -38,6 +39,7 @@ export interface ToolDeps {
   connections: ConnectionsService
   stripeViews: StripeViewsService
   calendlyViews: CalendlyViewsService
+  posthogViews: PosthogViewsService
 }
 
 // ── Stripe metric enums ────────────────────────────────────────────────────
@@ -219,6 +221,76 @@ export function buildTools(deps: ToolDeps): Record<string, ChatTool> {
     },
   }
 
+  const listPosthogEvents: ChatTool = {
+    definition: {
+      name: 'list_posthog_events',
+      description:
+        "List up to 200 distinct event names recently recorded on a PostHog connection. ALWAYS call this BEFORE `get_posthog_event_count` so you pick the exact event name — HogQL is case-sensitive and event names are arbitrary (`project_submitted`, `signup`, `$pageview`, etc.). The user usually describes events by intent, not name, so this is the discovery step.",
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          connectionId: {
+            type: 'string',
+            description:
+              'PostHog connection id from `list_connections`. Pick the one whose project matches the project the user is asking about.',
+          },
+        },
+        required: ['connectionId'],
+      },
+    },
+    handler: async (input, { userId }) => {
+      const events = await deps.posthogViews.listEventNamesForConnection(
+        String(input.connectionId),
+        userId,
+      )
+      return { events, total: events.length }
+    },
+  }
+
+  const getPosthogEventCount: ChatTool = {
+    definition: {
+      name: 'get_posthog_event_count',
+      description:
+        'Count how many times a specific PostHog event fired in a date range. Returns `{ total, buckets[] }` — buckets are per-day with `{date, count}`. Use total for "how many times" questions; use buckets for "show me the trend" questions. The event name MUST be one you obtained from `list_posthog_events` — do not guess.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          connectionId: { type: 'string' },
+          eventName: {
+            type: 'string',
+            description:
+              'EXACT event name from `list_posthog_events`. Case-sensitive. Examples: `project_submitted`, `$pageview`, `user_signup`.',
+          },
+          dateFrom: {
+            type: 'string',
+            description:
+              'YYYY-MM-DD inclusive. For "recently" / vague timeframes, default to today-minus-7-days.',
+          },
+          dateTo: {
+            type: 'string',
+            description: 'YYYY-MM-DD inclusive. Defaults to today.',
+          },
+          tz: {
+            type: 'string',
+            description: "IANA timezone (e.g. 'America/New_York') — use the user's tz from the system prompt.",
+          },
+        },
+        required: ['connectionId', 'eventName', 'dateFrom'],
+      },
+    },
+    handler: async (input, { userId }) => {
+      const data = await deps.posthogViews.fetchEventCountForChat(
+        String(input.connectionId),
+        userId,
+        String(input.eventName),
+        String(input.dateFrom),
+        input.dateTo ? String(input.dateTo) : undefined,
+        input.tz ? String(input.tz) : undefined,
+      )
+      return data
+    },
+  }
+
   const getCalendlyMeetings: ChatTool = {
     definition: {
       name: 'get_calendly_meetings',
@@ -254,5 +326,7 @@ export function buildTools(deps: ToolDeps): Record<string, ChatTool> {
     get_stripe_chart: getStripeChart,
     get_stripe_top_customers: getStripeTopCustomers,
     get_calendly_meetings: getCalendlyMeetings,
+    list_posthog_events: listPosthogEvents,
+    get_posthog_event_count: getPosthogEventCount,
   }
 }

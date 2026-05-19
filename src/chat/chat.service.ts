@@ -24,6 +24,7 @@ import { ProjectsService } from '../projects/projects.service'
 import { ConnectionsService } from '../connections/connections.service'
 import { StripeViewsService } from '../stripe/views/views.service'
 import { CalendlyViewsService } from '../calendly/views/views.service'
+import { PosthogViewsService } from '../posthog/views/views.service'
 import { buildTools, type ChatTool, type ToolCtx, type ToolDeps } from './tools'
 
 // Sonnet 4.5 instead of Opus 4.5: ~5× cheaper across input + output
@@ -58,6 +59,7 @@ export class ChatService {
     private readonly connections: ConnectionsService,
     private readonly stripeViews: StripeViewsService,
     private readonly calendlyViews: CalendlyViewsService,
+    private readonly posthogViews: PosthogViewsService,
   ) {
     // Construct lazily — let the controller surface a clean error if
     // the env var isn't set, instead of crashing at module init time.
@@ -69,6 +71,7 @@ export class ChatService {
       connections,
       stripeViews,
       calendlyViews,
+      posthogViews,
     }
     this.tools = buildTools(deps)
     this.toolDefinitions = Object.values(this.tools).map(t => t.definition)
@@ -148,11 +151,18 @@ export class ChatService {
       '',
       'Guidelines:',
       "- When the user names a project, look it up in the PROJECTS list above. You don't need to call list_projects unless the inventory above is empty.",
-      "- For metric tools (`get_stripe_metric`, `get_stripe_chart`), pass `tz` from the system prompt above when the user asks about \"today\", \"this week\", etc.",
+      "- For metric tools (`get_stripe_metric`, `get_stripe_chart`, `get_posthog_event_count`), pass `tz` from the system prompt above when the user asks about \"today\", \"this week\", etc.",
       '- Currency values from Stripe tools are in **cents**. Divide by 100 and format as USD when reporting (e.g. `$1,234.56`).',
       '- Cite which connection / project a number came from (e.g. "$1,234 — Stripe on Taplaunch").',
       '- Be concise. Markdown is supported (bold, lists, inline code).',
       "- If a tool returns `unavailable: true` or an error, tell the user the data isn't available rather than fabricating numbers.",
+      '',
+      'PostHog event questions:',
+      '- The user often describes events by intent ("how many times did a user sign up") rather than the exact event name. PostHog event names are case-sensitive and arbitrary (e.g. `project_submitted`, `user_signup`, `$pageview`).',
+      '- Workflow: (1) find the PostHog connection for the relevant project from CONNECTIONS, (2) call `list_posthog_events` to see what event names exist, (3) pick the closest match by name, (4) call `get_posthog_event_count` with the EXACT event name from step 2.',
+      "- If multiple events plausibly match (e.g. `signup` and `user_signup` both exist), pick the most specific one and mention which you used so the user can correct you. Don't guess at names that aren't in the list.",
+      '- For "recently" / "lately" / vague timeframes, default to **last 7 days** and mention the range in your reply.',
+      "- If `list_posthog_events` returns 0 events, tell the user the project hasn't recorded any events yet (instead of inventing a name).",
     ].join('\n')
   }
 
