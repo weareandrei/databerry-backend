@@ -53,6 +53,40 @@ export class PosthogViewsController {
   }
 
   /**
+   * Ad-hoc event-count chart — same `{ points: ChartPoint[] }` shape
+   * as `chart-data` but takes `eventName` directly instead of a
+   * stored `viewId`. Used by the overview chart's cascade-dropdown
+   * PostHog overlay: when the user picks "PostHog → Event count →
+   * `project_submitted`" we have no view row to point at, just the
+   * connection + event name + date range.
+   *
+   * Mirrors the wire shape Stripe and GA's chart-data endpoints use,
+   * so the frontend's `useConnectionMetricSeries` can route to
+   * whichever one matches the cascade pick and merge the results
+   * uniformly.
+   */
+  @Get('event-chart-data')
+  async getEventChartData(
+    @Query('connectionId') connectionId: string,
+    @Query('eventName') eventName: string,
+    @Query('dateFrom') dateFrom: string | undefined,
+    @Query('dateTo') dateTo: string | undefined,
+    @Query('mode') mode: 'daily' | 'weekly' | 'monthly' | undefined,
+    @Query('tz') tz: string | undefined,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.posthogViewsService.fetchEventChartData(
+      connectionId,
+      eventName,
+      req.authUser.id,
+      dateFrom,
+      dateTo,
+      mode,
+      tz,
+    )
+  }
+
+  /**
    * Funnel — `{ steps: FunnelStepRow[] }`. One route per non-`live-value`
    * view type, mirroring the convention established by Stripe's
    * `/stripe/views/top-customers`. Keeps the wire shape per route specific

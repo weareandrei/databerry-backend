@@ -174,6 +174,71 @@ export class PosthogViewsService {
     return { total, buckets }
   }
 
+  /**
+   * Per-bucket count of an event over `[dateFrom, dateTo]` — wire
+   * shape `{ points: ChartPoint[] }`, matching Stripe and GA's
+   * chart-data endpoints. Used by the overview chart's cascade
+   * dropdown to plot a PostHog event count as the secondary line
+   * (or eventually primary bars).
+   *
+   * Distinct from `fetchChartData` (which reads a stored view's
+   * config) — here the event name is passed directly so callers
+   * don't need to create a throwaway view row for an ad-hoc pick.
+   * Reuses the same `fetchPosthogEventCountByBucket` HogQL
+   * `fetchEventCountForChat` uses, just reformatted into the
+   * chart-data shape: per-bucket label + value, with the bucket
+   * granularity matching the requested mode.
+   *
+   * Bucket alignment: the user passes the SAME mode + range here
+   * that the overview chart's primary fetch uses, so the bucket
+   * COUNTS match → the frontend can merge by index. Once we
+   * migrate to the canonical-grid contract (`chart-grid.ts`) this
+   * becomes a proper key-based join.
+   */
+  async fetchEventChartData(
+    connectionId: string,
+    eventName: string,
+    userId: string,
+    dateFrom?: string,
+    dateTo?: string,
+    mode?: 'daily' | 'weekly' | 'monthly',
+    tz: string = 'UTC',
+  ): Promise<{ points: { label: string; value: number }[] }> {
+    const { from, to, tz: tzLit } = buildViewFetchContext(dateFrom, dateTo, tz)
+    this.logger.log(
+      `fetchEventChartData  connectionId=${connectionId}  eventName=${eventName}  ${from}→${to}  mode=${mode ?? '?'}  tz=${tzLit}`,
+    )
+
+    if (!eventName) {
+      throw new NotFoundException('eventName query param is required')
+    }
+
+    const ph = await this.loadCredsForConnection(connectionId, userId)
+    // Daily mode → hourly buckets (matches what `useOverviewChartData`
+    // gets from the project-overview backend). Anything else → daily.
+    const granularity: 'hourly' | 'daily' =
+      mode === 'daily' || (!mode && from === to) ? 'hourly' : 'daily'
+
+    const rows = await fetchPosthogEventCountByBucket(
+      ph,
+      eventName,
+      from,
+      to,
+      granularity,
+      this.logger,
+      tzLit,
+    )
+
+    // Reformat from `{bucketKey, value}` → `{label, value}` for the
+    // chart-data wire shape. The label is whatever PostHog's HogQL
+    // returned for the bucket key — frontend currently aligns by
+    // INDEX, not label, so the exact string doesn't matter (we
+    // could pass through bucketKey verbatim and it would render the
+    // same). Documented here so the next person knows the labels
+    // aren't load-bearing in the current alignment scheme.
+    return { points: rows.map(r => ({ label: r.bucketKey, value: r.value })) }
+  }
+
   async fetchLiveValue(
     connectionId: string,
     viewId: string,
