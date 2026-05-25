@@ -32,6 +32,11 @@ const RULES: Rule[] = [
   { match: /google/i,                                  key: 'google',     label: 'Google',      color: '#ffffff' },
   { match: /(t\.co|twitter|x\.com)/i,                  key: 'x',          label: 'X',           color: '#4b5563' },
   { match: /reddit/i,                                  key: 'reddit',     label: 'Reddit',      color: '#F46719' },
+  // Product Hunt — `producthunt.com` (and www.) referrers. Placed
+  // before the generic fallthrough so launch-day traffic gets its
+  // own row + logo rather than collapsing into "Other". Colour is
+  // PH's brand red-orange, mirroring the frontend SOURCE_STYLE entry.
+  { match: /producthunt/i,                             key: 'producthunt', label: 'ProductHunt', color: '#DA552F' },
   { match: /youtube/i,                                 key: 'youtube',    label: 'YouTube',     color: '#dc2626' },
   { match: /facebook/i,                                key: 'facebook',   label: 'Facebook',    color: '#2563eb' },
   { match: /linkedin/i,                                key: 'linkedin',   label: 'LinkedIn',    color: '#0284c7' },
