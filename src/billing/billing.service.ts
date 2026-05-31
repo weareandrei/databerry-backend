@@ -154,14 +154,23 @@ export class BillingService {
       subscription_data: {
         metadata: { databerry_user_id: userId, plan_id: planId },
       },
-      // Allow promo codes the user types in (Stripe auto-validates).
-      // Doesn't conflict with our `discounts` field — Stripe accepts
-      // one or the other, and our intro coupon is auto-applied below.
-      allow_promotion_codes: plan.stripe_intro_coupon_id ? false : true,
     }
 
+    // `allow_promotion_codes` and `discounts` are mutually exclusive on
+    // Stripe's Checkout API — and "mutually exclusive" means the field
+    // can't be SPECIFIED alongside the other, even with `false`. We
+    // previously set `allow_promotion_codes: false` whenever an intro
+    // coupon was configured, expecting Stripe to read that as "no
+    // promo input UI"; instead Stripe rejected the whole request with
+    // `StripeInvalidRequestError: You may only specify one of these
+    // parameters`. The fix is to OMIT `allow_promotion_codes` from
+    // the params entirely in the intro-coupon branch.
     if (plan.stripe_intro_coupon_id) {
       params.discounts = [{ coupon: plan.stripe_intro_coupon_id }]
+    } else {
+      // No intro coupon → let the user type their own promo code at
+      // checkout (Stripe auto-validates).
+      params.allow_promotion_codes = true
     }
 
     const session = await this.getStripe().checkout.sessions.create(params)

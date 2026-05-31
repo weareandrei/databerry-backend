@@ -52,6 +52,33 @@ export class ViewsController {
     return this.viewsService.createView(dto, req.authUser.id)
   }
 
+  /**
+   * Persist a new ordering for one container's views (drag-and-drop
+   * reorder). `folderId` is nullable — `null` targets the project-root
+   * container; a UUID targets a folder. `orderedViewIds` is the full
+   * desired sequence; the service rewrites every view's `position` to
+   * match its index in the array. Returns 204; the frontend has already
+   * optimistically reordered.
+   *
+   * Declared BEFORE `@Patch(':id')` so the literal `reorder` segment
+   * matches before the catch-all `:id` route would swallow it as a
+   * (malformed) view id.
+   */
+  @Patch('reorder')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  reorder(
+    @Body()
+    dto: { projectId: string; folderId: string | null; orderedViewIds: string[] },
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.viewsService.reorderViews(
+      req.authUser.id,
+      dto.projectId,
+      dto.folderId ?? null,
+      dto.orderedViewIds,
+    )
+  }
+
   @Patch(':id')
   update(
     @Param('id') id: string,

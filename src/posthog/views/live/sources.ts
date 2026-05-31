@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common'
 import {
   escapeDateLiteral,
   escapeStringLiteral,
+  POSTHOG_SOURCE_EXPR,
   tzDateBucket,
   tzWrappedTimestamp,
 } from './hogql-utils'
@@ -48,7 +49,10 @@ export async function fetchPosthogSourcesByBucket(
   const safeFrom = escapeDateLiteral(dateFrom)
   const safeTo = escapeDateLiteral(dateTo)
 
-  // `$initial_referring_domain` is the standard Posthog property for session source.
+  // `src` uses the shared first-touch attribution expression
+  // (`POSTHOG_SOURCE_EXPR`: ref → utm_source → referring_domain) so this
+  // panel/chart and the per-user list stay in lockstep. See its docstring
+  // in hogql-utils.ts for the precedence + the retroactive-recovery note.
   //
   // Parens around the BETWEEN are load-bearing: HogQL's parser binds the
   // surrounding AND tighter than BETWEEN, so without them the query reads
@@ -58,7 +62,7 @@ export async function fetchPosthogSourcesByBucket(
   //
   // The BETWEEN bound also runs in `tz` (via the toTimeZone wrap inside
   // `tzDateBucket`) so a "today" range maps to the user's local day, not UTC.
-  const hogql = `SELECT ${timeExpr} AS bucket, properties.$initial_referring_domain AS src, count() FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket, src ORDER BY bucket`
+  const hogql = `SELECT ${timeExpr} AS bucket, ${POSTHOG_SOURCE_EXPR} AS src, count() FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket, src ORDER BY bucket`
 
   const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
     method: 'POST',

@@ -24,6 +24,8 @@ import type { ConnectionsService } from '../connections/connections.service'
 import type { StripeViewsService } from '../stripe/views/views.service'
 import type { CalendlyViewsService } from '../calendly/views/views.service'
 import type { PosthogViewsService } from '../posthog/views/views.service'
+import type { GoogleAnalyticsViewsService } from '../google-analytics/views/views.service'
+import type { McpService } from '../mcp/mcp.service'
 
 export interface ToolCtx {
   userId: string
@@ -40,6 +42,13 @@ export interface ToolDeps {
   stripeViews: StripeViewsService
   calendlyViews: CalendlyViewsService
   posthogViews: PosthogViewsService
+  gaViews: GoogleAnalyticsViewsService
+  // Used by `ChatService` to fan out to the user's MCP servers at
+  // chat-start (list their tools) and dispatch `tools/call` from
+  // inside the agent loop. Not consumed by the built-in tools
+  // declared in this file; lives on `ToolDeps` so the chat layer
+  // has a single dependency surface.
+  mcp: McpService
 }
 
 // ── Stripe metric enums ────────────────────────────────────────────────────
@@ -319,6 +328,62 @@ export function buildTools(deps: ToolDeps): Record<string, ChatTool> {
     },
   }
 
+  const getGaMetric: ChatTool = {
+    definition: {
+      name: 'get_ga_metric',
+      description:
+        "Fetch a Google Analytics metric for the user's GA4 property. Returns the metric value as a string (string because GA's API does — divide / parse as a number when reporting). Use this for **website traffic** questions (visitors, sessions, pageviews) — distinct from PostHog, which tracks app-side events. If both PostHog and GA are connected for a project, pick GA for \"website / page / visitors\" phrasing and PostHog for \"clicks / signups / app events\" phrasing — query both if either could plausibly apply.",
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          connectionId: {
+            type: 'string',
+            description: 'GA connection id from `list_connections` (type `google_analytics`).',
+          },
+          viewType: {
+            type: 'string',
+            enum: [
+              // Realtime — current snapshot, today only. Returns
+              // `unavailable: true` for non-today ranges.
+              'ga_active_users',
+              // Range-based metrics — accept dateFrom/dateTo. The
+              // `_today` suffix is a legacy view-id name; the metric
+              // itself works over any range.
+              'ga_users_today',
+              'ga_sessions_today',
+              'ga_pageviews_today',
+            ],
+            description:
+              "Which GA metric to query. `ga_active_users` is realtime (today only). `ga_users_today` = unique users; `ga_sessions_today` = sessions; `ga_pageviews_today` = pageviews. The `_today` names are legacy — pass any date range you want via dateFrom/dateTo.",
+          },
+          dateFrom: { type: 'string', description: 'YYYY-MM-DD inclusive. Defaults to today.' },
+          dateTo: { type: 'string', description: 'YYYY-MM-DD inclusive. Defaults to today.' },
+          tz: {
+            type: 'string',
+            description:
+              "IANA timezone. Accepted for API parity but GA evaluates ranges in the property's configured timezone — not the user's tz. Pass it anyway; the service handles the mismatch internally.",
+          },
+        },
+        required: ['connectionId', 'viewType'],
+      },
+    },
+    handler: async (input, { userId }) => {
+      const data = await deps.gaViews.fetchLiveValue(
+        String(input.connectionId),
+        String(input.viewType),
+        userId,
+        input.dateFrom ? String(input.dateFrom) : undefined,
+        input.dateTo ? String(input.dateTo) : undefined,
+        input.tz ? String(input.tz) : 'UTC',
+      )
+      return {
+        viewType: input.viewType,
+        value: data.value,
+        unavailable: data.unavailable ?? false,
+      }
+    },
+  }
+
   return {
     list_projects: listProjects,
     list_connections: listConnections,
@@ -328,5 +393,6 @@ export function buildTools(deps: ToolDeps): Record<string, ChatTool> {
     get_calendly_meetings: getCalendlyMeetings,
     list_posthog_events: listPosthogEvents,
     get_posthog_event_count: getPosthogEventCount,
+    get_ga_metric: getGaMetric,
   }
 }

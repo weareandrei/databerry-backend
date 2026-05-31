@@ -1,5 +1,5 @@
 import { Logger } from '@nestjs/common'
-import { escapeDateLiteral, tzDateBucket } from './hogql-utils'
+import { escapeDateLiteral, POSTHOG_SOURCE_EXPR, tzDateBucket } from './hogql-utils'
 import type { PosthogCredentials } from '../../connection/credentials'
 
 export interface PosthogUserRow {
@@ -60,7 +60,14 @@ export async function fetchPosthogUsersList(
   // distinct-`$session_id` count. `any(...)` for the geoip fields
   // because they're denormalised per-event and we just want a
   // representative value per user.
-  const hogql = `SELECT distinct_id, any(properties.$initial_referring_domain) AS src, dateDiff('second', min(timestamp), max(timestamp)) AS session_sec, max(timestamp) AS last_seen, any(properties.$geoip_country_code) AS country_code, any(properties.$geoip_country_name) AS country_name, any(properties.$geoip_city_name) AS city, count(distinct properties.$session_id) AS session_count FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY distinct_id ORDER BY last_seen DESC LIMIT ${safeLimit}`
+  //
+  // `src` wraps the shared `POSTHOG_SOURCE_EXPR` (ref → utm_source →
+  // referring_domain) in `any(...)` so each user's source matches how
+  // the overview chart + Sources panel attribute the same visit — a
+  // Product Hunt visitor reads "ProductHunt" here too, not "direct".
+  // The wrapped expression is per-user-stable (all `$initial_*`), so
+  // `any` just picks that stable value.
+  const hogql = `SELECT distinct_id, any(${POSTHOG_SOURCE_EXPR}) AS src, dateDiff('second', min(timestamp), max(timestamp)) AS session_sec, max(timestamp) AS last_seen, any(properties.$geoip_country_code) AS country_code, any(properties.$geoip_country_name) AS country_name, any(properties.$geoip_city_name) AS city, count(distinct properties.$session_id) AS session_count FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY distinct_id ORDER BY last_seen DESC LIMIT ${safeLimit}`
 
   const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
     method: 'POST',

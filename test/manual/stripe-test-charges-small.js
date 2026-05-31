@@ -65,41 +65,43 @@ if (!SECRET_KEY.startsWith('sk_test_')) {
 
 const stripe = new Stripe(SECRET_KEY, { stripeAccount: CONNECTED_ACCOUNT })
 
-// Distinct from the original 8 (Alice/Bob/…) AND from the previous
-// small batch (Nora/Pavel/Yuki/Lucas) so the dedupe script can tell
-// each batch apart — these emails are unique to this run (2026-05-18
-// gap-fill, covering ~May 3 → May 18 since the last seed on May 2).
+// Distinct from every previous batch (original Alice/Bob/…,
+// Nora/Pavel/Yuki/Lucas, Maria/Diego/Aiko/Tomas, Sofia/Hassan/Greta/Kenji,
+// Lena/Mateo/Priya/Oskar/Yara, and the last Amara/Felix/Sana/Theo run)
+// so the dedupe script can tell each batch apart — emails unique to
+// this run.
 const CUSTOMERS = [
-  { name: 'Maria Voinea',      email: 'maria@test.example' },
-  { name: 'Diego Costa',       email: 'diego@test.example' },
-  { name: 'Aiko Mori',         email: 'aiko@test.example' },
-  { name: 'Tomas Lindgren',    email: 'tomas@test.example' },
+  { name: 'Indira Rao',        email: 'indira@test.example' },
+  { name: 'Mateusz Nowak',     email: 'mateusz@test.example' },
+  { name: 'Chen Wei',          email: 'chenwei@test.example' },
+  { name: 'Olamide Adebayo',   email: 'olamide@test.example' },
 ]
 
 /**
  * Plan summary (fits inside DAYS_BACK=16, so no step has day ≥ 16):
- *   - Maria: subscribed early, two one-time buys (one of each price)
- *   - Diego: one-time only, no sub
- *   - Aiko:  subscribed mid-window, one one-time buy
- *   - Tomas: two one-time buys, no sub
+ *   - Indira:  subscriber + two one-time buys
+ *   - Mateusz: one-time only, three buys (mix of prices)
+ *   - Chen:    subscriber + one one-time buy
+ *   - Olamide: one-time only, two buys
  *
- * → 2 active subs (Maria, Aiko) → +30 RON MRR on top of whatever's there
- * → 7 one-time charges spread over the 16-day window
+ * → 2 active subs (Indira, Chen) → +30 RON MRR on top of whatever's there
+ * → 8 one-time charges spread over the 16-day window
  */
 const PLAN = [
-  // Maria — early subscriber + mixed buys
-  { day: 1,  who: 0, action: 'subscribe' },
-  { day: 4,  who: 0, action: 'buy41' },
-  { day: 10, who: 0, action: 'buy25' },
-  // Diego — one-time only
-  { day: 2,  who: 1, action: 'buy25' },
-  { day: 11, who: 1, action: 'buy41' },
-  // Aiko — sub + one buy
-  { day: 6,  who: 2, action: 'subscribe' },
-  { day: 13, who: 2, action: 'buy25' },
-  // Tomas — couple of one-time buys
+  // Indira — subscriber + mixed buys
+  { day: 2,  who: 0, action: 'subscribe' },
+  { day: 6,  who: 0, action: 'buy41' },
+  { day: 11, who: 0, action: 'buy25' },
+  // Mateusz — three one-time buys, no sub
+  { day: 1,  who: 1, action: 'buy25' },
+  { day: 8,  who: 1, action: 'buy41' },
+  { day: 13, who: 1, action: 'buy25' },
+  // Chen — sub + one buy
+  { day: 4,  who: 2, action: 'subscribe' },
+  { day: 12, who: 2, action: 'buy41' },
+  // Olamide — two one-time buys
   { day: 5,  who: 3, action: 'buy41' },
-  { day: 14, who: 3, action: 'buy25' },
+  { day: 10, who: 3, action: 'buy25' },
 ]
 
 async function waitForClockReady(clockId, { timeoutMs = 60_000, intervalMs = 1_000 } = {}) {

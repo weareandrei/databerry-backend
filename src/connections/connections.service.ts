@@ -9,6 +9,7 @@ import { SupabaseService } from '../supabase/supabase.service'
 import { PosthogCredentialsService } from '../posthog/connection/credentials'
 import { StripeBackfillService } from '../stripe/sync/backfill.service'
 import { encryptForUser } from '../common/crypto/encryption'
+import { validateMcpConnection } from '../mcp/mcp-validate'
 
 export interface CreateConnectionDto {
   name: string
@@ -48,7 +49,7 @@ export class ConnectionsService {
     const { data, error } = await this.supabaseService
       .getClient()
       .from('connections')
-      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name), connections_vercel(project_name)')
+      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name), connections_vercel(project_name), connections_mcp(server_url, auth_type)')
       .eq('user_id', userId)
       .order('created_at', { ascending: true })
 
@@ -63,7 +64,7 @@ export class ConnectionsService {
     const { data, error } = await this.supabaseService
       .getClient()
       .from('connections')
-      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name), connections_vercel(project_name)')
+      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name), connections_vercel(project_name), connections_mcp(server_url, auth_type)')
       .eq('id', connectionId)
       .eq('user_id', userId)
       .single()
@@ -378,6 +379,83 @@ export class ConnectionsService {
         )
         throw new Error(error.message)
       }
+    } else if (type === 'mcp') {
+      // MCP connections are generic: name + URL + (none / bearer /
+      // custom-header) auth + optional extra headers. We validate
+      // against the live server BEFORE persisting so users get an
+      // immediate "this works" / "this doesn't work because X" rather
+      // than a silent half-broken connection. Validation runs MCP's
+      // `initialize` + `tools/list` handshake — see `mcp/mcp-validate.ts`.
+      //
+      // On validation failure: log the original error for ops + throw
+      // a 400 with a user-readable message. On success: encrypt the
+      // credential material with the per-user envelope (same as every
+      // other credential table here) and insert.
+      const serverUrl = (config.serverUrl as string | undefined)?.trim()
+      const authType = config.authType as 'none' | 'bearer' | 'custom_header' | undefined
+      const authCredential = (config.authCredential as string | undefined) ?? null
+      const authHeaderName = (config.authHeaderName as string | undefined)?.trim() || null
+      const extraHeaders =
+        (config.extraHeaders as Record<string, string> | undefined) ?? null
+
+      if (!serverUrl) {
+        throw new BadRequestException('MCP server URL is required.')
+      }
+      if (!authType || !['none', 'bearer', 'custom_header'].includes(authType)) {
+        throw new BadRequestException(
+          `Unknown MCP auth type "${String(authType)}". Use 'none', 'bearer', or 'custom_header'.`,
+        )
+      }
+      // Shape checks mirror the SQL CHECK constraint — catch them
+      // here so the error is actionable instead of a generic DB
+      // constraint violation.
+      if (authType === 'bearer' && !authCredential) {
+        throw new BadRequestException('MCP bearer auth requires a token.')
+      }
+      if (authType === 'custom_header' && (!authCredential || !authHeaderName)) {
+        throw new BadRequestException(
+          'MCP custom-header auth requires both a header name and a value.',
+        )
+      }
+
+      try {
+        await validateMcpConnection({
+          serverUrl,
+          authType,
+          authCredential,
+          authHeaderName,
+          extraHeaders,
+        })
+      } catch (err) {
+        // Log the raw error for ops (URL is OK to log; secrets are not
+        // in the message because `validateMcpConnection` never echoes
+        // credentials back into errors). Re-throw as 400 so the user
+        // sees the same message the validator produced.
+        const message = err instanceof Error ? err.message : String(err)
+        this.logger.warn(
+          `MCP validate failed (user=${userId}, url=${serverUrl}): ${message}`,
+        )
+        throw new BadRequestException(message)
+      }
+
+      const { error } = await client.from('connections_mcp').insert({
+        connection_id: connectionId,
+        server_url: serverUrl,
+        auth_type: authType,
+        auth_credential:
+          authCredential != null ? encryptForUser(authCredential, userId) : null,
+        auth_header_name: authHeaderName,
+        extra_headers:
+          extraHeaders != null
+            ? encryptForUser(JSON.stringify(extraHeaders), userId)
+            : null,
+      })
+      if (error) {
+        this.logger.warn(
+          `insertTypeConfig (mcp) failed (connection=${connectionId}): ${error.message}`,
+        )
+        throw new Error(error.message)
+      }
     }
   }
 
@@ -399,6 +477,15 @@ export class ConnectionsService {
       ? (vercelRaw as { project_name: string | null }[])[0]
       : (vercelRaw as { project_name: string | null } | null)
 
+    // MCP-specific surface: only `server_url` + `auth_type` (no
+    // credentials) are joined in, so the connection list can render
+    // a row per MCP server without ever round-tripping the encrypted
+    // token to the client.
+    const mcpRaw = row.connections_mcp
+    const mcpRow = Array.isArray(mcpRaw)
+      ? (mcpRaw as { server_url: string; auth_type: string }[])[0]
+      : (mcpRaw as { server_url: string; auth_type: string } | null)
+
     return {
       id: row.id,
       name: row.name,
@@ -412,6 +499,8 @@ export class ConnectionsService {
       gaPropertyId: gaRow?.property_id ?? null,
       gaPropertyName: gaRow?.property_name ?? null,
       vercelProjectName: vercelRow?.project_name ?? null,
+      mcpServerUrl: mcpRow?.server_url ?? null,
+      mcpAuthType: mcpRow?.auth_type ?? null,
     }
   }
 }

@@ -69,3 +69,39 @@ export function tzWrappedTimestamp(tz: string, column: string = 'timestamp'): st
 export function tzDateBucket(tz: string, column: string = 'timestamp'): string {
   return `toDate(${tzWrappedTimestamp(tz, column)})`
 }
+
+/**
+ * Canonical first-touch traffic-source expression — the SINGLE source of
+ * truth for how every PostHog surface attributes a visit to a source.
+ * Used by the overview chart's stacked bars + the Sources panel
+ * (`sources.ts`) and the per-user list (`users.ts`), so they can never
+ * drift apart on what counts as e.g. Product Hunt vs "direct".
+ *
+ * Precedence (first non-empty wins):
+ *   1. `?ref=<x>` from the LANDING URL — explicit campaign tag used by
+ *      directories / launch platforms (Product Hunt sends
+ *      `?ref=producthunt`; many others use `?ref=`). PostHog does NOT
+ *      auto-capture `ref` into a property — it only captures `utm_*`,
+ *      gclid, fbclid, … — but the full landing URL is preserved in
+ *      `$initial_current_url`, so we pull `ref` back out of it with
+ *      `extractURLParameter`. This is RETROACTIVE: a visit that landed on
+ *      `…/?ref=producthunt` with no HTTP referrer was previously bucketed
+ *      as "direct"; reading the ref from the stored URL re-attributes it
+ *      to its real source with no data loss.
+ *   2. `utm_source` — the standard campaign param (PostHog captures this
+ *      natively as `$initial_utm_source`).
+ *   3. `$initial_referring_domain` — first-touch HTTP referrer; the
+ *      previous sole signal, still the fallback for untagged referrals.
+ *
+ * `nullIf(x, '')` turns empties into NULL so `coalesce` skips them — an
+ * untagged visit falls straight through to the referrer and behaves
+ * exactly as before (no regression for existing sources).
+ *
+ * Callers that GROUP BY a per-user/per-session key wrap this in an
+ * aggregate, e.g. `any(${POSTHOG_SOURCE_EXPR})`.
+ */
+export const POSTHOG_SOURCE_EXPR =
+  `coalesce(` +
+  `nullIf(extractURLParameter(properties.$initial_current_url, 'ref'), ''), ` +
+  `nullIf(properties.$initial_utm_source, ''), ` +
+  `properties.$initial_referring_domain)`

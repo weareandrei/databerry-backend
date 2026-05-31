@@ -52,7 +52,21 @@ export class ViewsService {
       .select('*, views_values(value, created_at)')
       .eq('folder_id', folderId)
       .eq('user_id', userId)
+      // Primary sort: explicit per-container `position` (set by the
+      // drag-reorder endpoint, defaults to insertion order). Secondary
+      // sort: `created_at` then `id` so reads stay deterministic if two
+      // positions ever collide (the index is non-unique by design — see
+      // the 2026-05 migration).
+      //
+      // `nullsFirst: false` makes the fallback explicit: views without
+      // a saved position (legacy rows, partial migration, or a future
+      // insert path that misses the explicit `position` write) fall to
+      // the END and the secondary `created_at` sort places them in
+      // creation order. The user can then drag them to reorder, which
+      // writes a real position.
+      .order('position', { ascending: true, nullsFirst: false })
       .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
 
     if (error) throw new Error(error.message)
     const healed = await this.healOrphans(data ?? [], userId)
@@ -71,7 +85,21 @@ export class ViewsService {
       .eq('project_id', projectId)
       .is('folder_id', null)
       .eq('user_id', userId)
+      // Primary sort: explicit per-container `position` (set by the
+      // drag-reorder endpoint, defaults to insertion order). Secondary
+      // sort: `created_at` then `id` so reads stay deterministic if two
+      // positions ever collide (the index is non-unique by design — see
+      // the 2026-05 migration).
+      //
+      // `nullsFirst: false` makes the fallback explicit: views without
+      // a saved position (legacy rows, partial migration, or a future
+      // insert path that misses the explicit `position` write) fall to
+      // the END and the secondary `created_at` sort places them in
+      // creation order. The user can then drag them to reorder, which
+      // writes a real position.
+      .order('position', { ascending: true, nullsFirst: false })
       .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
 
     if (error) throw new Error(error.message)
     const healed = await this.healOrphans(data ?? [], userId)
@@ -87,7 +115,21 @@ export class ViewsService {
       .select('*, views_values(value, created_at)')
       .eq('user_id', userId)
       .eq('is_pinned', true)
+      // Primary sort: explicit per-container `position` (set by the
+      // drag-reorder endpoint, defaults to insertion order). Secondary
+      // sort: `created_at` then `id` so reads stay deterministic if two
+      // positions ever collide (the index is non-unique by design — see
+      // the 2026-05 migration).
+      //
+      // `nullsFirst: false` makes the fallback explicit: views without
+      // a saved position (legacy rows, partial migration, or a future
+      // insert path that misses the explicit `position` write) fall to
+      // the END and the secondary `created_at` sort places them in
+      // creation order. The user can then drag them to reorder, which
+      // writes a real position.
+      .order('position', { ascending: true, nullsFirst: false })
       .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
 
     if (error) throw new Error(error.message)
     const healed = await this.healOrphans(data ?? [], userId)
@@ -116,9 +158,116 @@ export class ViewsService {
     if (error) throw new Error(error.message)
   }
 
+  /**
+   * Persist a new ordering for the views inside one container — i.e. one
+   * (project_id, folder_id) bucket. `orderedIds` is the desired sequence;
+   * each view gets `position = its index in the array`, so a single
+   * reorder rewrites every affected view's position to a clean 0..N-1
+   * sequence. That's simpler than fractional indexing and fine at the
+   * ~10–20 views per container we expect; the cost is O(N) updates per
+   * reorder, which is well under any latency budget.
+   *
+   * Security: every UPDATE is gated by `user_id` AND `project_id` AND
+   * `folder_id`, so an attacker can't reach into another user's grid by
+   * supplying ids they don't own — those rows simply don't match the
+   * WHERE clause and are left untouched. The frontend always passes the
+   * full container's id list (not a partial), but partial lists are
+   * still safe — they'd just leave the un-named views at their existing
+   * positions, which secondary `created_at` sorting tolerates.
+   *
+   * `folderId === null` represents the project-root container; we
+   * dispatch to `.is('folder_id', null)` for those (vs `.eq` for
+   * folder-scoped containers) because PostgREST distinguishes the two.
+   *
+   * The composite project_overview pair is excluded from this set at
+   * the FRONTEND layer (it's rendered above the sortable container and
+   * never participates in DnD). The backend doesn't need to know about
+   * that anchor — it just writes whatever ordered ids the client sends.
+   */
+  async reorderViews(
+    userId: string,
+    projectId: string,
+    folderId: string | null,
+    orderedIds: string[],
+  ): Promise<void> {
+    this.logger.log(
+      `\n  ► reorderViews\n  projectId : ${projectId}\n  folderId  : ${folderId ?? 'none (project root)'}\n  userId    : ${userId}\n  count     : ${orderedIds.length}`,
+    )
+
+    if (orderedIds.length === 0) return
+
+    const client = this.supabaseService.getClient()
+    const results = await Promise.all(
+      orderedIds.map((id, position) => {
+        let q = client
+          .from('views')
+          .update({ position })
+          .eq('id', id)
+          .eq('user_id', userId)
+          .eq('project_id', projectId)
+        // `folder_id` is nullable — `.eq('folder_id', null)` would
+        // generate `folder_id = NULL` which never matches; PostgREST
+        // needs `IS NULL` instead, which `.is(...)` produces.
+        q = folderId === null ? q.is('folder_id', null) : q.eq('folder_id', folderId)
+        return q
+      }),
+    )
+
+    for (const r of results) {
+      if (r.error) throw new Error(`reorderViews failed: ${r.error.message}`)
+    }
+  }
+
+  /**
+   * Compute the next `position` value for a new view in a given
+   * container. Returns 0 for the first view, otherwise `max(position)
+   * + 1` so new views append. Folder-scoped vs project-root containers
+   * dispatch on `folderId` the same way `reorderViews` does (`.is` for
+   * NULL, `.eq` otherwise).
+   *
+   * `not('position', 'is', null)` filters out the fallback nulls so
+   * the "max" we read is the true highest placed position. Without
+   * this, a single null-position row could surface as the top hit
+   * under PostgREST's default ordering and we'd hand back `NaN` or
+   * collide with position 0. The filter keeps insertions correct
+   * even if legacy data ever leaks through.
+   */
+  private async nextPositionFor(
+    userId: string,
+    projectId: string,
+    folderId: string | null,
+  ): Promise<number> {
+    const client = this.supabaseService.getClient()
+    let q = client
+      .from('views')
+      .select('position')
+      .eq('user_id', userId)
+      .eq('project_id', projectId)
+      .not('position', 'is', null)
+      .order('position', { ascending: false, nullsFirst: false })
+      .limit(1)
+    q = folderId === null ? q.is('folder_id', null) : q.eq('folder_id', folderId)
+    const { data, error } = await q.maybeSingle()
+    if (error) throw new Error(`nextPositionFor failed: ${error.message}`)
+    if (!data) return 0
+    const current = data.position as number | null
+    return current == null ? 0 : current + 1
+  }
+
   async createView(dto: CreateViewDto, userId: string) {
     this.logger.log(
       `\n  ► createView\n  projectId      : ${dto.projectId}\n  folderId       : ${dto.folderId ?? 'none (project root)'}\n  connectionId   : ${dto.connectionId}\n  connectionType : ${dto.connectionType}\n  name           : ${dto.name}`,
+    )
+
+    // New views append to the end of their container — the user's
+    // expected mental model ("the thing I just made shows up at the
+    // bottom"). Computed once up-front and threaded into both insert
+    // paths (PostHog + everything else) so the two branches stay in
+    // sync. See `nextPositionFor` for the read.
+    const position = await this.nextPositionFor(
+      userId,
+      dto.projectId,
+      dto.folderId ?? null,
     )
 
     const baseInsert = {
@@ -131,6 +280,7 @@ export class ViewsService {
       config: dto.config ?? {},
       is_pinned: false,
       user_id: userId,
+      position,
     }
 
     // For PostHog views: create Hog Function first — if it fails, abort
