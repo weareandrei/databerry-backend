@@ -106,6 +106,32 @@ export class ViewsService {
     return healed.map(row => this.toCamel(row, dateFrom, dateTo))
   }
 
+  /**
+   * Return the total number of views owned by this user across all
+   * their projects and folders. Used by the sidebar plan card to
+   * show "X / Y views" usage without having to eagerly fetch every
+   * view (which is expensive — `getViewsByFolder` is per-folder
+   * and joins the values table).
+   *
+   * Uses Supabase's `head: true` + `count: 'exact'` so the query
+   * returns just the row count, no data — single roundtrip, no
+   * row payload. Returns 0 on error rather than throwing because
+   * the sidebar bar gracefully renders zero (and the controller
+   * surfaces the failure to logs).
+   */
+  async countByUser(userId: string): Promise<number> {
+    const { count, error } = await this.supabaseService
+      .getClient()
+      .from('views')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId)
+    if (error) {
+      this.logger.warn(`countByUser failed (user=${userId}): ${error.message}`)
+      return 0
+    }
+    return count ?? 0
+  }
+
   async getPinnedViews(userId: string) {
     this.logger.log(`\n  ► getPinnedViews\n  userId : ${userId}`)
 

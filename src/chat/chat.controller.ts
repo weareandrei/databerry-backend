@@ -8,20 +8,19 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common'
-import type Anthropic from '@anthropic-ai/sdk'
 import { SupabaseAuthGuard } from '../auth/supabase-auth.guard'
-import { ChatService } from './chat.service'
+import { ChatService, type ChatMessageParam } from './chat.service'
 import type { AuthenticatedRequest } from '../common/types'
 
 interface ChatPostBody {
-  messages?: Anthropic.MessageParam[]
+  messages?: ChatMessageParam[]
   tz?: string | null
 }
 
 /**
  * `POST /chat` — single endpoint for the Ask-AI page. Behind
  * `SupabaseAuthGuard` like every other authenticated route, so the
- * Anthropic call (and all the tools it triggers) run as the
+ * Gemini call (and all the tools it triggers) run as the
  * authenticated user.
  *
  * Always returns JSON. Top-level try/catch makes sure the client
@@ -40,7 +39,7 @@ export class ChatController {
   async chat(@Body() body: ChatPostBody, @Req() req: AuthenticatedRequest) {
     if (!this.chatService.isConfigured()) {
       throw new HttpException(
-        'Server is missing ANTHROPIC_API_KEY',
+        'Server is missing GEMINI_API_KEY',
         HttpStatus.SERVICE_UNAVAILABLE,
       )
     }
@@ -61,14 +60,20 @@ export class ChatController {
       )
       return result
     } catch (err) {
-      // Surface the real reason in server logs (full stack) AND in
-      // the body so the chat UI can render something useful.
-      const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
-      this.logger.error(`chat failed: ${message}`, err instanceof Error ? err.stack : undefined)
-      throw new HttpException(
-        `Server error — ${message}`,
-        HttpStatus.INTERNAL_SERVER_ERROR,
+      // Log the full thing for ops (name + stack); send only the
+      // clean, already-extracted message to the client. The chat
+      // service already parses Gemini's JSON error envelopes via
+      // `extractGeminiErrorMessage`, so `err.message` is already
+      // human-readable. Dropping the legacy `Server error —`
+      // prefix means the frontend renders the message verbatim
+      // (in a red bubble), which reads as plain English instead
+      // of "Server error — ApiError: { huge json }".
+      const message = err instanceof Error ? err.message : String(err)
+      this.logger.error(
+        `chat failed: ${err instanceof Error ? err.name : 'unknown'}: ${message}`,
+        err instanceof Error ? err.stack : undefined,
       )
+      throw new HttpException(message, HttpStatus.INTERNAL_SERVER_ERROR)
     }
   }
 }

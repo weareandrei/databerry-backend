@@ -18,7 +18,6 @@
  * that's the model's job.
  */
 
-import type Anthropic from '@anthropic-ai/sdk'
 import type { ProjectsService } from '../projects/projects.service'
 import type { ConnectionsService } from '../connections/connections.service'
 import type { StripeViewsService } from '../stripe/views/views.service'
@@ -26,15 +25,10 @@ import type { CalendlyViewsService } from '../calendly/views/views.service'
 import type { PosthogViewsService } from '../posthog/views/views.service'
 import type { GoogleAnalyticsViewsService } from '../google-analytics/views/views.service'
 import type { McpService } from '../mcp/mcp.service'
+import type { ChatTool, ToolCtx } from './tool-types'
 
-export interface ToolCtx {
-  userId: string
-}
-
-export interface ChatTool {
-  definition: Anthropic.Tool
-  handler: (input: Record<string, unknown>, ctx: ToolCtx) => Promise<unknown>
-}
+// Re-exported so call sites don't have to import from two places.
+export type { ChatTool, ToolCtx } from './tool-types'
 
 export interface ToolDeps {
   projects: ProjectsService
@@ -76,7 +70,18 @@ const STRIPE_CHART_METRICS = [
   'stripe_gross',
 ] as const
 
-export function buildTools(deps: ToolDeps): Record<string, ChatTool> {
+/**
+ * Build the static, always-available "built-in" tools. These ship
+ * with the chat regardless of which MCP servers the user has
+ * connected: Stripe, Calendly, PostHog, GA, plus the inventory
+ * helpers (`list_projects`, `list_connections`).
+ *
+ * MCP tools are handled separately by `buildMcpMetaTools` — three
+ * thin meta-tools (`mcp_list_tools`, `mcp_inspect_tool`,
+ * `mcp_call_tool`) that lazy-load schemas instead of dumping every
+ * MCP server's full catalog into the prompt at chat-start.
+ */
+export function buildBuiltinTools(deps: ToolDeps): Record<string, ChatTool> {
   const listProjects: ChatTool = {
     definition: {
       name: 'list_projects',

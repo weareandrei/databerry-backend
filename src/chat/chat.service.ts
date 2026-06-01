@@ -1,24 +1,39 @@
 /**
- * Ask-AI agentic loop, server-side.
+ * Ask-AI agentic loop, server-side. Built on Gemini 2.5 Flash via
+ * `@google/genai`.
  *
- * - One chat turn = N agent iterations (capped at MAX_AGENT_TURNS)
- *   inside `runAgent`. Each iteration sends the message log + tool
- *   list to Claude; if Claude responds with `tool_use`, we execute
- *   each tool against our own services (no HTTP), feed results
- *   back, and loop.
- * - Inventory (`list_projects`, `list_connections`) is pre-loaded
- *   into the system prompt at the start of each turn so the model
- *   sees the user's data inventory without spending an extra round
- *   trip on every question.
- * - Tools are called *in-process* via injected services. Per-user
- *   scoping is preserved because each handler receives the auth
- *   user id and the underlying services already filter by user.
+ * Why Gemini Flash (not Claude Sonnet, which we used previously):
+ *   - ~5-10× cheaper per token on both sides.
+ *   - 1M-token effective context window — even with our new lazy
+ *     MCP loading, the larger budget removes the "prompt too long"
+ *     class of failures entirely.
+ *   - Function-calling quality is comparable for this workload
+ *     (multi-tool routing + structured arg generation).
+ *
+ * Lazy MCP tool loading:
+ *   - We DON'T concat every MCP server's `tools/list` schemas into
+ *     the request anymore (a single PostHog MCP would push the
+ *     request past 200k tokens — see PR notes).
+ *   - Instead we ship three "meta-tools" (`mcp_list_tools`,
+ *     `mcp_inspect_tool`, `mcp_call_tool`) that fetch what's
+ *     needed on demand, plus a catalog summary IN PROSE in the
+ *     system prompt so the model knows which servers exist and
+ *     what each is for.
+ *   - `McpToolsCacheService` keeps tools/list responses fresh for
+ *     60 s so the model's discover → inspect → call dance during a
+ *     single turn doesn't hit the MCP server three times.
  *
  * No DB persistence. The client owns the message log (in
  * localStorage); the server is stateless per request.
  */
 
-import Anthropic from '@anthropic-ai/sdk'
+import {
+  GoogleGenAI,
+  type Content,
+  type FunctionCall,
+  type GenerateContentResponse,
+  type Part,
+} from '@google/genai'
 import { Injectable, Logger } from '@nestjs/common'
 import { ProjectsService } from '../projects/projects.service'
 import { ConnectionsService } from '../connections/connections.service'
@@ -27,58 +42,77 @@ import { CalendlyViewsService } from '../calendly/views/views.service'
 import { PosthogViewsService } from '../posthog/views/views.service'
 import { GoogleAnalyticsViewsService } from '../google-analytics/views/views.service'
 import { McpService } from '../mcp/mcp.service'
-import { buildTools, type ChatTool, type ToolCtx, type ToolDeps } from './tools'
+import { McpToolsCacheService } from '../mcp/mcp-tools-cache.service'
+import { buildBuiltinTools, type ToolDeps } from './tools'
+import { buildMcpMetaTools } from './mcp-meta-tools'
+import {
+  toGeminiFunctionDeclaration,
+  type ChatTool,
+  type ToolCtx,
+} from './tool-types'
 import {
   maybeRenderableFor,
   type Renderable,
   type RenderableCtx,
 } from './renderables'
 
-// Sonnet 4.5 instead of Opus 4.5: ~5× cheaper across input + output
-// tokens, still extremely capable at tool-using chat. Opus is overkill
-// for "answer a question about your Stripe MRR" — Sonnet handles
-// multi-tool reasoning fine. Bump to Opus only if we see Sonnet
-// missing tool calls or producing worse summaries.
-const MODEL = 'claude-sonnet-4-5'
-const MAX_AGENT_TURNS = 5
+// Gemini 2.5 Flash — the workhorse. `gemini-2.5-flash-lite` would
+// be even cheaper but materially weaker at multi-step tool
+// reasoning; the savings aren't worth degrading "are we doing
+// good?" answers.
+const MODEL = 'gemini-2.5-flash'
 
-// Cap on auto-generated visual cards per chat turn. The agent can
-// call many tools in a single turn ("Are we doing good?" → revenue
-// + MRR + active subs + recent activity); without a cap we'd render
-// six cards under one reply, which gets visually crowded. Four leaves
-// room for the model to surface the most useful primaries without
-// turning the surface into a dashboard. Built-in tools whose results
-// don't deserve a card (`list_*`, MCP tools today) don't count
-// against this limit anyway.
+// Cap on agent iterations within a single user turn. Each
+// iteration is one Gemini round-trip. With lazy MCP loading a
+// turn can plausibly take more iterations than before (the
+// list → inspect → call dance for MCP work), so I bumped this
+// from 5 → 8. Still bounded.
+const MAX_AGENT_TURNS = 8
+
+// Cap on visual cards per turn — see frontend `Renderables.tsx`.
 const MAX_RENDERABLES_PER_TURN = 4
+
+// Neutral conversation message — the controller accepts these
+// from the frontend. Conversion to Gemini's `Content[]` happens
+// inside `runAgent`.
+export interface ChatMessageParam {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface ToolCallTrace {
+  name: string
+  input: Record<string, unknown>
+  result?: unknown
+  error?: string
+  /**
+   * Set when the call routed through `mcp_call_tool`. Carries the
+   * MCP connection's display name + the original (server-side)
+   * tool name so the frontend can render a chip labelled with the
+   * MCP name rather than the meta-tool name.
+   */
+  mcp?: { connectionName: string; toolName: string }
+}
+
+export interface ChatRunResult {
+  reply: string
+  toolCalls: ToolCallTrace[]
+  renderables: Renderable[]
+}
 
 // ── Date context for the system prompt ─────────────────────────────
 //
-// The model's training cutoff is months or years before the current
-// wall clock, and the system prompt gives it the user's timezone but
-// no anchor for "what is today's date." Left to its own devices it
-// fills in dates from its prior — e.g. assumes "this week" means
-// some week in early 2025 — and passes that range to a metric tool,
-// which then dutifully returns $0 because the user wasn't charging
-// anything back then.
-//
-// Fix: compute today's date IN THE USER'S TIMEZONE plus the obvious
-// relative-date anchors ("this week", "last week", etc.) and inject
-// them as a block. The model only has to substitute, not compute.
-//
-// We do the date math via `Intl.DateTimeFormat` (which honours
-// `timeZone`) to get the wall-clock Y/M/D in the user's tz, then
-// shift forward/backward in pure UTC date arithmetic. Date-only
-// math is DST-safe because we never carry a time-of-day component.
+// Same logic + same rationale as the Claude version: anchor "today",
+// "this week", etc. to wall-clock now-in-user-tz so the model doesn't
+// invent dates from its training prior.
 
 interface YmdParts {
   year: number
   month: number // 1-12
   day: number
-  weekday: string // 'Monday' | 'Tuesday' | …
+  weekday: string
 }
 
-/** Format Y/M/D/weekday of `instant` rendered in `tz`. */
 function getWallClock(instant: Date, tz: string): YmdParts {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: tz,
@@ -101,11 +135,6 @@ function fmt(y: number, m: number, d: number): string {
   return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`
 }
 
-/**
- * Add `days` to a Y/M/D triple using UTC arithmetic. We're operating
- * on calendar dates, not instants, so UTC-based shifting gives the
- * right answer regardless of the user's timezone or DST transitions.
- */
 function addDays(parts: { year: number; month: number; day: number }, days: number): { year: number; month: number; day: number } {
   const d = new Date(Date.UTC(parts.year, parts.month - 1, parts.day))
   d.setUTCDate(d.getUTCDate() + days)
@@ -127,33 +156,22 @@ const ISO_WEEKDAY_INDEX: Record<string, number> = {
 }
 
 function buildDateContext(tz: string | null): string {
-  // Always run the math with SOME tz — UTC is the safe fallback when
-  // the client didn't send one. The output explicitly says "(UTC,
-  // user tz unknown)" in that case so the model knows the anchors
-  // may be off by a few hours from the user's wall clock.
   const effectiveTz = tz ?? 'UTC'
-
   const today = getWallClock(new Date(), effectiveTz)
   const todayStr = fmt(today.year, today.month, today.day)
-
   const dowIdx = ISO_WEEKDAY_INDEX[today.weekday] ?? 0
   const mondayThisWeek = addDays(today, -dowIdx)
   const sundayThisWeek = addDays(mondayThisWeek, 6)
   const mondayLastWeek = addDays(mondayThisWeek, -7)
   const sundayLastWeek = addDays(mondayThisWeek, -1)
-
-  // Last day of the current month: day 0 of next month in UTC.
   const monthEnd = new Date(Date.UTC(today.year, today.month, 0))
   const thisMonthStart = fmt(today.year, today.month, 1)
   const thisMonthEnd = fmt(today.year, today.month, monthEnd.getUTCDate())
-
-  // Previous calendar month.
   const prevYear = today.month === 1 ? today.year - 1 : today.year
   const prevMonth = today.month === 1 ? 12 : today.month - 1
   const prevMonthEnd = new Date(Date.UTC(prevYear, prevMonth, 0))
   const lastMonthStart = fmt(prevYear, prevMonth, 1)
   const lastMonthEnd = fmt(prevYear, prevMonth, prevMonthEnd.getUTCDate())
-
   const tzLabel = tz ?? 'UTC (user tz unknown)'
 
   return [
@@ -179,44 +197,11 @@ function buildDateContext(tz: string | null): string {
   ].join('\n')
 }
 
-export interface ToolCallTrace {
-  name: string
-  input: Record<string, unknown>
-  result?: unknown
-  error?: string
-  /**
-   * Set when the tool came from one of the user's MCP servers (as
-   * opposed to a built-in tool like `get_stripe_metric`). Carries
-   * the connection's display name + the tool's ORIGINAL (un-
-   * namespaced) name so the frontend can render a chip with the
-   * MCP name instead of the noisy internal `mcp_0__listPosts` form.
-   */
-  mcp?: { connectionName: string; toolName: string }
-}
-
-export interface ChatRunResult {
-  reply: string
-  toolCalls: ToolCallTrace[]
-  /**
-   * Visual cards derived from successful tool results — stat
-   * numbers, mini line charts, top-N lists. Rendered by the
-   * frontend below the assistant's text bubble. The agent's prose
-   * still narrates ("revenue trended up this week"); these are
-   * the visual companion.
-   *
-   * Built by `renderables.ts` per tool — the chat service just
-   * collects them. Capped at `MAX_RENDERABLES_PER_TURN` to keep
-   * busy turns from drowning the chat surface in cards.
-   */
-  renderables: Renderable[]
-}
-
 @Injectable()
 export class ChatService {
   private readonly logger = new Logger(ChatService.name)
-  private readonly anthropic: Anthropic | null
-  private readonly tools: Record<string, ChatTool>
-  private readonly toolDefinitions: Anthropic.Tool[]
+  private readonly genai: GoogleGenAI | null
+  private readonly builtinTools: Record<string, ChatTool>
 
   constructor(
     private readonly projects: ProjectsService,
@@ -226,11 +211,10 @@ export class ChatService {
     private readonly posthogViews: PosthogViewsService,
     private readonly gaViews: GoogleAnalyticsViewsService,
     private readonly mcp: McpService,
+    private readonly mcpCache: McpToolsCacheService,
   ) {
-    // Construct lazily — let the controller surface a clean error if
-    // the env var isn't set, instead of crashing at module init time.
-    const apiKey = process.env.ANTHROPIC_API_KEY
-    this.anthropic = apiKey ? new Anthropic({ apiKey }) : null
+    const apiKey = process.env.GEMINI_API_KEY
+    this.genai = apiKey ? new GoogleGenAI({ apiKey }) : null
 
     const deps: ToolDeps = {
       projects,
@@ -241,24 +225,19 @@ export class ChatService {
       gaViews,
       mcp,
     }
-    this.tools = buildTools(deps)
-    this.toolDefinitions = Object.values(this.tools).map(t => t.definition)
+    this.builtinTools = buildBuiltinTools(deps)
   }
 
   isConfigured(): boolean {
-    return this.anthropic !== null
+    return this.genai !== null
   }
 
-  // ── System prompt building ──────────────────────────────────────────────
+  // ── Inventory ──────────────────────────────────────────────────
 
   private async loadInventory(userId: string): Promise<{
     projects: { id: string; name: string }[]
     connections: { id: string; name: string; type: string; projectId: string | null }[]
   }> {
-    // Best-effort — if either call fails we proceed without that
-    // half of the inventory rather than blocking the whole chat.
-    // The services return `unknown`-typed columns (toCamel mapping
-    // doesn't narrow), so we cast here to the shapes we need.
     const [projectsRaw, connectionsRaw] = await Promise.all([
       this.projects.getProjects(userId).catch(err => {
         this.logger.warn(`loadInventory: getProjects failed — ${err.message}`)
@@ -269,10 +248,9 @@ export class ChatService {
         return []
       }),
     ])
-    const projects = (projectsRaw as Array<{ id: unknown; name: unknown }>).map(p => ({
-      id: String(p.id),
-      name: String(p.name),
-    }))
+    const projects = (projectsRaw as Array<{ id: unknown; name: unknown }>).map(
+      p => ({ id: String(p.id), name: String(p.name) }),
+    )
     const connections = (
       connectionsRaw as Array<{ id: unknown; name: unknown; type: unknown; projectId: unknown }>
     ).map(c => ({
@@ -284,11 +262,13 @@ export class ChatService {
     return { projects, connections }
   }
 
+  // ── System prompt ──────────────────────────────────────────────
+
   private buildSystemPrompt(
     projects: { id: string; name: string }[],
     connections: { id: string; name: string; type: string; projectId: string | null }[],
     tz: string | null,
-    mcpServers: McpServerSummary[],
+    mcpCatalog: McpCatalogEntry[],
   ): string {
     const projectLines = projects.length
       ? projects.map(p => `- ${p.id} "${p.name}"`).join('\n')
@@ -306,30 +286,29 @@ export class ChatService {
           .join('\n')
       : '(none)'
 
-    // MCP servers — only emit a section when the user has any
-    // configured. Listing each server's tool names lets the model
-    // know "for Beehiiv questions there's a `list_posts` tool" before
-    // it scans the tools[] array. Names are the original (server-
-    // facing) names; the Anthropic-facing names are `mcp_<idx>__<n>`,
-    // documented in the routing guidance below.
-    const mcpLines = mcpServers.length
-      ? mcpServers
-          .map(s => {
-            const tools = s.toolNames.slice(0, 12) // cap so the prompt stays bounded
+    // MCP CATALOG — names + tool counts + brief tool listings.
+    // This replaces the "dump every full schema into tools[]"
+    // approach. The model sees what exists and can drill in via
+    // `mcp_list_tools` / `mcp_inspect_tool` / `mcp_call_tool`
+    // when needed.
+    const mcpLines = mcpCatalog.length
+      ? mcpCatalog
+          .map(e => {
+            const previewNames = e.toolNames.slice(0, 12)
             const more =
-              s.toolNames.length > tools.length
-                ? ` + ${s.toolNames.length - tools.length} more`
+              e.toolNames.length > previewNames.length
+                ? ` + ${e.toolNames.length - previewNames.length} more`
                 : ''
-            const toolList = tools.length ? tools.join(', ') + more : '(no tools)'
-            return `- mcp_${s.idx} "${s.name}" — tools: ${toolList}`
+            const previewList = previewNames.length
+              ? previewNames.join(', ') + more
+              : '(no tools exposed)'
+            return `- mcp_${e.idx} "${e.name}" — ${e.toolNames.length} tools (${previewList})`
           })
           .join('\n')
       : null
 
     const sections: string[] = [
       "You are Databerry's data assistant. You help solo founders understand their business by answering questions about the data they've connected.",
-      '',
-      'The current user has the following projects and connections:',
       '',
       'PROJECTS:',
       projectLines,
@@ -341,237 +320,159 @@ export class ChatService {
     if (mcpLines) {
       sections.push(
         '',
-        'MCP SERVERS (third-party tools the user wired up via the Model Context Protocol — each tool below is callable as `mcp_<idx>__<tool>` in the tools[] list):',
+        'MCP SERVERS (third-party tools the user wired up via MCP — call them via the `mcp_list_tools` / `mcp_inspect_tool` / `mcp_call_tool` meta-tools; full schemas are NOT in the tools list to save tokens):',
         mcpLines,
+        '',
+        'MCP workflow:',
+        "  1. If a server's tool list above already tells you which tool to call, skip to step 2. Otherwise call `mcp_list_tools(serverIndex)` to see brief descriptions.",
+        "  2. Call `mcp_inspect_tool(serverIndex, toolName)` to get the EXACT input schema for the tool you want to call.",
+        "  3. Call `mcp_call_tool(serverIndex, toolName, arguments)` with arguments shaped per the schema you just inspected.",
+        "  If `mcp_call_tool` returns `error` or a result with `isError: true`, surface that honestly — don't fabricate data.",
       )
     }
 
     sections.push(
       '',
-      // CRITICAL: the model's training cutoff is months-to-years
-      // before today, so without this block it WILL guess a date
-      // from its prior and pass it to a metric tool — leading to
-      // wrong "this week" lookups against an empty range. Anchor
-      // everything to wall-clock now-in-user-tz here.
       buildDateContext(tz),
       '',
       'Guidelines:',
       "- When the user names a project, look it up in the PROJECTS list above. You don't need to call list_projects unless the inventory above is empty.",
-      '- For metric tools (`get_stripe_metric`, `get_stripe_chart`, `get_posthog_event_count`), pass `tz` from the date context above AND derive `dateFrom` / `dateTo` from the anchors above for relative queries ("today", "this week", "last month"). NEVER guess dates from your own training data — your knowledge cutoff is before today.',
-      '- Currency values from Stripe tools are in **cents**. Divide by 100 and format as USD when reporting (e.g. `$1,234.56`).',
+      '- For metric tools (`get_stripe_metric`, `get_stripe_chart`, `get_posthog_event_count`), pass `tz` from the date context AND derive `dateFrom` / `dateTo` from the anchors for relative queries. NEVER guess dates from your own training data.',
+      '- Currency values from Stripe tools are in **cents**. Divide by 100 and format as USD when reporting.',
       '- Cite which connection / project a number came from (e.g. "$1,234 — Stripe on Taplaunch").',
-      '- When you mention a date range in your reply, use the SAME range you actually passed to the tool — never paraphrase it into a different year/week.',
-      '- Be concise. Markdown is supported (bold, lists, inline code).',
+      '- When you mention a date range in your reply, use the SAME range you actually passed to the tool — never paraphrase it.',
+      '- Be concise. Markdown is supported.',
       "- If a tool returns `unavailable: true` or an error, tell the user the data isn't available rather than fabricating numbers.",
       '',
-      'Routing — picking the right source for the user\'s question:',
-      "- **Revenue / money / sales** → Stripe. If the user names a project, use only that project's Stripe connection. If they don't name one (\"how is my revenue this week?\") and the user has MULTIPLE Stripe connections across projects, query each one and either sum them (one overall figure) OR break out per-project — your call based on phrasing. Don't ask them to specify Stripe; that's the implied source.",
-      '- **Visitors / traffic / pageviews** → Google Analytics (`google_analytics`) tracks website pageviews; PostHog tracks app-side events (clicks, signups, custom events). If the user asks about "website visitors" prefer GA; if they say "users in my app" prefer PostHog; if either could apply, query both connections (when present) and clearly label which source each number came from.',
+      'Routing — picking the right source:',
+      '- **Revenue / money / sales** → Stripe. If user names a project, use only that project\'s Stripe connection. If they don\'t and the user has multiple, query each and either sum or break out per-project.',
+      '- **Visitors / traffic / pageviews** → Google Analytics (`google_analytics`) for website pageviews; PostHog for app-side events. Query both when ambiguous and label which source each number came from.',
       "- **Meetings / calls** → Calendly.",
-      "- **Anything else specifically named** (Beehiiv, Notion, an internal API, etc.) → check the MCP SERVERS list above. If a server with that name exists, use its tools rather than apologising that the platform isn't supported.",
-      "- **Open-ended health checks** (\"are we doing good?\", \"how's the business?\") → pull 2-3 anchor metrics from whatever the user has connected: revenue trend (Stripe weekly chart), MRR + active subs (Stripe metric), and recent app activity (PostHog event count if available). Summarise the takeaway in 2-3 sentences. Don't dump every number you can find.",
-      "- **Diagnostic 'why' questions** (\"why aren't users subscribing?\", \"why is revenue down?\") → no single tool answers this. Pull two or three relevant signals (e.g. PostHog event counts for the relevant funnel steps + Stripe MRR change) and call out what stands out. Acknowledge that you're inferring from what's measurable, not asserting a cause.",
+      "- **Anything else specifically named** (Beehiiv, Notion, an internal API, etc.) → check the MCP SERVERS list above. If a server with that name exists, use the MCP meta-tools rather than apologising.",
+      "- **Open-ended health checks** (\"are we doing good?\") → pull 2-3 anchor metrics from connected sources: revenue trend, MRR + active subs, recent app activity. Summarise in 2-3 sentences. Don't dump every number.",
+      "- **Diagnostic 'why' questions** → pull two or three relevant signals and call out what stands out. Acknowledge you're inferring, not asserting cause.",
       '',
       'PostHog event questions:',
-      '- The user often describes events by intent ("how many times did a user sign up") rather than the exact event name. PostHog event names are case-sensitive and arbitrary (e.g. `project_submitted`, `user_signup`, `$pageview`).',
-      '- Workflow: (1) find the PostHog connection for the relevant project from CONNECTIONS, (2) call `list_posthog_events` to see what event names exist, (3) pick the closest match by name, (4) call `get_posthog_event_count` with the EXACT event name from step 2.',
-      "- If multiple events plausibly match (e.g. `signup` and `user_signup` both exist), pick the most specific one and mention which you used so the user can correct you. Don't guess at names that aren't in the list.",
-      '- For "recently" / "lately" / vague timeframes, default to **last 7 days** ending today (use the "today" anchor above) and mention the range in your reply.',
-      "- If `list_posthog_events` returns 0 events, tell the user the project hasn't recorded any events yet (instead of inventing a name).",
-      '',
-      'MCP-server tools:',
-      '- The MCP tools above are exposed by the user\'s OWN connected servers (think: their personal Beehiiv account, Notion workspace, etc.). You call them like any other tool — the tools[] list has them as `mcp_<idx>__<name>`.',
-      '- Read each tool\'s description carefully — MCP servers don\'t share a schema, so input shapes vary wildly.',
-      '- If a tool returns a result with `isError: true` or an obvious error message, surface that to the user honestly instead of pretending you got data.',
-      '- When citing an MCP-sourced number, name the server (e.g. "12.5% open rate — Beehiiv via Newsletter MCP") so the user can verify.',
+      '- PostHog event names are case-sensitive and arbitrary. Workflow: find the PostHog connection for the project from CONNECTIONS → call `list_posthog_events` → pick the closest match by name → call `get_posthog_event_count` with the EXACT name.',
+      "- For \"recently\" / vague timeframes, default to **last 7 days** ending today and mention the range in your reply.",
     )
 
     return sections.join('\n')
   }
 
-  // ── MCP tool building ───────────────────────────────────────────────────
-  //
-  // Fan out to the user's MCP servers, call `tools/list` on each, and
-  // build Anthropic-compatible `Tool[]` definitions with namespaced
-  // names (so `Beehiiv.list_posts` becomes `mcp_0__list_posts` to
-  // Claude). The dispatch map is returned alongside so the agent loop
-  // can route a tool_use block back to the right server.
-  //
-  // Fail-soft: a dead MCP server logs a warning and contributes
-  // nothing — the other servers (and the built-in tools) still work.
-
-  private async buildMcpToolsForUser(userId: string): Promise<{
-    definitions: Anthropic.Tool[]
-    dispatch: Map<string, McpDispatchEntry>
-    summaries: McpServerSummary[]
-  }> {
-    const mcpConns = await this.mcp.listForUser(userId)
-    if (mcpConns.length === 0) {
-      return { definitions: [], dispatch: new Map(), summaries: [] }
-    }
-
-    // Parallel list to keep the latency bound to max(MCP latencies)
-    // rather than their sum. `mcpService.listTools` already wraps
-    // failures in a returned `[]`, so `Promise.all` here is safe.
-    const toolsPerConn = await Promise.all(
-      mcpConns.map(c => this.mcp.listTools(c.connectionId, userId)),
-    )
-
-    const definitions: Anthropic.Tool[] = []
-    const dispatch = new Map<string, McpDispatchEntry>()
-    const summaries: McpServerSummary[] = []
-
-    mcpConns.forEach((conn, idx) => {
-      const tools = toolsPerConn[idx] ?? []
-      summaries.push({
-        idx,
-        name: conn.name,
-        toolNames: tools.map(t => t.name),
-      })
-
-      for (const tool of tools) {
-        const claudeName = makeMcpToolName(idx, tool.name)
-        if (!claudeName) continue // sanitization left nothing usable; skip.
-        const description = tool.description
-          ? `[${conn.name}] ${tool.description}`
-          : `Tool exposed by the user's "${conn.name}" MCP server.`
-        // Anthropic requires SOME object schema. MCP servers usually
-        // ship one; for the few that don't, default to "no args."
-        const schema = (tool.inputSchema as Record<string, unknown> | undefined) ?? {
-          type: 'object',
-          properties: {},
-        }
-        definitions.push({
-          name: claudeName,
-          description,
-          input_schema: schema as Anthropic.Tool['input_schema'],
-        })
-        dispatch.set(claudeName, {
-          connectionId: conn.connectionId,
-          connectionName: conn.name,
-          originalToolName: tool.name,
-        })
-      }
-    })
-
-    return { definitions, dispatch, summaries }
-  }
+  // ── MCP catalog ────────────────────────────────────────────────
 
   /**
-   * Dispatch an MCP-namespaced tool call. Mirrors the shape of
-   * `executeTool` (same `{ result, trace }` envelope) so the agent
-   * loop can treat both pathways uniformly.
+   * Prefetch tools/list for each MCP and produce a small catalog
+   * the system prompt can list. NOT the full schemas — just names
+   * and brief descriptions, which is what the model needs to know
+   * WHICH server to drill into.
+   *
+   * Fail-soft: a dead MCP server contributes an empty `toolNames`
+   * array. The catalog entry still appears so the model knows the
+   * server exists; calls to it will then surface the real error
+   * via the meta-tools.
    */
-  private async executeMcpTool(
-    claudeName: string,
-    entry: McpDispatchEntry,
-    input: Record<string, unknown>,
-    userId: string,
-  ): Promise<{ result: unknown; trace: ToolCallTrace }> {
-    try {
-      const result = await this.mcp.callTool(
-        entry.connectionId,
-        userId,
-        entry.originalToolName,
-        input,
-      )
-      return {
-        result,
-        trace: {
-          name: claudeName,
-          input,
-          result,
-          mcp: {
-            connectionName: entry.connectionName,
-            toolName: entry.originalToolName,
-          },
-        },
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      this.logger.warn(
-        `MCP tool ${claudeName} (${entry.connectionName}.${entry.originalToolName}) failed: ${message}`,
-      )
-      return {
-        result: { error: message },
-        trace: {
-          name: claudeName,
-          input,
-          error: message,
-          mcp: {
-            connectionName: entry.connectionName,
-            toolName: entry.originalToolName,
-          },
-        },
-      }
-    }
+  private async buildMcpCatalog(userId: string): Promise<McpCatalogEntry[]> {
+    const servers = await this.mcp.listForUser(userId)
+    if (servers.length === 0) return []
+    const toolsPerServer = await Promise.all(
+      servers.map(s => this.mcpCache.getToolsFor(s.connectionId, userId)),
+    )
+    return servers.map((s, idx) => ({
+      idx,
+      connectionId: s.connectionId,
+      name: s.name,
+      toolNames: (toolsPerServer[idx] ?? []).map(t => t.name),
+    }))
   }
 
-  // ── Tool execution ──────────────────────────────────────────────────────
+  // ── Tool dispatch ──────────────────────────────────────────────
 
   private async executeTool(
-    toolName: string,
+    tools: Record<string, ChatTool>,
+    name: string,
     input: Record<string, unknown>,
     ctx: ToolCtx,
+    catalog: McpCatalogEntry[],
   ): Promise<{ result: unknown; trace: ToolCallTrace }> {
-    const tool = this.tools[toolName]
+    const tool = tools[name]
     if (!tool) {
-      const error = `Unknown tool: ${toolName}`
+      const error = `Unknown tool: ${name}`
       return {
         result: { error },
-        trace: { name: toolName, input, error },
+        trace: { name, input, error },
       }
     }
     try {
       const result = await tool.handler(input, ctx)
-      return { result, trace: { name: toolName, input, result } }
+      const trace: ToolCallTrace = { name, input, result }
+      // Tag `mcp_call_tool` traces with the MCP server name + original
+      // tool name so the frontend's chip row labels them "PostHog"
+      // (or whatever the connection is called) instead of the generic
+      // `mcp_call_tool`. Resolves from the catalog by serverIndex.
+      if (name === 'mcp_call_tool') {
+        const idx = Number(input.serverIndex)
+        const entry = Number.isInteger(idx) ? catalog[idx] : undefined
+        if (entry) {
+          trace.mcp = {
+            connectionName: entry.name,
+            toolName: String(input.toolName ?? ''),
+          }
+        }
+      }
+      return { result, trace }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      this.logger.warn(`tool ${toolName} failed: ${message}`)
+      this.logger.warn(`tool ${name} failed: ${message}`)
       return {
         result: { error: message },
-        trace: { name: toolName, input, error: message },
+        trace: { name, input, error: message },
       }
     }
   }
 
-  // ── Agent loop ──────────────────────────────────────────────────────────
+  // ── Agent loop ─────────────────────────────────────────────────
 
   async runAgent(
-    messages: Anthropic.MessageParam[],
+    messages: ChatMessageParam[],
     userId: string,
     tz: string | null,
   ): Promise<ChatRunResult> {
-    if (!this.anthropic) {
-      // Should never reach here — controller checks `isConfigured()`
-      // before calling — but keep the guard for safety.
-      throw new Error('ANTHROPIC_API_KEY is not set')
+    if (!this.genai) {
+      throw new Error('GEMINI_API_KEY is not set')
     }
 
-    // Inventory + MCP discovery run in parallel — both hit external
-    // services (Supabase + per-MCP `tools/list` round-trips), no
-    // dependency between them. Max(inventory, MCPs) latency rather
-    // than sum.
-    const [inventoryResult, mcpResult] = await Promise.all([
+    // Build inventory + MCP catalog in parallel — both hit external
+    // services, no dependency between them.
+    const [inventory, mcpCatalog] = await Promise.all([
       this.loadInventory(userId),
-      this.buildMcpToolsForUser(userId),
+      this.buildMcpCatalog(userId),
     ])
-    const { projects, connections } = inventoryResult
-    const { definitions: mcpToolDefinitions, dispatch: mcpDispatch, summaries: mcpSummaries } =
-      mcpResult
+    const { projects, connections } = inventory
 
-    const system = this.buildSystemPrompt(projects, connections, tz, mcpSummaries)
-    // Built-in tools first, MCP tools after — order doesn't affect
-    // the model's choice (it picks by name + description), but keeps
-    // the list visually grouped if we ever log it.
-    const allTools = [...this.toolDefinitions, ...mcpToolDefinitions]
+    // Meta-tools are built per-turn so they can close over the
+    // catalog (the `serverIndex` argument the model sends is
+    // resolved against this array).
+    const metaTools = buildMcpMetaTools({
+      servers: mcpCatalog.map(e => ({
+        connectionId: e.connectionId,
+        name: e.name,
+      })),
+      cache: this.mcpCache,
+      mcp: this.mcp,
+      userId,
+    })
+    const allTools = { ...this.builtinTools, ...metaTools }
+    const geminiTools = Object.values(allTools).map(t =>
+      toGeminiFunctionDeclaration(t.definition),
+    )
 
-    // Lookup the renderable builders use to enrich card titles with
-    // the source project name — "Gross volume · Databerry" vs the
-    // ambiguous "Gross volume" you'd otherwise get when the agent
-    // produces multiple parallel cards (one per project) in a single
-    // turn. The map is built ONCE per chat turn; builders read it
-    // O(1) per tool.
+    const system = this.buildSystemPrompt(projects, connections, tz, mcpCatalog)
+
+    // Renderable enrichment context — map connectionId →
+    // {name, projectName} so multi-project responses get unique
+    // titles ("Gross volume · Databerry" vs. just "Gross volume").
     const projectNamesById = new Map(projects.map(p => [p.id, p.name]))
     const connectionsById = new Map(
       connections.map(c => [
@@ -579,100 +480,121 @@ export class ChatService {
         {
           name: c.name,
           projectName: c.projectId
-            ? (projectNamesById.get(c.projectId) ?? null)
+            ? projectNamesById.get(c.projectId) ?? null
             : null,
         },
       ]),
     )
     const renderableCtx: RenderableCtx = { connectionsById }
 
-    let currentMessages: Anthropic.MessageParam[] = messages
+    let contents: Content[] = toGeminiContents(messages)
     const toolCalls: ToolCallTrace[] = []
     const renderables: Renderable[] = []
     const ctx: ToolCtx = { userId }
 
-    for (let i = 0; i < MAX_AGENT_TURNS; i++) {
-      const response = await this.anthropic.messages.create({
-        model: MODEL,
-        // Caps the assistant's reply length. 1024 tokens ≈ ~750
-        // English words — comfortably more than any Q&A response
-        // needs, and ½ the previous 2048 cap. Output tokens are the
-        // priciest line item, so this directly trims cost on long
-        // answers without affecting normal ones.
-        max_tokens: 1024,
-        // 0.3 = mostly deterministic. The model is doing factual
-        // data lookups via tools, not creative writing — we don't
-        // want it inventing numbers, and we want repeated questions
-        // to give consistent answers.
-        temperature: 0.3,
-        system,
-        tools: allTools,
-        messages: currentMessages,
-      })
+    // Pre-flight log — see how much cheaper this turn is than the
+    // old Claude path. Includes the meta-tools + the catalog text;
+    // does NOT include the per-MCP full schemas (which we no
+    // longer send).
+    const systemChars = system.length
+    const toolsChars = JSON.stringify(geminiTools).length
+    const messagesChars = JSON.stringify(contents).length
+    this.logger.log(
+      `runAgent prep: user=${userId} model=${MODEL} ` +
+        `tools=${geminiTools.length} (builtin=${Object.keys(this.builtinTools).length}, mcp-meta=${Object.keys(metaTools).length}) ` +
+        `mcpServers=${mcpCatalog.length} ` +
+        `system=${systemChars} chars (~${Math.round(systemChars / 4)} tok) ` +
+        `tools=${toolsChars} chars (~${Math.round(toolsChars / 4)} tok) ` +
+        `messages=${messagesChars} chars (~${Math.round(messagesChars / 4)} tok) ` +
+        `total≈${Math.round((systemChars + toolsChars + messagesChars) / 4)} tok`,
+    )
 
-      if (response.stop_reason === 'end_turn') {
-        const textBlocks = response.content.filter(
-          (b): b is Anthropic.TextBlock => b.type === 'text',
+    for (let iter = 0; iter < MAX_AGENT_TURNS; iter++) {
+      let response: GenerateContentResponse
+      try {
+        response = await this.genai.models.generateContent({
+          model: MODEL,
+          contents,
+          config: {
+            systemInstruction: system,
+            tools: [{ functionDeclarations: geminiTools }],
+            // Mostly deterministic — same rationale as the Claude
+            // path. Tool routing is factual lookup, not creative
+            // writing.
+            temperature: 0.3,
+            maxOutputTokens: 1024,
+          },
+        })
+      } catch (err) {
+        // Re-throw with a human-readable message extracted from
+        // Gemini's JSON error envelope (the SDK's `ApiError`
+        // serialises its `.message` as a JSON blob — useless to
+        // the user). The controller catches this and surfaces the
+        // clean message to the frontend, which renders it as a
+        // red error bubble.
+        throw new Error(extractGeminiErrorMessage(err))
+      }
+
+      // Pull the model's first candidate Content (the next message
+      // it wants to send). Gemini structures this as one Content
+      // with multiple Parts; the parts may mix text and
+      // functionCall blocks within a single response.
+      const candidate = response.candidates?.[0]
+      const modelContent: Content | undefined = candidate?.content
+      const parts: Part[] = modelContent?.parts ?? []
+
+      const functionCalls = parts
+        .map(p => p.functionCall)
+        .filter((fc): fc is FunctionCall => !!fc)
+
+      if (functionCalls.length === 0) {
+        // No tool calls — the model is replying with text. Pull
+        // text parts and we're done.
+        const reply = parts
+          .map(p => (typeof p.text === 'string' ? p.text : ''))
+          .filter(Boolean)
+          .join('\n\n')
+        return { reply, toolCalls, renderables }
+      }
+
+      // Tool call(s) — execute each, append both the model's call
+      // and our function responses to `contents`, loop.
+      const responseParts: Part[] = []
+      for (const fc of functionCalls) {
+        const name = fc.name ?? ''
+        const input = (fc.args as Record<string, unknown>) ?? {}
+        const { result, trace } = await this.executeTool(
+          allTools,
+          name,
+          input,
+          ctx,
+          mcpCatalog,
         )
-        return {
-          reply: textBlocks.map(b => b.text).join('\n\n'),
-          toolCalls,
-          renderables,
+        toolCalls.push(trace)
+        responseParts.push({
+          functionResponse: {
+            name,
+            response: { result },
+          },
+        })
+
+        // Derive a Renderable if applicable. For `mcp_call_tool`
+        // the underlying tool isn't one of the built-in renderable
+        // tools, so this is a no-op for MCP calls (matches V1).
+        if (renderables.length < MAX_RENDERABLES_PER_TURN && !trace.error) {
+          const r = maybeRenderableFor(name, input, result, renderableCtx)
+          if (r) renderables.push(r)
         }
       }
 
-      if (response.stop_reason === 'tool_use') {
-        const toolResults: Anthropic.ToolResultBlockParam[] = []
-        for (const block of response.content) {
-          if (block.type === 'tool_use') {
-            const input = block.input as Record<string, unknown>
-            // MCP tools dispatch through a separate code path because
-            // they live outside `this.tools` and need credential
-            // decryption + remote round-trip per call.
-            const mcpEntry = mcpDispatch.get(block.name)
-            const { result, trace } = mcpEntry
-              ? await this.executeMcpTool(block.name, mcpEntry, input, userId)
-              : await this.executeTool(block.name, input, ctx)
-            toolCalls.push(trace)
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: block.id,
-              content: JSON.stringify(result),
-            })
-
-            // Derive a visual card from this result (per-tool logic
-            // lives in `renderables.ts`). Skip when:
-            //   - The cap is hit (avoid 6-card walls of text).
-            //   - The tool returned an error (already surfaced in the
-            //     trace popover; a card would be redundant + scary).
-            //   - The derivation returned `null` (tool doesn't merit
-            //     a card — `list_*`, MCP, etc.).
-            if (
-              renderables.length < MAX_RENDERABLES_PER_TURN &&
-              !trace.error
-            ) {
-              const r = maybeRenderableFor(block.name, input, result, renderableCtx)
-              if (r) renderables.push(r)
-            }
-          }
-        }
-        currentMessages = [
-          ...currentMessages,
-          { role: 'assistant', content: response.content },
-          { role: 'user', content: toolResults },
-        ]
-        continue
-      }
-
-      // max_tokens / stop_sequence — return whatever text we have.
-      const textBlocks = response.content.filter(
-        (b): b is Anthropic.TextBlock => b.type === 'text',
-      )
-      return {
-        reply: textBlocks.map(b => b.text).join('\n\n'),
-        toolCalls,
-        renderables,
-      }
+      // Append the assistant's tool-calling Content + our user-
+      // role functionResponse Content. The next iteration sees
+      // the new state and either calls more tools or replies.
+      contents = [
+        ...contents,
+        modelContent ?? { role: 'model', parts },
+        { role: 'user', parts: responseParts },
+      ]
     }
 
     return {
@@ -684,32 +606,73 @@ export class ChatService {
   }
 }
 
-// ── MCP helpers ─────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────
 
-/** What `buildSystemPrompt` needs to know about each MCP server. */
-interface McpServerSummary {
+interface McpCatalogEntry {
   idx: number
+  connectionId: string
   name: string
   toolNames: string[]
 }
 
-/** Per-turn mapping for routing a model tool_use → the right MCP. */
-interface McpDispatchEntry {
-  connectionId: string
-  connectionName: string
-  originalToolName: string
+/**
+ * Translate the frontend's `{role, content}` shape into Gemini's
+ * `Content[]`. Past assistant messages become `role: 'model'`;
+ * everything else stays `role: 'user'`. Empty messages are dropped
+ * — Gemini rejects zero-length Content items.
+ */
+function toGeminiContents(messages: ChatMessageParam[]): Content[] {
+  return messages
+    .filter(m => m.content && m.content.length > 0)
+    .map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content }],
+    }))
 }
 
 /**
- * Produce a Claude-safe tool name from `(idx, mcpToolName)`. Anthropic
- * tool names match `^[a-zA-Z0-9_-]{1,64}$`; MCP tool names are
- * basically anything. Sanitize then prefix.
+ * Pull a clean, user-readable message out of whatever Gemini SDK
+ * error we got. The SDK's `ApiError` exposes the upstream JSON
+ * envelope as `err.message` — e.g.:
+ *   `{"error":{"code":503,"message":"This model is currently
+ *     experiencing high demand…","status":"UNAVAILABLE"}}`
  *
- * Returns null if sanitization leaves nothing (so the caller can
- * skip the tool rather than register an empty-named one).
+ * Without this, the controller's outer catch would re-throw the
+ * whole JSON blob, and users see the literal payload in their chat
+ * surface. Parse it instead and return just `error.message`.
+ *
+ * Fallback chain:
+ *   1. JSON-parse `err.message`, return `parsed.error.message`.
+ *   2. JSON-parse, return `parsed.message` (some SDK error shapes).
+ *   3. The raw error message (already a string from Node `Error`).
+ *   4. Hardcoded fallback if nothing's available.
  */
-function makeMcpToolName(idx: number, mcpToolName: string): string | null {
-  const cleaned = mcpToolName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 50)
-  if (!cleaned) return null
-  return `mcp_${idx}__${cleaned}`
+function extractGeminiErrorMessage(err: unknown): string {
+  const raw =
+    err instanceof Error
+      ? err.message
+      : typeof err === 'string'
+        ? err
+        : ''
+  if (!raw) return 'The AI service returned an unknown error.'
+  // The SDK sometimes prefixes the JSON with `got status: X. ` — try
+  // to scrub that before parsing.
+  const cleaned = raw.replace(/^got status:\s*\d+\.\s*/i, '').trim()
+  // Many errors are pure JSON; some are JSON with leading prose.
+  // Try to find the first `{` and parse from there.
+  const firstBrace = cleaned.indexOf('{')
+  if (firstBrace >= 0) {
+    const candidate = cleaned.slice(firstBrace)
+    try {
+      const parsed = JSON.parse(candidate) as {
+        error?: { message?: string; status?: string; code?: number }
+        message?: string
+      }
+      if (parsed.error?.message) return parsed.error.message
+      if (parsed.message) return parsed.message
+    } catch {
+      // Not parseable JSON — fall through to the raw message.
+    }
+  }
+  return cleaned || raw
 }

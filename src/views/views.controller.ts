@@ -27,6 +27,22 @@ export class ViewsController {
     return this.viewsService.getPinnedViews(req.authUser.id)
   }
 
+  /**
+   * Returns the user's total view count across all projects, used
+   * by the sidebar plan card. Declared BEFORE the catch-all `@Get`
+   * below so the literal `count` segment matches first (otherwise
+   * `getViews` would try to interpret "count" as a folder filter
+   * and 400).
+   *
+   * Cheap query: Supabase HEAD request with `count: 'exact'` — no
+   * row payload, just the number.
+   */
+  @Get('count')
+  async getCount(@Req() req: AuthenticatedRequest) {
+    const count = await this.viewsService.countByUser(req.authUser.id)
+    return { count }
+  }
+
   @Get()
   getViews(
     @Query('folderId') folderId: string | undefined,
