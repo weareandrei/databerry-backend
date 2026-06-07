@@ -18,6 +18,9 @@ import { ProjectSettingsModule } from './project-settings/project-settings.modul
 import { ProjectOverviewModule } from './project-overview/project-overview.module'
 import { ChatModule } from './chat/chat.module'
 import { ContactModule } from './contact/contact.module'
+import { FeedbackModule } from './feedback/feedback.module'
+import { SuggestionsModule } from './suggestions/suggestions.module'
+import { PeopleModule } from './people/people.module'
 import { BillingModule } from './billing/billing.module'
 
 @Module({
@@ -41,6 +44,9 @@ import { BillingModule } from './billing/billing.module'
     ProjectOverviewModule,
     ChatModule,
     ContactModule,
+    FeedbackModule,
+    SuggestionsModule,
+    PeopleModule,
     BillingModule,
   ],
 })
