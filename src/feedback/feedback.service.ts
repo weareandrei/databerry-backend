@@ -25,12 +25,8 @@ export class FeedbackService {
   private readonly logger = new Logger(FeedbackService.name)
   private readonly client: Resend | null
   private readonly fromAddress: string
-  /**
-   * Personal inbox for founder-only feedback. NOT the public support
-   * alias — these messages are deliberately routed away from the
-   * team mailbox so the founder sees the raw, unfiltered signal.
-   */
-  private readonly toAddress = 'weareandrei@gmail.com'
+  /** Team inbox for dashboard satisfaction-survey feedback. */
+  private readonly toAddress = 'team@heavenmade.org'
 
   constructor() {
     const apiKey = process.env.RESEND_API_KEY
