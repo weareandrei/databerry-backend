@@ -4,7 +4,8 @@ import {
   type ChargeRow,
 } from '../storage-queries'
 
-export type BucketGranularity = 'hourly' | 'daily'
+import type { BucketGranularity } from '../../../common/types'
+export type { BucketGranularity }
 
 type Client = ReturnType<SupabaseService['getClient']>
 

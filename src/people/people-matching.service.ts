@@ -24,6 +24,14 @@ export interface ObservedPerson {
   identifiers: ObservedIdentifier[]
   email?: string | null
   displayName?: string | null
+  /** ISO 3166-1 alpha-2 country code (PostHog geoip / Stripe address). */
+  country?: string | null
+  /** First-touch traffic source (referring domain / utm), '$direct'
+   *  already normalised to 'direct'. NULL when the platform has none. */
+  initialSource?: string | null
+  /** The platform's timestamp for this person (ISO). Sort key + the
+   *  displayed "Last seen". See the migration note on its semantics. */
+  lastSeenAt?: string | null
 }
 
 /**
@@ -181,6 +189,9 @@ export class PeopleMatchingService {
         user_id: userId,
         display_name: observed.displayName ?? null,
         primary_email: observed.email ? observed.email.trim().toLowerCase() : null,
+        country: observed.country ?? null,
+        initial_source: observed.initialSource ?? null,
+        last_seen_at: observed.lastSeenAt ?? null,
       })
       .select('id')
       .single()
@@ -299,10 +310,12 @@ export class PeopleMatchingService {
   }
 
   /**
-   * Backfill the person's display fields if this observation taught
-   * us something the row didn't have. We only FILL nulls — never
-   * overwrite an existing name/email, so the first non-null wins and
-   * later pulls don't clobber it.
+   * Backfill the person's display fields from this observation:
+   *   - name / email / country / initial_source → FILL nulls only
+   *     (first non-null wins; later pulls never clobber).
+   *   - last_seen_at → keep the LATEST (so re-syncs and multiple
+   *     platforms advance it, never rewind it).
+   * No-op when the observation adds nothing.
    */
   private async enrichPerson(
     userId: string,
@@ -311,22 +324,44 @@ export class PeopleMatchingService {
   ): Promise<void> {
     const email = observed.email ? observed.email.trim().toLowerCase() : null
     const name = observed.displayName ?? null
-    if (!email && !name) return
+    const country = observed.country ?? null
+    const initialSource = observed.initialSource ?? null
+    const lastSeenAt = observed.lastSeenAt ?? null
+    if (!email && !name && !country && !initialSource && !lastSeenAt) return
 
     const { data: current, error } = await this.supabaseService
       .getClient()
       .from('people')
-      .select('primary_email, display_name')
+      .select('primary_email, display_name, country, initial_source, last_seen_at')
       .eq('user_id', userId)
       .eq('id', personId)
       .maybeSingle()
     if (error) throw new Error(error.message)
     if (!current) return
 
-    const cur = current as { primary_email: string | null; display_name: string | null }
+    const cur = current as {
+      primary_email: string | null
+      display_name: string | null
+      country: string | null
+      initial_source: string | null
+      last_seen_at: string | null
+    }
     const patch: Record<string, string> = {}
     if (email && !cur.primary_email) patch.primary_email = email
     if (name && !cur.display_name) patch.display_name = name
+    if (country && !cur.country) patch.country = country
+    if (initialSource && !cur.initial_source) patch.initial_source = initialSource
+    // Advance last_seen_at to the most recent observed timestamp.
+    // Compare by parsed epoch, NOT string: the observed value is
+    // normalised ISO ("…Z") while the stored timestamptz comes back
+    // as "…+00:00", so a lexicographic compare would be unreliable.
+    if (lastSeenAt) {
+      const observedMs = new Date(lastSeenAt).getTime()
+      const currentMs = cur.last_seen_at ? new Date(cur.last_seen_at).getTime() : NaN
+      if (!Number.isNaN(observedMs) && (Number.isNaN(currentMs) || observedMs > currentMs)) {
+        patch.last_seen_at = lastSeenAt
+      }
+    }
     if (Object.keys(patch).length === 0) return
 
     const { error: upErr } = await this.supabaseService

@@ -39,7 +39,7 @@ const LIVE_VALUE_TYPES = new Set([
   'stripe_churn_rate',
 ])
 
-type ChartMode = 'daily' | 'weekly' | 'monthly'
+import type { ChartMode } from '../../common/types'
 
 const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 const MONTH_LABELS = [

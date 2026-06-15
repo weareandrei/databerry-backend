@@ -6,7 +6,7 @@ import { metricForViewType, fetchRealtimeActiveUsers, fetchTodayMetric } from '.
 import { fetchMetricByBucket, type BucketGranularity } from './live/sources'
 import { hourlyBucketCount } from '../../common/tz'
 
-type ChartMode = 'daily' | 'weekly' | 'monthly'
+import type { ChartMode } from '../../common/types'
 
 const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 

@@ -12,7 +12,8 @@ import {
 const DATA_BASE = 'https://analyticsdata.googleapis.com/v1beta'
 const logger = new Logger('GoogleAnalyticsDataAPI')
 
-export type BucketGranularity = 'hourly' | 'daily'
+import type { BucketGranularity } from '../../../common/types'
+export type { BucketGranularity }
 
 export interface SourceBucketRow {
   bucketKey: string // "YYYYMMDDHH" for hourly, "YYYYMMDD" for daily
@@ -75,8 +76,15 @@ async function throwForResponse(
 }
 
 /**
- * Fetches sessions (activeUsers) grouped by session source and time bucket.
- * Uses `dateHour` dimension for Daily mode (hourly buckets) and `date` dimension for Weekly/Monthly.
+ * Fetches UNIQUE VISITORS (`totalUsers`) grouped by session source and
+ * time bucket. Uses `dateHour` dimension for Daily mode (hourly
+ * buckets) and `date` for Weekly/Monthly.
+ *
+ * Was `sessions` — swapped to `totalUsers` as part of the
+ * visitors-vs-pageviews disambiguation: the overview chart labels
+ * this series "Visitors", so it must count people, not sessions
+ * (one person bouncing in three times a day inflated "visitors" by
+ * 3× and never reconciled with PostHog-backed projects).
  */
 export async function fetchSourcesByBucket(
   token: string,
@@ -94,7 +102,7 @@ export async function fetchSourcesByBucket(
     body: JSON.stringify({
       dateRanges: [{ startDate: dateFrom, endDate: dateTo }],
       dimensions: [{ name: 'sessionSource' }, { name: timeDimension }],
-      metrics: [{ name: 'sessions' }],
+      metrics: [{ name: 'totalUsers' }],
       limit: 10000,
     }),
   })
@@ -109,6 +117,87 @@ export async function fetchSourcesByBucket(
     source: row.dimensionValues[0].value,
     bucketKey: row.dimensionValues[1].value,
     value: parseInt(row.metricValues[0].value, 10) || 0,
+  }))
+}
+
+/**
+ * Range-wide UNIQUE visitor count — `totalUsers` over [from, to] with
+ * NO date dimension, so GA dedupes once across the whole window.
+ *
+ * Same reasoning as the PostHog `fetchPosthogVisitorsTotal`: summing
+ * the per-bucket `totalUsers` from `fetchSourcesByBucket` double-counts
+ * anyone active in more than one bucket, inflating the chart's headline
+ * "Visitors" total above the real number of people. This single
+ * dimensionless report is the honest deduped total.
+ */
+export async function fetchVisitorsTotal(
+  token: string,
+  connectionId: string,
+  propertyId: string,
+  dateFrom: string,
+  dateTo: string,
+): Promise<number> {
+  const res = await fetch(`${DATA_BASE}/properties/${propertyId}:runReport`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      dateRanges: [{ startDate: dateFrom, endDate: dateTo }],
+      metrics: [{ name: 'totalUsers' }],
+    }),
+  })
+
+  if (!res.ok) await throwForResponse(connectionId, res, 'GA Data API error (visitors total)')
+
+  const data = (await res.json()) as {
+    rows?: { metricValues: { value: string }[] }[]
+  }
+  return parseInt(data.rows?.[0]?.metricValues[0]?.value ?? '0', 10) || 0
+}
+
+export interface GAPageRow {
+  path: string
+  pageviews: number
+  visitors: number
+}
+
+/**
+ * Top pages by pageview count — GA flavour of the overview panel's
+ * "Pages" tab. One `runReport` over `pagePath` with both counts so
+ * the UI can show views + unique people per path without a second
+ * round-trip. Server-side ordered by pageviews desc.
+ */
+export async function fetchPagesList(
+  token: string,
+  connectionId: string,
+  propertyId: string,
+  dateFrom: string,
+  dateTo: string,
+  limit: number,
+): Promise<GAPageRow[]> {
+  const safeLimit = Math.max(1, Math.min(250, Math.floor(limit)))
+
+  const res = await fetch(`${DATA_BASE}/properties/${propertyId}:runReport`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      dateRanges: [{ startDate: dateFrom, endDate: dateTo }],
+      dimensions: [{ name: 'pagePath' }],
+      metrics: [{ name: 'screenPageViews' }, { name: 'totalUsers' }],
+      orderBys: [{ metric: { metricName: 'screenPageViews' }, desc: true }],
+      limit: safeLimit,
+    }),
+  })
+
+  if (!res.ok) await throwForResponse(connectionId, res, 'GA Data API error (pages)')
+
+  const data = (await res.json()) as {
+    rows?: { dimensionValues: { value: string }[]; metricValues: { value: string }[] }[]
+  }
+
+  return (data.rows ?? []).map(row => ({
+    path: row.dimensionValues[0].value,
+    pageviews: parseInt(row.metricValues[0].value, 10) || 0,
+    visitors: parseInt(row.metricValues[1].value, 10) || 0,
   }))
 }
 

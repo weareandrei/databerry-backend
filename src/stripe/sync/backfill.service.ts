@@ -71,7 +71,53 @@ export class StripeBackfillService {
     get: StripeGetter,
     key: string,
   ): Promise<StripeAccountRow> {
-    const account = (await get('account')) as unknown as StripeAccountRow
+    let account: StripeAccountRow
+    try {
+      account = (await get('account')) as unknown as StripeAccountRow
+    } catch (err) {
+      // Restricted keys created per our setup instructions (Read on
+      // Charges / Customers / Subscriptions / Products) do NOT carry
+      // `accounts_kyc_basic_read` ("Basic Business Contact
+      // Information"), which Stripe now requires for /v1/account.
+      // That failure does NOT mean the key is bad — Stripe
+      // AUTHENTICATED it (the permission error even names the
+      // account id). Rejecting here forced users to grant a KYC
+      // permission we never use, purely to satisfy our own probe.
+      //
+      // Recovery: pull the `acct_…` id out of Stripe's error text,
+      // then prove the key can read what we ACTUALLY need with a
+      // 1-charge probe. Genuinely invalid keys (rotated / deleted)
+      // fail with no account id in the message and still reject.
+      const msg = err instanceof Error ? err.message : String(err)
+      const acctId = /acct_[A-Za-z0-9]+/.exec(msg)?.[0]
+      const scopeLimited = /required permissions|Permission denied/i.test(msg)
+      if (!acctId || !scopeLimited) throw err
+
+      this.logger.log(
+        `  → /v1/account is scope-limited for this restricted key; recovered ${acctId} from the error. Probing Charges read…`,
+      )
+      try {
+        await get('charges', { limit: '1' })
+      } catch (probeErr) {
+        const probeMsg =
+          probeErr instanceof Error ? probeErr.message : String(probeErr)
+        if (/required permissions|Permission denied/i.test(probeMsg)) {
+          // The key authenticates but can't read the data we chart —
+          // THIS is the precise, actionable rejection.
+          throw new Error(
+            "this key can't read Charges. Edit the key in the Stripe Dashboard and grant Read access to Charges, Customers, Subscriptions, and Products",
+          )
+        }
+        throw probeErr
+      }
+
+      return {
+        id: acctId,
+        business_profile: null,
+        livemode: deriveLivemodeFromKey(key),
+      }
+    }
+
     if (!account?.id) {
       throw new Error('Stripe /v1/account returned no account id')
     }

@@ -79,4 +79,83 @@ export class PeopleInitializationService {
         )
     }
   }
+
+  /**
+   * Sync people for a WHOLE project — runs initialization across
+   * every identity-bearing connection that serves the project
+   * (project-scoped to it OR Common). This is what the "Sync people"
+   * button calls: one click, populate the project's people index
+   * from all its sources at once.
+   *
+   * Connection types that don't carry people identity (webhook,
+   * sentry, vercel, calendly-not-yet, mcp, …) are skipped — only the
+   * ones the dispatcher above knows how to handle.
+   *
+   * Per-connection failures are swallowed + logged so one broken
+   * credential doesn't abort the others; the caller gets the total
+   * processed plus a per-connection breakdown.
+   */
+  async syncProject(
+    userId: string,
+    projectId: string,
+  ): Promise<{
+    processed: number
+    connections: {
+      connectionId: string
+      source: string
+      processed: number
+      error?: string
+    }[]
+  }> {
+    const { data: conns, error } = await this.supabaseService
+      .getClient()
+      .from('connections')
+      .select('id, type')
+      .eq('user_id', userId)
+      // Identity-bearing types only — extend as new initializers land.
+      .in('type', IDENTITY_CONNECTION_TYPES)
+      // Project-scoped to this project OR Common (project_id null,
+      // which serves every project).
+      .or(`project_id.eq.${projectId},project_id.is.null`)
+    if (error) throw new Error(error.message)
+
+    const results: {
+      connectionId: string
+      source: string
+      processed: number
+      error?: string
+    }[] = []
+    let total = 0
+
+    for (const row of conns ?? []) {
+      const c = row as { id: string; type: string }
+      try {
+        const { processed, source } = await this.initialize(
+          c.id,
+          userId,
+          projectId,
+        )
+        total += processed
+        results.push({ connectionId: c.id, source, processed })
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err)
+        this.logger.warn(
+          `syncProject: connection ${c.id} (${c.type}) failed — ${detail}`,
+        )
+        results.push({ connectionId: c.id, source: c.type, processed: 0, error: detail })
+      }
+    }
+
+    this.logger.log(
+      `syncProject done  project=${projectId} connections=${results.length} people=${total}`,
+    )
+    return { processed: total, connections: results }
+  }
 }
+
+/**
+ * Connection types that carry end-user identity and have an
+ * initializer wired. Keep in sync with the `switch` in
+ * `initialize` — add a type here AND a case there together.
+ */
+const IDENTITY_CONNECTION_TYPES = ['stripe', 'stripe_manual', 'posthog']

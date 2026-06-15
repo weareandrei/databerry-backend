@@ -58,6 +58,23 @@ export class PeopleController {
     )
   }
 
+  /**
+   * "Sync people" — populate the project's people index from ALL its
+   * identity-bearing connections in one call. Backs the empty-state
+   * button + the 3-dots menu item in the Users view. Body:
+   * `{ projectId }`.
+   */
+  @Post('sync')
+  sync(
+    @Req() req: AuthenticatedRequest,
+    @Body() body: { projectId?: string },
+  ) {
+    if (!body?.projectId) {
+      throw new BadRequestException('projectId is required')
+    }
+    return this.initService.syncProject(req.authUser.id, body.projectId)
+  }
+
   @Get()
   list(
     @Req() req: AuthenticatedRequest,

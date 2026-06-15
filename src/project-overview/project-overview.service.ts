@@ -10,16 +10,20 @@ import { getPosthogCredentials } from '../posthog/connection/credentials'
 import {
   fetchSourcesByBucket as fetchGASourcesByBucket,
   fetchMetricByBucket as fetchGAMetricByBucket,
+  fetchPagesList as fetchGAPagesList,
+  fetchVisitorsTotal as fetchGAVisitorsTotal,
   type SourceBucketRow as GASourceRow,
   type BucketGranularity,
 } from '../google-analytics/views/live/sources'
 import {
   fetchPosthogSourcesByBucket,
   fetchPosthogEventCountByBucket,
+  fetchPosthogVisitorsTotal,
   listPosthogEventNames,
 } from '../posthog/views/live/sources'
 import { fetchPosthogUsersList } from '../posthog/views/live/users'
 import { fetchPosthogCountriesList } from '../posthog/views/live/countries'
+import { fetchPosthogPagesList } from '../posthog/views/live/pages'
 import { fetchStripeRevenueByBucketFromStorage } from '../stripe/views/live/revenue-by-bucket'
 import {
   getConnectionProductFilter,
@@ -33,7 +37,11 @@ import {
   phHourlyKeyInTz,
 } from '../common/tz'
 
-export type OverviewMode = 'daily' | 'weekly' | 'monthly'
+import type { ChartMode } from '../common/types'
+
+/** Alias kept for the existing import surface (controller, frontend
+ *  mirror) — canonical union lives in `common/types.ts`. */
+export type OverviewMode = ChartMode
 export type PrimaryMetric = 'visitors' | 'pageviews' | 'conversions' | 'revenue'
 export type SecondaryMetric =
   | 'conversion_rate'
@@ -105,6 +113,22 @@ export interface OverviewCountriesResponse {
    * per-country rollup — same rationale as the legacy users panel),
    * `'posthog'` for successful queries.
    */
+  provider: 'google_analytics' | 'posthog' | null
+}
+
+/** One row of the Pages tab. `share` is pageview-based. */
+export interface OverviewPage {
+  path: string
+  pageviews: number
+  visitors: number
+  share: number
+}
+
+export interface OverviewPagesResponse {
+  pages: OverviewPage[]
+  /** Same provider semantics as the countries response. Pages are
+   *  supported on BOTH providers (GA via `pagePath`, PostHog via
+   *  `$pathname`). */
   provider: 'google_analytics' | 'posthog' | null
 }
 
@@ -395,12 +419,26 @@ export class ProjectOverviewService {
     const { unavailable: secondaryUnavailable, total: totalSecondary } =
       await this.accumulateSecondaryMetric(ctx, secondaryMetric, bySecondary)
 
+    // Unique-visitor totals must be DEDUPED across the whole range, not
+    // summed from the per-bucket bars. The bars hold per-bucket distinct
+    // people (a legit per-hour/day stat), but summing them double-counts
+    // anyone active in multiple buckets — which is how the headline
+    // "Visitors" total could read higher than the pageview count and
+    // disagree with the (deduped) sources panel. Fetch the honest
+    // range-wide distinct count and override the summed total. Only for
+    // `visitors`; pageviews/conversions/revenue sum correctly.
+    const totalPrimaryOverride =
+      primaryMetric === 'visitors' && !primaryUnavailable
+        ? await this.fetchVisitorsTotal(ctx)
+        : undefined
+
     return this.buildChartResponse({
       buckets,
       byBucketTotal,
       byBucketSources,
       bySecondary,
       totalSecondary,
+      totalPrimaryOverride,
       primaryUnavailable,
       secondaryUnavailable,
       provider,
@@ -441,11 +479,23 @@ export class ProjectOverviewService {
           return { unavailable: true }
         }
       }
-      // PostHog
+      // PostHog — the metric decides the aggregation: 'visitors'
+      // counts DISTINCT people, 'pageviews' counts raw $pageview
+      // events. These used to be the same query (count()), which is
+      // why the chart's "Visitors" never matched PostHog's own
+      // unique-visitor numbers.
       try {
         const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
         if (!ph) return { unavailable: true }
-        const rows = await fetchPosthogSourcesByBucket(ph, dateFrom, dateTo, gran, this.logger, tz)
+        const rows = await fetchPosthogSourcesByBucket(
+          ph,
+          dateFrom,
+          dateTo,
+          gran,
+          this.logger,
+          tz,
+          primaryMetric === 'visitors' ? 'visitors' : 'pageviews',
+        )
         this.assignSourceRows(buckets, byBucketTotal, byBucketSources, rows, 'posthog')
         return { unavailable: false }
       } catch (err) {
@@ -627,6 +677,31 @@ export class ProjectOverviewService {
     return new Map(rows.map(r => [r.bucketKey, r.value]))
   }
 
+  /**
+   * Range-wide deduped unique-visitor count for the chart's headline
+   * total (see the note at the `fetchChart` call site). Routes to the
+   * active traffic provider. Returns `null` on a missing provider or
+   * any upstream error so the caller falls back to the per-bucket sum
+   * rather than wrongly showing "Total: 0" under populated bars.
+   */
+  private async fetchVisitorsTotal(ctx: ChartFetchContext): Promise<number | null> {
+    const { provider, dateFrom, dateTo, tz } = ctx
+    if (!provider) return null
+    try {
+      if (provider.type === 'google_analytics') {
+        const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
+        const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
+        return await fetchGAVisitorsTotal(token, provider.connectionId, propertyId, dateFrom, dateTo)
+      }
+      const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+      if (!ph) return null
+      return await fetchPosthogVisitorsTotal(ph, dateFrom, dateTo, this.logger, tz)
+    } catch (err) {
+      this.logger.warn(`visitors-total fetch failed: ${String(err)}`)
+      return null
+    }
+  }
+
   /** Final assembly: stitch the bucket grid + accumulators into the
    *  response shape the controller returns. Pure transform — no I/O. */
   private buildChartResponse(args: {
@@ -635,11 +710,15 @@ export class ProjectOverviewService {
     byBucketSources: BucketSourceMap[]
     bySecondary: (number | null)[]
     totalSecondary: number | null
+    /** When set, replaces the summed primary total (see the deduped
+     *  unique-visitor note in `fetchChart`). `null`/`undefined` →
+     *  fall back to the bar sum. */
+    totalPrimaryOverride?: number | null
     primaryUnavailable: boolean
     secondaryUnavailable: boolean
     provider: TrafficProvider | null
   }): OverviewChartResponse {
-    const { buckets, byBucketTotal, byBucketSources, bySecondary, totalSecondary, primaryUnavailable, secondaryUnavailable, provider } = args
+    const { buckets, byBucketTotal, byBucketSources, bySecondary, totalSecondary, totalPrimaryOverride, primaryUnavailable, secondaryUnavailable, provider } = args
     const outBuckets: OverviewBucket[] = buckets.map((b, i) => ({
       label: b.label,
       total: byBucketTotal[i],
@@ -648,7 +727,7 @@ export class ProjectOverviewService {
         .sort((a, b) => b.value - a.value),
       secondary: bySecondary[i],
     }))
-    const totalPrimary = byBucketTotal.reduce((a, b) => a + b, 0)
+    const totalPrimary = totalPrimaryOverride ?? byBucketTotal.reduce((a, b) => a + b, 0)
     return {
       buckets: outBuckets,
       totalPrimary,
@@ -665,9 +744,10 @@ export class ProjectOverviewService {
     dateFrom: string,
     dateTo: string,
     limit = 10,
+    tz: string = 'UTC',
   ): Promise<OverviewSourcesResponse> {
     this.logger.log(
-      `\n  ► fetchSources  projectId=${projectId} ${dateFrom}→${dateTo}  limit=${limit}`,
+      `\n  ► fetchSources  projectId=${projectId} ${dateFrom}→${dateTo}  limit=${limit} tz=${tz}`,
     )
 
     const provider = await this.pickTrafficProvider(userId, projectId)
@@ -693,7 +773,20 @@ export class ProjectOverviewService {
       } else {
         const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
         if (ph) {
-          const all = await fetchPosthogSourcesByBucket(ph, dateFrom, dateTo, gran, this.logger)
+          // 'visitors' + the user's tz. The tz used to be omitted
+          // (defaulted to UTC) while the CHART bucketed in the
+          // user's tz — so the panel and chart could disagree on
+          // which events belong to "today" and their totals never
+          // reconciled near midnight-adjacent hours.
+          const all = await fetchPosthogSourcesByBucket(
+            ph,
+            dateFrom,
+            dateTo,
+            gran,
+            this.logger,
+            tz,
+            'visitors',
+          )
           rows = all.map(r => ({ source: r.source, value: r.value }))
         }
       }
@@ -807,9 +900,10 @@ export class ProjectOverviewService {
     dateFrom: string,
     dateTo: string,
     limit = 50,
+    tz: string = 'UTC',
   ): Promise<OverviewCountriesResponse> {
     this.logger.log(
-      `\n  ► fetchCountries  projectId=${projectId} ${dateFrom}→${dateTo}  limit=${limit}`,
+      `\n  ► fetchCountries  projectId=${projectId} ${dateFrom}→${dateTo}  limit=${limit} tz=${tz}`,
     )
 
     const provider = await this.pickTrafficProvider(userId, projectId)
@@ -832,6 +926,7 @@ export class ProjectOverviewService {
         dateTo,
         limit,
         this.logger,
+        tz,
       )
       const totalVisitors = rows.reduce((sum, r) => sum + r.visitors, 0)
       const countries: OverviewCountry[] = rows.map(r => ({
@@ -845,6 +940,60 @@ export class ProjectOverviewService {
       this.logger.warn(`fetchCountries PostHog error: ${String(err)}`)
       return { countries: [], provider: 'posthog' }
     }
+  }
+
+  /**
+   * Top pages by pageview count — the overview panel's "Pages" tab.
+   * `pageviews` is the headline (how many pages were viewed, no
+   * matter by whom); `visitors` rides along so the row can show the
+   * unique-people count too. `share` is pageview-based.
+   */
+  async fetchPages(
+    userId: string,
+    projectId: string,
+    dateFrom: string,
+    dateTo: string,
+    limit = 50,
+    tz: string = 'UTC',
+  ): Promise<OverviewPagesResponse> {
+    this.logger.log(
+      `\n  ► fetchPages  projectId=${projectId} ${dateFrom}→${dateTo}  limit=${limit} tz=${tz}`,
+    )
+
+    const provider = await this.pickTrafficProvider(userId, projectId)
+    if (!provider) return { pages: [], provider: null }
+
+    let rows: { path: string; pageviews: number; visitors: number }[] = []
+    try {
+      if (provider.type === 'google_analytics') {
+        const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
+        const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
+        rows = await fetchGAPagesList(
+          token,
+          provider.connectionId,
+          propertyId,
+          dateFrom,
+          dateTo,
+          limit,
+        )
+      } else {
+        const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+        if (!ph) return { pages: [], provider: 'posthog' }
+        rows = await fetchPosthogPagesList(ph, dateFrom, dateTo, limit, this.logger, tz)
+      }
+    } catch (err) {
+      this.logger.warn(`fetchPages provider error: ${String(err)}`)
+      return { pages: [], provider: provider.type }
+    }
+
+    const totalPageviews = rows.reduce((sum, r) => sum + r.pageviews, 0)
+    const pages: OverviewPage[] = rows.map(r => ({
+      path: r.path,
+      pageviews: r.pageviews,
+      visitors: r.visitors,
+      share: totalPageviews > 0 ? r.pageviews / totalPageviews : 0,
+    }))
+    return { pages, provider: provider.type }
   }
 
   async listConversionEvents(

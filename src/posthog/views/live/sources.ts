@@ -8,12 +8,53 @@ import {
 } from './hogql-utils'
 import type { PosthogCredentials } from '../../connection/credentials'
 
-export type BucketGranularity = 'hourly' | 'daily'
+import type { BucketGranularity } from '../../../common/types'
+export type { BucketGranularity }
+
+/**
+ * Which number a traffic query counts. THE distinction this codebase
+ * conflated for months:
+ *   - 'visitors'  → unique PEOPLE (`count(DISTINCT person_id)` —
+ *     person_id is the merged identity, so pre/post-identify events
+ *     from the same human count once)
+ *   - 'pageviews' → raw `$pageview` EVENT count (one person opening
+ *     five pages = 5)
+ * Callers MUST pick explicitly; the default preserves the legacy
+ * behaviour (event counts).
+ */
+export type TrafficMetric = 'visitors' | 'pageviews'
+
+const AGG_EXPR: Record<TrafficMetric, string> = {
+  visitors: 'count(DISTINCT person_id)',
+  pageviews: 'count()',
+}
 
 export interface SourceBucketRow {
   bucketKey: string
   source: string
   value: number
+}
+
+/**
+ * Canonicalize a HogQL bucket value to the EXACT shapes the
+ * project-overview matcher expects:
+ *   - daily  → "YYYY-MM-DD" (passes through untouched)
+ *   - hourly → "YYYY-MM-DDTHH:00:00" (matches `phHourlyKeyInTz`)
+ *
+ * Needed because PostHog's serialization of DateTime results is not
+ * stable across response shapes: hourly buckets have been observed
+ * as "YYYY-MM-DD HH:00:00" (space separator) and as ISO-8601 WITH a
+ * timezone suffix ("…T14:00:00+02:00"). Either variant misses the
+ * matcher's key index, which zeroed every bar of the daily (hourly)
+ * chart while non-bucketed totals still showed — the classic
+ * "I see a total but no chart" bug. Unifying the separator and
+ * slicing to seconds makes all variants converge on the matcher
+ * key.
+ */
+function normalizeBucketKey(raw: unknown): string {
+  const s = String(raw)
+  if (s.length <= 10) return s // date-only — already canonical
+  return s.replace(' ', 'T').slice(0, 19)
 }
 
 /**
@@ -29,8 +70,9 @@ function hourBucketExpr(tz: string): string {
 
 /**
  * Posthog sources-by-bucket (via HogQL).
- * bucketKey format: "YYYY-MM-DD HH:00:00" for hourly, "YYYY-MM-DD" for daily,
- * both rendered in `tz`. We can't pass `tz` as a second arg to
+ * bucketKey format (post-normalization): "YYYY-MM-DDTHH:00:00" for
+ * hourly (matching `phHourlyKeyInTz`), "YYYY-MM-DD" for daily, both
+ * rendered in `tz`. We can't pass `tz` as a second arg to
  * `toStartOfHour`/`toDate` (HogQL is 1-arg only) — instead we wrap with
  * `toTimeZone(timestamp, tz)` and truncate. Default `tz='UTC'` preserves the
  * legacy shape (toTimeZone(ts, 'UTC') is a no-op for a UTC-stored column).
@@ -42,6 +84,7 @@ export async function fetchPosthogSourcesByBucket(
   granularity: BucketGranularity,
   logger: Logger,
   tz: string = 'UTC',
+  metric: TrafficMetric = 'pageviews',
 ): Promise<SourceBucketRow[]> {
   const tzDate = tzDateBucket(tz)
   const timeExpr = granularity === 'hourly' ? hourBucketExpr(tz) : tzDate
@@ -62,7 +105,7 @@ export async function fetchPosthogSourcesByBucket(
   //
   // The BETWEEN bound also runs in `tz` (via the toTimeZone wrap inside
   // `tzDateBucket`) so a "today" range maps to the user's local day, not UTC.
-  const hogql = `SELECT ${timeExpr} AS bucket, ${POSTHOG_SOURCE_EXPR} AS src, count() FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket, src ORDER BY bucket`
+  const hogql = `SELECT ${timeExpr} AS bucket, ${POSTHOG_SOURCE_EXPR} AS src, ${AGG_EXPR[metric]} FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket, src ORDER BY bucket`
 
   const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
     method: 'POST',
@@ -80,12 +123,56 @@ export async function fetchPosthogSourcesByBucket(
   const rows: SourceBucketRow[] = []
   for (const [bucket, src, count] of json.results ?? []) {
     rows.push({
-      bucketKey: String(bucket),
+      bucketKey: normalizeBucketKey(bucket),
       source: src ?? '',
       value: Number(count) || 0,
     })
   }
   return rows
+}
+
+/**
+ * Range-wide UNIQUE visitor count — a single `count(DISTINCT person_id)`
+ * over the whole [from, to] window, with NO time bucketing.
+ *
+ * Why this exists separately from the bucketed query: unique counts
+ * DON'T SUM. Summing the per-hour distinct-person counts (what the
+ * chart's bars hold in daily mode) double-counts anyone who visited in
+ * more than one hour — so a returning visitor inflates the headline
+ * total above the true number of people (and can even push it above
+ * the pageview count, which looks impossible). This query dedupes once
+ * across the entire range, so it matches PostHog's own "unique
+ * visitors" and reconciles with the (also-deduped) sources panel.
+ *
+ * Same `$pageview` scope, same tz-aware BETWEEN bound, same first-touch
+ * window as `fetchPosthogSourcesByBucket` so the two stay comparable.
+ */
+export async function fetchPosthogVisitorsTotal(
+  ph: PosthogCredentials,
+  dateFrom: string,
+  dateTo: string,
+  logger: Logger,
+  tz: string = 'UTC',
+): Promise<number> {
+  const tzDate = tzDateBucket(tz)
+  const safeFrom = escapeDateLiteral(dateFrom)
+  const safeTo = escapeDateLiteral(dateTo)
+  const hogql = `SELECT count(DISTINCT person_id) FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}'))`
+
+  const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ph.apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogql } }),
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    logger.error(`PostHog visitors-total query failed: ${body}`)
+    return 0
+  }
+
+  const json = (await res.json()) as { results?: [number][] }
+  return Number(json.results?.[0]?.[0]) || 0
 }
 
 /**
@@ -126,7 +213,7 @@ export async function fetchPosthogEventCountByBucket(
 
   const json = (await res.json()) as { results?: [unknown, number][] }
   return (json.results ?? []).map(([bucket, count]) => ({
-    bucketKey: String(bucket),
+    bucketKey: normalizeBucketKey(bucket),
     value: Number(count) || 0,
   }))
 }

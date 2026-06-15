@@ -50,7 +50,11 @@ export async function fetchPosthogCountriesList(
   // need one representative value per code. Parens around BETWEEN are
   // load-bearing — see fetchPosthogSourcesByBucket for the precedence
   // bug story.
-  const hogql = `SELECT properties.$geoip_country_code AS country_code, any(properties.$geoip_country_name) AS country_name, count(distinct distinct_id) AS visitors FROM events WHERE event = '$pageview' AND properties.$geoip_country_code IS NOT NULL AND properties.$geoip_country_code != '' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY properties.$geoip_country_code ORDER BY visitors DESC LIMIT ${safeLimit}`
+  //
+  // `person_id` (not distinct_id): the merged person identity, so a
+  // visitor who later identifies counts ONCE — same visitors
+  // definition as the chart, sources, and pages queries.
+  const hogql = `SELECT properties.$geoip_country_code AS country_code, any(properties.$geoip_country_name) AS country_name, count(DISTINCT person_id) AS visitors FROM events WHERE event = '$pageview' AND properties.$geoip_country_code IS NOT NULL AND properties.$geoip_country_code != '' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY properties.$geoip_country_code ORDER BY visitors DESC LIMIT ${safeLimit}`
 
   const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
     method: 'POST',

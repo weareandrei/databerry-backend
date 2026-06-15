@@ -3,6 +3,7 @@ import { SupabaseModule } from '../supabase/supabase.module'
 import { PeopleController } from './people.controller'
 import { PeopleService } from './people.service'
 import { PeopleMatchingService } from './people-matching.service'
+import { PeopleEventsService } from './people-events.service'
 import { StripePeopleInitializer } from './initializers/stripe-people.initializer'
 import { PosthogPeopleInitializer } from './initializers/posthog-people.initializer'
 import { PeopleInitializationService } from './initializers/people-init.service'
@@ -24,6 +25,7 @@ import { PeopleInitializationService } from './initializers/people-init.service'
   providers: [
     PeopleService,
     PeopleMatchingService,
+    PeopleEventsService,
     StripePeopleInitializer,
     PosthogPeopleInitializer,
     PeopleInitializationService,
@@ -31,6 +33,7 @@ import { PeopleInitializationService } from './initializers/people-init.service'
   exports: [
     PeopleService,
     PeopleMatchingService,
+    PeopleEventsService,
     StripePeopleInitializer,
     PosthogPeopleInitializer,
     PeopleInitializationService,

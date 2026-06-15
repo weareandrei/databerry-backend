@@ -83,6 +83,34 @@ export class ProjectsService {
     if (error) throw new Error(error.message)
     const project = this.toCamel(data)
 
+    // Connection-aware defaults for the seeded overview chart:
+    //   - primary 'visitors' only when a traffic tool (PostHog / GA)
+    //     exists — otherwise an explicitly-EMPTY primary (null), so
+    //     the chart's metric dropdown shows its "Select metric"
+    //     placeholder instead of a Visitors axis with no data behind
+    //     it.
+    //   - secondary 'revenue' only when Stripe is connected — the
+    //     revenue overlay flatlining at $0 for non-Stripe users is
+    //     noise, but Stripe users get the visitors-vs-revenue pairing
+    //     by default.
+    // Best-effort: a failed lookup degrades to the empty defaults
+    // rather than blocking project creation.
+    let hasTraffic = false
+    let hasStripe = false
+    try {
+      const { data: connRows } = await this.supabaseService
+        .getClient()
+        .from('connections')
+        .select('type')
+        .eq('user_id', userId)
+        .in('type', ['google_analytics', 'posthog', 'stripe', 'stripe_manual'])
+      const types = new Set((connRows ?? []).map(r => (r as { type: string }).type))
+      hasTraffic = types.has('google_analytics') || types.has('posthog')
+      hasStripe = types.has('stripe') || types.has('stripe_manual')
+    } catch (err) {
+      this.logger.warn(`Connection lookup for overview defaults failed: ${String(err)}`)
+    }
+
     // Best-effort: auto-create the composite "Overview" views at the project root.
     // The overview is split into two independently-managed views: the chart and the
     // sources panel. Both are created together, but can be removed independently.
@@ -95,7 +123,10 @@ export class ProjectsService {
           connectionType: 'composite',
           type: 'project_overview',
           name: 'Overview',
-          config: { primaryMetric: 'visitors', secondaryMetric: null },
+          config: {
+            primaryMetric: hasTraffic ? 'visitors' : null,
+            secondaryMetric: hasStripe ? 'revenue' : null,
+          },
         },
         userId,
       )

@@ -134,6 +134,11 @@ export class PeopleService {
     projectId: row.project_id as string,
     displayName: (row.display_name as string | null) ?? null,
     primaryEmail: (row.primary_email as string | null) ?? null,
+    // Overview "People" table attributes (filled by the matcher from
+    // each platform). All nullable — "—" in the UI when unresolved.
+    country: (row.country as string | null) ?? null,
+    initialSource: (row.initial_source as string | null) ?? null,
+    lastSeenAt: (row.last_seen_at as string | null) ?? null,
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
   })

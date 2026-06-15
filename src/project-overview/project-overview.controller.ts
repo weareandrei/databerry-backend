@@ -53,6 +53,7 @@ export class ProjectOverviewController {
     @Query('dateFrom') dateFrom: string,
     @Query('dateTo') dateTo: string,
     @Query('limit') limit: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     // Default 100 — the panel paginates client-side now, so we want to send
@@ -61,7 +62,42 @@ export class ProjectOverviewController {
     // founder-scale project; beyond that, drilling into PostHog directly is
     // the right escape hatch.
     const n = limit ? parseInt(limit, 10) : 100
-    return this.service.fetchSources(req.authUser.id, projectId, dateFrom, dateTo, isNaN(n) ? 100 : n)
+    const safeTz =
+      typeof tz === 'string' && /^[A-Za-z0-9_/+-]+$/.test(tz) ? tz : 'UTC'
+    return this.service.fetchSources(
+      req.authUser.id,
+      projectId,
+      dateFrom,
+      dateTo,
+      isNaN(n) ? 100 : n,
+      safeTz,
+    )
+  }
+
+  /**
+   * Top pages by pageview count — the panel's "Pages" tab. Same
+   * query-param surface as `sources`/`countries`.
+   */
+  @Get('pages')
+  async pages(
+    @Query('projectId') projectId: string,
+    @Query('dateFrom') dateFrom: string,
+    @Query('dateTo') dateTo: string,
+    @Query('limit') limit: string | undefined,
+    @Query('tz') tz: string | undefined,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    const n = limit ? parseInt(limit, 10) : 50
+    const safeTz =
+      typeof tz === 'string' && /^[A-Za-z0-9_/+-]+$/.test(tz) ? tz : 'UTC'
+    return this.service.fetchPages(
+      req.authUser.id,
+      projectId,
+      dateFrom,
+      dateTo,
+      isNaN(n) ? 50 : n,
+      safeTz,
+    )
   }
 
   @Get('users')
@@ -88,15 +124,19 @@ export class ProjectOverviewController {
     @Query('dateFrom') dateFrom: string,
     @Query('dateTo') dateTo: string,
     @Query('limit') limit: string | undefined,
+    @Query('tz') tz: string | undefined,
     @Req() req: AuthenticatedRequest,
   ) {
     const n = limit ? parseInt(limit, 10) : 50
+    const safeTz =
+      typeof tz === 'string' && /^[A-Za-z0-9_/+-]+$/.test(tz) ? tz : 'UTC'
     return this.service.fetchCountries(
       req.authUser.id,
       projectId,
       dateFrom,
       dateTo,
       isNaN(n) ? 50 : n,
+      safeTz,
     )
   }
 

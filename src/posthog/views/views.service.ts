@@ -37,6 +37,24 @@ interface LoadedView {
   ph: PosthogCredentials
 }
 
+/**
+ * Enumerate the inclusive calendar dates `from`…`to` as
+ * `YYYY-MM-DD` keys — the same format `fetchPosthogEventCountByBucket`
+ * emits for daily buckets. Steps UTC midnights (fixed 24 h hops, so
+ * no DST drift); the keys are plain calendar labels, so UTC stepping
+ * lands on consecutive local dates regardless of tz.
+ */
+function enumerateDateKeys(from: string, to: string): string[] {
+  const keys: string[] = []
+  const start = Date.parse(`${from}T00:00:00Z`)
+  const end = Date.parse(`${to}T00:00:00Z`)
+  if (Number.isNaN(start) || Number.isNaN(end)) return keys
+  for (let t = start; t <= end; t += 86_400_000) {
+    keys.push(new Date(t).toISOString().slice(0, 10))
+  }
+  return keys
+}
+
 @Injectable()
 export class PosthogViewsService {
   private readonly logger = new Logger(PosthogViewsService.name)
@@ -229,14 +247,29 @@ export class PosthogViewsService {
       tzLit,
     )
 
-    // Reformat from `{bucketKey, value}` → `{label, value}` for the
-    // chart-data wire shape. The label is whatever PostHog's HogQL
-    // returned for the bucket key — frontend currently aligns by
-    // INDEX, not label, so the exact string doesn't matter (we
-    // could pass through bucketKey verbatim and it would render the
-    // same). Documented here so the next person knows the labels
-    // aren't load-bearing in the current alignment scheme.
-    return { points: rows.map(r => ({ label: r.bucketKey, value: r.value })) }
+    // DENSE-FILL the grid. `fetchPosthogEventCountByBucket` does a
+    // HogQL `GROUP BY bucket`, so buckets with ZERO events are simply
+    // absent from `rows`. Returning that sparse list is a bug for the
+    // overview's secondary line:
+    //   - the frontend index-merges this series with the chart's
+    //     buckets, so trailing empty buckets (e.g. no signups Fri/Sat)
+    //     have no point → render as `null` → the line GAPS OUT instead
+    //     of dropping to 0;
+    //   - worse, an empty bucket in the MIDDLE shifts every later
+    //     point left by one index → counts land on the wrong day.
+    // Emit exactly one point per bucket in range (0 for the empties),
+    // ordered, so the overlay is correct AND continuous. The key
+    // format matches `normalizeBucketKey`'s output for each
+    // granularity ("YYYY-MM-DD" daily, "YYYY-MM-DDTHH:00:00" hourly).
+    const valueByKey = new Map(rows.map(r => [r.bucketKey, r.value]))
+    const keys =
+      granularity === 'hourly'
+        ? Array.from(
+            { length: 24 },
+            (_, h) => `${from}T${String(h).padStart(2, '0')}:00:00`,
+          )
+        : enumerateDateKeys(from, to)
+    return { points: keys.map(key => ({ label: key, value: valueByKey.get(key) ?? 0 })) }
   }
 
   async fetchLiveValue(
