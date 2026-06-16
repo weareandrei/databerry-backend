@@ -92,9 +92,13 @@ export class PeopleEventsService {
       .getClient()
       .from('people_events')
       .upsert(rows, {
-        // The idempotency key — re-syncs / overlapping windows no-op.
+        // Idempotent on (connection_id, source_event_id). `ignoreDuplicates:
+        // false` => ON CONFLICT DO UPDATE, so a re-sync REFRESHES an
+        // already-ingested event's captured properties (e.g. the page path
+        // or clicked element) instead of skipping it. Re-syncs stay safe —
+        // same row, same key, just updated detail.
         onConflict: 'connection_id,source_event_id',
-        ignoreDuplicates: true,
+        ignoreDuplicates: false,
       })
     if (error) throw new Error(error.message)
     return rows.length

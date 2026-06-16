@@ -122,6 +122,10 @@ export class PosthogPeopleInitializer {
       throw new Error(`No PostHog persons could be synced — ${firstError}`)
     }
 
+    // Drop the old synthetic "First seen" markers we used to insert —
+    // we now show real events instead, so these are stale noise.
+    await this.deleteSyntheticFirstSeen(connectionId, userId)
+
     await this.markSynced(connectionId, projectId, userId)
     this.logger.log(
       `PostHog people init done  connection=${connectionId} project=${projectId} persons=${processed}`,
@@ -202,8 +206,7 @@ export class PosthogPeopleInitializer {
         projectId,
         connectionId,
         personId,
-        person,
-        distinctIds[0] ?? null,
+        distinctIds,
         creds,
         defCache,
       )
@@ -214,46 +217,25 @@ export class PosthogPeopleInitializer {
   }
 
   /**
-   * Build + persist one person's event timeline: a "First seen"
-   * marker (from `person.created_at`) plus their most recent PostHog
-   * events for the primary distinct_id. Each PostHog event id is the
-   * idempotency key, so re-syncs no-op.
+   * Persist one person's REAL PostHog event timeline — their most
+   * recent events across ALL their distinct_ids (a person usually has
+   * several; querying only the first misses most of their activity,
+   * which is why active users were showing an empty timeline). Real
+   * events only — no synthetic "first seen" marker (it was confusing
+   * and, once real events flow, redundant). Each PostHog event id is
+   * the idempotency key, so re-syncs refresh rather than duplicate.
    */
   private async ingestPersonEvents(
     userId: string,
     projectId: string,
     connectionId: string,
     personId: string,
-    person: PosthogPerson,
-    primaryDistinctId: string | null,
+    distinctIds: string[],
     creds: PosthogCreds,
     defCache: Map<string, string>,
   ): Promise<void> {
-    const events: ObservedEvent[] = []
-
-    if (person.created_at) {
-      events.push({
-        eventKey: 'first_seen',
-        displayName: 'First seen',
-        occurredAt: person.created_at,
-        sourceEventId: `${person.id}:first_seen`,
-        properties: {},
-      })
-    }
-
-    if (primaryDistinctId) {
-      for (const e of await this.fetchPersonEvents(creds, primaryDistinctId)) {
-        const occurredAt = toIsoUtc(e.timestamp)
-        if (!e.id || !e.event || !occurredAt) continue
-        events.push({
-          eventKey: e.event,
-          displayName: prettifyEventName(e.event),
-          occurredAt,
-          sourceEventId: e.id,
-          properties: {},
-        })
-      }
-    }
+    const events = await this.fetchPersonEvents(creds, distinctIds)
+    if (events.length === 0) return
 
     await this.events.recordEvents(
       userId,
@@ -301,27 +283,82 @@ export class PosthogPeopleInitializer {
   }
 
   /**
-   * Most recent events for one distinct_id (cap 50). Uses PostHog's
-   * legacy events endpoint, which filters by `distinct_id`. One GET
-   * per person — fine at the people counts we sync; the place to move
-   * to a batched HogQL query if volume grows.
+   * Most recent events across ALL of a person's distinct_ids (cap 200,
+   * newest first). Uses the HogQL query API — the same proven path the
+   * Users view uses — which is far more reliable than the legacy
+   * `/events` endpoint (that one silently returned nothing for many
+   * distinct_ids, leaving active users with an empty timeline). Selects
+   * only the few properties we actually render, as columns.
    */
   private async fetchPersonEvents(
     creds: PosthogCreds,
-    distinctId: string,
-  ): Promise<PosthogEvent[]> {
-    const url =
-      `${creds.host}/api/projects/${creds.projectId}/events/` +
-      `?distinct_id=${encodeURIComponent(distinctId)}&limit=50`
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${creds.apiKey}` },
+    distinctIds: string[],
+  ): Promise<ObservedEvent[]> {
+    if (distinctIds.length === 0) return []
+    const inList = distinctIds.map(d => `'${escHogql(d)}'`).join(', ')
+    const hogql =
+      'SELECT toString(uuid), event, timestamp, ' +
+      'properties.$pathname, properties.$current_url, properties.$el_text, ' +
+      'coalesce(properties.provider, properties.login_method, properties.method) ' +
+      `FROM events WHERE distinct_id IN (${inList}) ` +
+      'ORDER BY timestamp DESC LIMIT 200'
+
+    const res = await fetch(`${creds.host}/api/projects/${creds.projectId}/query/`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${creds.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogql } }),
     })
     if (!res.ok) {
       const body = await res.text().catch(() => '')
-      throw new Error(`PostHog events API ${res.status}: ${body.slice(0, 200)}`)
+      throw new Error(`PostHog events query ${res.status}: ${body.slice(0, 200)}`)
     }
-    const json = (await res.json()) as { results?: PosthogEvent[] }
-    return json.results ?? []
+
+    const json = (await res.json()) as { results?: unknown[][] }
+    const out: ObservedEvent[] = []
+    for (const row of json.results ?? []) {
+      const id = asString(row?.[0])
+      const event = asString(row?.[1])
+      const occurredAt = toIsoUtc(asString(row?.[2]))
+      if (!id || !event || !occurredAt) continue
+      out.push({
+        eventKey: event,
+        displayName: prettifyEventName(event),
+        occurredAt,
+        sourceEventId: id,
+        properties: buildPosthogProps(event, {
+          pathname: asString(row?.[3]),
+          currentUrl: asString(row?.[4]),
+          elementText: asString(row?.[5]),
+          loginMethod: asString(row?.[6]),
+        }),
+      })
+    }
+    return out
+  }
+
+  /**
+   * Delete the synthetic "first_seen" events we used to insert (their
+   * `source_event_id` ends in `:first_seen`). Cheap + idempotent; runs
+   * each sync so the stale markers vanish from already-synced people on
+   * the next refresh.
+   */
+  private async deleteSyntheticFirstSeen(
+    connectionId: string,
+    userId: string,
+  ): Promise<void> {
+    const { error } = await this.supabaseService
+      .getClient()
+      .from('people_events')
+      .delete()
+      .eq('user_id', userId)
+      .eq('connection_id', connectionId)
+      .like('source_event_id', '%:first_seen')
+    if (error) {
+      this.logger.warn(`first_seen cleanup failed for ${connectionId}: ${error.message}`)
+    }
   }
 
   /**
@@ -393,11 +430,69 @@ function prettifyEventName(raw: string): string {
     $identify: 'Identified',
     $set: 'Profile updated',
     $screen: 'Screen view',
+    // "Web vitals" is jargon — call it what it measures.
+    $web_vitals: 'Page performance',
   }
   if (known[raw]) return known[raw]
   const cleaned = raw.replace(/^\$/, '').replace(/[_-]+/g, ' ').trim()
   if (!cleaned) return raw
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1)
+}
+
+/**
+ * Build the curated `properties` we store + render for a PostHog event,
+ * from the specific columns the HogQL query selected. Friendly keys the
+ * frontend reads directly:
+ *   - `path`        — the page visited (pageview / pageleave / click)
+ *   - `elementText` — the text of the clicked element (autocapture)
+ *   - `method`      — the auth method, for login-type events ("Google")
+ */
+function buildPosthogProps(
+  event: string,
+  cols: {
+    pathname?: string
+    currentUrl?: string
+    elementText?: string
+    loginMethod?: string
+  },
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+
+  const path = cols.pathname ?? pathFromUrl(cols.currentUrl)
+  if (path) out.path = path
+
+  if (cols.elementText) {
+    out.elementText = cols.elementText.replace(/\s+/g, ' ').trim().slice(0, 80)
+  }
+
+  // Login method — only for login / sign-in events; the coalesced
+  // candidate is app-specific, so this is best-effort.
+  const ev = event.toLowerCase()
+  if (((ev.includes('log') && ev.includes('in')) || ev.includes('sign')) && cols.loginMethod) {
+    out.method = cols.loginMethod
+  }
+
+  return out
+}
+
+/** Coerce a HogQL result cell to a non-empty trimmed string, else undefined. */
+function asString(v: unknown): string | undefined {
+  return typeof v === 'string' && v.trim() ? v : undefined
+}
+
+/** Escape a value for a single-quoted HogQL/ClickHouse string literal. */
+function escHogql(v: string): string {
+  return v.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+}
+
+/** Pathname of a URL (e.g. `/pricing`), or undefined if it won't parse. */
+function pathFromUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined
+  try {
+    return new URL(url).pathname || '/'
+  } catch {
+    return undefined
+  }
 }
 
 /** Minimal shape of the PostHog person fields we consume. */
@@ -409,12 +504,3 @@ interface PosthogPerson {
   created_at?: string
 }
 
-/** Minimal shape of the PostHog event fields we turn into timeline rows. */
-interface PosthogEvent {
-  /** Event UUID — the idempotency key. */
-  id: string
-  /** Event name, e.g. '$pageview' or 'signed_up'. */
-  event: string
-  /** ISO 8601 occurrence time. */
-  timestamp: string
-}
