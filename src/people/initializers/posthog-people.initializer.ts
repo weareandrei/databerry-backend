@@ -297,9 +297,7 @@ export class PosthogPeopleInitializer {
     if (distinctIds.length === 0) return []
     const inList = distinctIds.map(d => `'${escHogql(d)}'`).join(', ')
     const hogql =
-      'SELECT toString(uuid), event, timestamp, ' +
-      'properties.$pathname, properties.$current_url, properties.$el_text, ' +
-      'coalesce(properties.provider, properties.login_method, properties.method) ' +
+      'SELECT toString(uuid), event, timestamp, properties ' +
       `FROM events WHERE distinct_id IN (${inList}) ` +
       'ORDER BY timestamp DESC LIMIT 200'
 
@@ -328,12 +326,7 @@ export class PosthogPeopleInitializer {
         displayName: prettifyEventName(event),
         occurredAt,
         sourceEventId: id,
-        properties: buildPosthogProps(event, {
-          pathname: asString(row?.[3]),
-          currentUrl: asString(row?.[4]),
-          elementText: asString(row?.[5]),
-          loginMethod: asString(row?.[6]),
-        }),
+        properties: buildPosthogProps(event, parsePropertyBag(row?.[3])),
       })
     }
     return out
@@ -441,38 +434,61 @@ function prettifyEventName(raw: string): string {
 
 /**
  * Build the curated `properties` we store + render for a PostHog event,
- * from the specific columns the HogQL query selected. Friendly keys the
- * frontend reads directly:
+ * from its full property bag. Friendly keys the frontend reads directly:
  *   - `path`        — the page visited (pageview / pageleave / click)
  *   - `elementText` — the text of the clicked element (autocapture)
  *   - `method`      — the auth method, for login-type events ("Google")
  */
 function buildPosthogProps(
   event: string,
-  cols: {
-    pathname?: string
-    currentUrl?: string
-    elementText?: string
-    loginMethod?: string
-  },
+  raw: Record<string, unknown>,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {}
-
-  const path = cols.pathname ?? pathFromUrl(cols.currentUrl)
-  if (path) out.path = path
-
-  if (cols.elementText) {
-    out.elementText = cols.elementText.replace(/\s+/g, ' ').trim().slice(0, 80)
+  const str = (k: string): string | undefined => {
+    const v = raw[k]
+    return typeof v === 'string' && v.trim() ? v : undefined
   }
 
-  // Login method — only for login / sign-in events; the coalesced
-  // candidate is app-specific, so this is best-effort.
+  // Page — the path of whatever URL the event carries (every $pageview
+  // has `$current_url`, so this is the "what page" answer).
+  const path = str('$pathname') ?? pathFromUrl(str('$current_url'))
+  if (path) out.path = path
+
+  // Click — autocapture stores the clicked element's text in `$el_text`.
+  const elText = str('$el_text')
+  if (elText) out.elementText = elText.replace(/\s+/g, ' ').trim().slice(0, 80)
+
+  // Login method — only for login / sign-in events, from the common
+  // property names apps use. App-specific, so best-effort.
   const ev = event.toLowerCase()
-  if (((ev.includes('log') && ev.includes('in')) || ev.includes('sign')) && cols.loginMethod) {
-    out.method = cols.loginMethod
+  if ((ev.includes('log') && ev.includes('in')) || ev.includes('sign')) {
+    const method =
+      str('provider') ?? str('login_method') ?? str('$oauth_provider') ?? str('method')
+    if (method) out.method = method
   }
 
   return out
+}
+
+/**
+ * Normalise the `properties` cell the HogQL query returns — it comes
+ * back as a raw JSON string on some PostHog versions and an already-
+ * parsed object on others. Always returns a plain object; never throws.
+ */
+function parsePropertyBag(raw: unknown): Record<string, unknown> {
+  if (!raw) return {}
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>
+  }
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as unknown
+      return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {}
+    } catch {
+      return {}
+    }
+  }
+  return {}
 }
 
 /** Coerce a HogQL result cell to a non-empty trimmed string, else undefined. */
