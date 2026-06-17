@@ -328,28 +328,37 @@ export class ViewsService {
       if (!dto.connectionId) {
         throw new Error('PostHog views require a connectionId')
       }
-      const hogFunctionId = await this.posthogLifecycleService.createHogFunction(
-        dto.connectionId,
-        tempView.id as string,
-        eventName,
-      )
-
-      if (!hogFunctionId) {
-        await this.supabaseService.getClient().from('views').delete().eq('id', tempView.id)
-        this.logger.error(`  ✗ Hog Function creation failed — view rolled back`)
-        throw new Error(
-          'Failed to register PostHog destination. Check your API key has the hog_function:write scope.',
+      // Register the live auto-update destination (hog function). If this
+      // fails — most often because the API key lacks the `hog_function:write`
+      // scope — DON'T abort: keep the view and record that it has no hog
+      // function (config.hogFunctionId = null). The UI reads that flag to
+      // warn the user, and we never re-check PostHog for it. The view still
+      // works on manual refresh; it just won't update live.
+      let hogFunctionId: string | null = null
+      try {
+        hogFunctionId = await this.posthogLifecycleService.createHogFunction(
+          dto.connectionId,
+          tempView.id as string,
+          eventName,
         )
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err)
+        this.logger.warn(`  ⚠ hog function failed (view kept, no live updates): ${detail}`)
       }
 
+      const finalConfig = { ...(dto.config ?? {}), hogFunctionId: hogFunctionId ?? null }
       await this.supabaseService
         .getClient()
         .from('views')
-        .update({ config: { ...(dto.config ?? {}), hogFunctionId } })
+        .update({ config: finalConfig })
         .eq('id', tempView.id)
 
-      this.logger.log(`  ✓ view created and hog function registered  id: ${tempView.id}`)
-      return this.toCamel({ ...tempView, config: { ...(dto.config ?? {}), hogFunctionId } })
+      this.logger.log(
+        hogFunctionId
+          ? `  ✓ view created and hog function registered  id: ${tempView.id}`
+          : `  ⚠ view created WITHOUT hog function (no live updates)  id: ${tempView.id}`,
+      )
+      return this.toCamel({ ...tempView, config: finalConfig })
     }
 
     // Non-PostHog views — create directly

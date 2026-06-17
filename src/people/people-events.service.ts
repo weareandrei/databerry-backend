@@ -105,6 +105,63 @@ export class PeopleEventsService {
   }
 
   /**
+   * Persist a batch of events spanning MANY people at once — each event
+   * carries its own `personId`. The bulk path: the PostHog sync fetches
+   * everyone's events in one query, resolves each to a person, and hands
+   * the whole lot here. Definitions resolve once (cached in `defCache`);
+   * the upsert is chunked so a large delta can't blow the request-size
+   * limit. Idempotent on (connection_id, source_event_id), like
+   * `recordEvents`.
+   */
+  async recordEventsBatch(
+    userId: string,
+    projectId: string,
+    connectionId: string,
+    source: string,
+    events: (ObservedEvent & { personId: string })[],
+    defCache: Map<string, string>,
+  ): Promise<number> {
+    if (events.length === 0) return 0
+
+    const rows: Record<string, unknown>[] = []
+    for (const ev of events) {
+      if (!ev.sourceEventId || !ev.occurredAt || !ev.personId) continue
+      const defId = await this.getOrCreateDefinition(
+        userId,
+        projectId,
+        connectionId,
+        source,
+        ev.eventKey,
+        ev.displayName ?? null,
+        defCache,
+      )
+      rows.push({
+        project_id: projectId,
+        user_id: userId,
+        person_id: ev.personId,
+        event_definition_id: defId,
+        connection_id: connectionId,
+        source_event_id: ev.sourceEventId,
+        occurred_at: ev.occurredAt,
+        properties: ev.properties ?? {},
+      })
+    }
+    if (rows.length === 0) return 0
+
+    // Chunk the upsert — one giant insert can exceed the payload limit.
+    const CHUNK = 1000
+    const client = this.supabaseService.getClient()
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const { error } = await client.from('people_events').upsert(rows.slice(i, i + CHUNK), {
+        onConflict: 'connection_id,source_event_id',
+        ignoreDuplicates: false,
+      })
+      if (error) throw new Error(error.message)
+    }
+    return rows.length
+  }
+
+  /**
    * Resolve the `event_definitions.id` for one (connection, eventKey),
    * creating it on first sight. Cached in `defCache` for the run.
    *

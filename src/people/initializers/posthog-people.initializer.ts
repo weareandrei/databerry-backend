@@ -23,11 +23,12 @@ type PosthogCreds = { host: string; projectId: string; apiKey: string }
  * into one person — the whole point of the identity graph. People
  * with no email stay PostHog-only until the SDK supplies a bridge.
  *
- * Per person we also ingest a small event timeline — a "first seen"
- * marker (from `person.created_at`) plus their most recent PostHog
- * events (by distinct_id) — via `PeopleEventsService`. That ingestion
- * is best-effort: a flaky/absent events API degrades to just the
- * marker and never fails the identity sync.
+ * Events are ingested in ONE bulk pass AFTER the identity loop
+ * (`syncEvents`), not per person: a single HogQL query pulls everyone's
+ * events since the `last_event_at` watermark, then `PeopleEventsService`
+ * batch-inserts them. Incremental + best-effort — the first run grabs a
+ * bounded history, every run after only the delta, and a failure leaves
+ * identity synced and retries the same window next time.
  *
  * Re-runnable + idempotent, same as the Stripe initializer.
  */
@@ -60,9 +61,6 @@ export class PosthogPeopleInitializer {
     let url: string | null =
       `${creds.host}/api/projects/${creds.projectId}/persons/?limit=100`
     const MAX_PAGES = 100 // 100 × 100 = 10k persons per run; re-runs continue.
-    // Per-run definition cache (eventKey → definition id) so we upsert
-    // each event_definition at most once, not once per occurrence.
-    const defCache = new Map<string, string>()
 
     // TRUE last-activity per distinct_id, in ONE HogQL pass (mirrors the
     // Users view's `max(timestamp)` pattern). This is what fixes "last
@@ -95,15 +93,7 @@ export class PosthogPeopleInitializer {
 
       for (const person of persons) {
         try {
-          await this.ingestPerson(
-            userId,
-            projectId,
-            connectionId,
-            person,
-            creds,
-            defCache,
-            lastSeenByDid,
-          )
+          await this.ingestPerson(userId, projectId, connectionId, person, lastSeenByDid)
           processed++
         } catch (err) {
           const detail = err instanceof Error ? err.message : String(err)
@@ -126,7 +116,18 @@ export class PosthogPeopleInitializer {
     // we now show real events instead, so these are stale noise.
     await this.deleteSyntheticFirstSeen(connectionId, userId)
 
-    await this.markSynced(connectionId, projectId, userId)
+    // Event timeline — ONE bulk + incremental pass for everyone (vs. the
+    // old query-per-person firehose). Best-effort: a failure here leaves
+    // identity synced and just retries the same window next time.
+    let newWatermark: string | null = null
+    try {
+      newWatermark = await this.syncEvents(userId, projectId, connectionId, creds)
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err)
+      this.logger.warn(`PostHog event sync failed for ${connectionId}: ${detail}`)
+    }
+
+    await this.markSynced(connectionId, projectId, userId, newWatermark)
     this.logger.log(
       `PostHog people init done  connection=${connectionId} project=${projectId} persons=${processed}`,
     )
@@ -144,8 +145,6 @@ export class PosthogPeopleInitializer {
     projectId: string,
     connectionId: string,
     person: PosthogPerson,
-    creds: PosthogCreds,
-    defCache: Map<string, string>,
     lastSeenByDid: Map<string, string>,
   ): Promise<void> {
     const distinctIds = (person.distinct_ids ?? []).filter(Boolean)
@@ -186,9 +185,11 @@ export class PosthogPeopleInitializer {
       connectionId,
     }))
 
-    // Throws on failure — the caller's loop counts successes, logs
-    // per-row failures, and escalates an all-failed batch.
-    const personId = await this.matching.upsertPerson(userId, projectId, {
+    // Identity only. Throws on failure — the caller's loop counts
+    // successes, logs per-row failures, and escalates an all-failed
+    // batch. Events are ingested in one bulk pass after the whole person
+    // list is in (see `syncEvents`).
+    await this.matching.upsertPerson(userId, projectId, {
       identifiers,
       email,
       displayName: name,
@@ -196,56 +197,98 @@ export class PosthogPeopleInitializer {
       initialSource,
       lastSeenAt,
     })
-
-    // Event timeline — BEST EFFORT. The events API may be flaky, rate-
-    // limited, or shaped differently across PostHog versions; none of
-    // that should fail the identity sync that already succeeded.
-    try {
-      await this.ingestPersonEvents(
-        userId,
-        projectId,
-        connectionId,
-        personId,
-        distinctIds,
-        creds,
-        defCache,
-      )
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err)
-      this.logger.warn(`PostHog events skipped for ${person.id}: ${detail}`)
-    }
   }
 
   /**
-   * Persist one person's REAL PostHog event timeline — their most
-   * recent events across ALL their distinct_ids (a person usually has
-   * several; querying only the first misses most of their activity,
-   * which is why active users were showing an empty timeline). Real
-   * events only — no synthetic "first seen" marker (it was confusing
-   * and, once real events flow, redundant). Each PostHog event id is
-   * the idempotency key, so re-syncs refresh rather than duplicate.
+   * Event timeline ingestion — BULK + INCREMENTAL.
+   *
+   * One HogQL query pulls EVERY person's events since the watermark
+   * (`connection_sync_state.last_event_at`), time-ordered + capped. We
+   * map each event to a person via a single pre-loaded identifier map,
+   * then hand the whole set to `recordEventsBatch` for one chunked
+   * insert. Returns the new watermark (latest event timestamp seen), or
+   * the old one when there's nothing new.
+   *
+   * This replaces the per-person query firehose: identical data, ~3
+   * queries instead of one-per-person.
    */
-  private async ingestPersonEvents(
+  private async syncEvents(
     userId: string,
     projectId: string,
     connectionId: string,
-    personId: string,
-    distinctIds: string[],
     creds: PosthogCreds,
-    defCache: Map<string, string>,
-  ): Promise<void> {
-    const events = await this.fetchPersonEvents(creds, distinctIds)
-    if (events.length === 0) return
+  ): Promise<string | null> {
+    const watermark = await this.readWatermark(connectionId, userId)
+    const personByDid = await this.loadPersonByDistinctId(connectionId, userId)
+    if (personByDid.size === 0) return watermark // no people yet → nothing to attach
 
-    await this.events.recordEvents(
-      userId,
-      projectId,
-      connectionId,
-      'posthog',
-      personId,
-      events,
-      defCache,
-    )
+    const rawEvents = await this.fetchEventsSince(creds, watermark)
+
+    const defCache = new Map<string, string>()
+    const batch: (ObservedEvent & { personId: string })[] = []
+    let maxIso = watermark
+    for (const e of rawEvents) {
+      const personId = personByDid.get(e.distinctId)
+      if (!personId) continue // event for a distinct_id we haven't bridged → skip
+      batch.push({
+        eventKey: e.eventKey,
+        displayName: e.displayName,
+        occurredAt: e.occurredAt,
+        sourceEventId: e.sourceEventId,
+        properties: e.properties,
+        personId,
+      })
+      // ISO UTC strings compare chronologically — track the newest.
+      if (!maxIso || e.occurredAt > maxIso) maxIso = e.occurredAt
+    }
+
+    await this.events.recordEventsBatch(userId, projectId, connectionId, 'posthog', batch, defCache)
+    return maxIso
+  }
+
+  /** The watermark — timestamp of the latest event we've ingested for
+   *  this connection. Null on the first sync. */
+  private async readWatermark(connectionId: string, userId: string): Promise<string | null> {
+    const { data, error } = await this.supabaseService
+      .getClient()
+      .from('connection_sync_state')
+      .select('last_event_at')
+      .eq('connection_id', connectionId)
+      .eq('user_id', userId)
+      .maybeSingle()
+    if (error) throw new Error(error.message)
+    return (data as { last_event_at?: string | null } | null)?.last_event_at ?? null
+  }
+
+  /**
+   * Map every `posthog` distinct_id we've bridged for this connection to
+   * its person id, so the bulk events attach without a lookup per event.
+   * Pages through identifiers (Supabase caps a select at 1000 rows).
+   */
+  private async loadPersonByDistinctId(
+    connectionId: string,
+    userId: string,
+  ): Promise<Map<string, string>> {
+    const map = new Map<string, string>()
+    const PAGE = 1000
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await this.supabaseService
+        .getClient()
+        .from('people_identifiers')
+        .select('external_id, person_id')
+        .eq('user_id', userId)
+        .eq('connection_id', connectionId)
+        .eq('source', 'posthog')
+        .range(from, from + PAGE - 1)
+      if (error) throw new Error(error.message)
+      const rows = data ?? []
+      for (const r of rows) {
+        const rr = r as { external_id: string; person_id: string }
+        if (rr.external_id && rr.person_id) map.set(rr.external_id, rr.person_id)
+      }
+      if (rows.length < PAGE) break
+    }
+    return map
   }
 
   /**
@@ -283,23 +326,26 @@ export class PosthogPeopleInitializer {
   }
 
   /**
-   * Most recent events across ALL of a person's distinct_ids (cap 200,
-   * newest first). Uses the HogQL query API — the same proven path the
-   * Users view uses — which is far more reliable than the legacy
-   * `/events` endpoint (that one silently returned nothing for many
-   * distinct_ids, leaving active users with an empty timeline). Selects
-   * only the few properties we actually render, as columns.
+   * ALL events since the watermark, in ONE HogQL query (the same proven
+   * query API the Users view uses). Time-ASCending + capped, so an
+   * oversized first run processes the oldest slice, advances the
+   * watermark, and the next sync continues — no events are ever skipped.
+   * Selects only the columns we render, to keep the response lean.
    */
-  private async fetchPersonEvents(
+  private async fetchEventsSince(
     creds: PosthogCreds,
-    distinctIds: string[],
-  ): Promise<ObservedEvent[]> {
-    if (distinctIds.length === 0) return []
-    const inList = distinctIds.map(d => `'${escHogql(d)}'`).join(', ')
+    watermark: string | null,
+  ): Promise<(ObservedEvent & { distinctId: string })[]> {
+    // Watermark → epoch seconds (timezone-proof); first run → last 90 days.
+    const since = watermark
+      ? `timestamp >= fromUnixTimestamp(${Math.floor(new Date(watermark).getTime() / 1000)})`
+      : 'timestamp >= now() - INTERVAL 90 DAY'
     const hogql =
-      'SELECT toString(uuid), event, timestamp, properties ' +
-      `FROM events WHERE distinct_id IN (${inList}) ` +
-      'ORDER BY timestamp DESC LIMIT 200'
+      'SELECT distinct_id, toString(uuid), event, timestamp, ' +
+      'properties.$pathname, properties.$current_url, properties.$el_text, ' +
+      'coalesce(properties.provider, properties.login_method, properties.method) ' +
+      `FROM events WHERE ${since} ` +
+      'ORDER BY timestamp ASC LIMIT 25000'
 
     const res = await fetch(`${creds.host}/api/projects/${creds.projectId}/query/`, {
       method: 'POST',
@@ -315,18 +361,25 @@ export class PosthogPeopleInitializer {
     }
 
     const json = (await res.json()) as { results?: unknown[][] }
-    const out: ObservedEvent[] = []
+    const out: (ObservedEvent & { distinctId: string })[] = []
     for (const row of json.results ?? []) {
-      const id = asString(row?.[0])
-      const event = asString(row?.[1])
-      const occurredAt = toIsoUtc(asString(row?.[2]))
-      if (!id || !event || !occurredAt) continue
+      const distinctId = asString(row?.[0])
+      const id = asString(row?.[1])
+      const event = asString(row?.[2])
+      const occurredAt = toIsoUtc(asString(row?.[3]))
+      if (!distinctId || !id || !event || !occurredAt) continue
       out.push({
+        distinctId,
         eventKey: event,
         displayName: prettifyEventName(event),
         occurredAt,
         sourceEventId: id,
-        properties: buildPosthogProps(event, parsePropertyBag(row?.[3])),
+        properties: buildPosthogProps(event, {
+          pathname: asString(row?.[4]),
+          currentUrl: asString(row?.[5]),
+          elementText: asString(row?.[6]),
+          loginMethod: asString(row?.[7]),
+        }),
       })
     }
     return out
@@ -355,29 +408,32 @@ export class PosthogPeopleInitializer {
   }
 
   /**
-   * Light sync bookkeeping — same as the Stripe initializer. Records
-   * that identity was pulled; does NOT touch `last_event_at` (that's
-   * the Phase 3 event watchdog's column).
+   * Sync bookkeeping — records when identity was pulled AND advances the
+   * `last_event_at` watermark to the newest event we ingested this run.
+   * The watermark is what makes the next sync incremental.
    */
   private async markSynced(
     connectionId: string,
     projectId: string,
     userId: string,
+    lastEventAt: string | null,
   ): Promise<void> {
+    const payload: Record<string, unknown> = {
+      connection_id: connectionId,
+      project_id: projectId,
+      user_id: userId,
+      last_synced_at: new Date().toISOString(),
+      last_status: 'people_initialized',
+      last_error: null,
+    }
+    // Only advance the watermark when we actually ingested newer events —
+    // omitting the column leaves the existing value untouched.
+    if (lastEventAt) payload.last_event_at = lastEventAt
+
     const { error } = await this.supabaseService
       .getClient()
       .from('connection_sync_state')
-      .upsert(
-        {
-          connection_id: connectionId,
-          project_id: projectId,
-          user_id: userId,
-          last_synced_at: new Date().toISOString(),
-          last_status: 'people_initialized',
-          last_error: null,
-        },
-        { onConflict: 'connection_id' },
-      )
+      .upsert(payload, { onConflict: 'connection_id' })
     if (error) {
       this.logger.warn(`Could not record sync state for ${connectionId}: ${error.message}`)
     }
@@ -434,71 +490,46 @@ function prettifyEventName(raw: string): string {
 
 /**
  * Build the curated `properties` we store + render for a PostHog event,
- * from its full property bag. Friendly keys the frontend reads directly:
+ * from the specific columns the bulk query selected. Friendly keys the
+ * frontend reads directly:
  *   - `path`        — the page visited (pageview / pageleave / click)
  *   - `elementText` — the text of the clicked element (autocapture)
  *   - `method`      — the auth method, for login-type events ("Google")
  */
 function buildPosthogProps(
   event: string,
-  raw: Record<string, unknown>,
+  cols: {
+    pathname?: string
+    currentUrl?: string
+    elementText?: string
+    loginMethod?: string
+  },
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {}
-  const str = (k: string): string | undefined => {
-    const v = raw[k]
-    return typeof v === 'string' && v.trim() ? v : undefined
-  }
 
   // Page — the path of whatever URL the event carries (every $pageview
   // has `$current_url`, so this is the "what page" answer).
-  const path = str('$pathname') ?? pathFromUrl(str('$current_url'))
+  const path = cols.pathname ?? pathFromUrl(cols.currentUrl)
   if (path) out.path = path
 
   // Click — autocapture stores the clicked element's text in `$el_text`.
-  const elText = str('$el_text')
-  if (elText) out.elementText = elText.replace(/\s+/g, ' ').trim().slice(0, 80)
+  if (cols.elementText) {
+    out.elementText = cols.elementText.replace(/\s+/g, ' ').trim().slice(0, 80)
+  }
 
-  // Login method — only for login / sign-in events, from the common
-  // property names apps use. App-specific, so best-effort.
+  // Login method — only for login / sign-in events; the coalesced
+  // candidate is app-specific, so this is best-effort.
   const ev = event.toLowerCase()
-  if ((ev.includes('log') && ev.includes('in')) || ev.includes('sign')) {
-    const method =
-      str('provider') ?? str('login_method') ?? str('$oauth_provider') ?? str('method')
-    if (method) out.method = method
+  if (((ev.includes('log') && ev.includes('in')) || ev.includes('sign')) && cols.loginMethod) {
+    out.method = cols.loginMethod
   }
 
   return out
 }
 
-/**
- * Normalise the `properties` cell the HogQL query returns — it comes
- * back as a raw JSON string on some PostHog versions and an already-
- * parsed object on others. Always returns a plain object; never throws.
- */
-function parsePropertyBag(raw: unknown): Record<string, unknown> {
-  if (!raw) return {}
-  if (typeof raw === 'object' && !Array.isArray(raw)) {
-    return raw as Record<string, unknown>
-  }
-  if (typeof raw === 'string') {
-    try {
-      const parsed = JSON.parse(raw) as unknown
-      return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {}
-    } catch {
-      return {}
-    }
-  }
-  return {}
-}
-
 /** Coerce a HogQL result cell to a non-empty trimmed string, else undefined. */
 function asString(v: unknown): string | undefined {
   return typeof v === 'string' && v.trim() ? v : undefined
-}
-
-/** Escape a value for a single-quoted HogQL/ClickHouse string literal. */
-function escHogql(v: string): string {
-  return v.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
 }
 
 /** Pathname of a URL (e.g. `/pricing`), or undefined if it won't parse. */
