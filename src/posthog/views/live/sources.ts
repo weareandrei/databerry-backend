@@ -6,7 +6,7 @@ import {
   tzDateBucket,
   tzWrappedTimestamp,
 } from './hogql-utils'
-import type { PosthogCredentials } from '../../connection/credentials'
+import { PosthogApiClient } from '../../posthog-api.client'
 
 import type { BucketGranularity } from '../../../common/types'
 export type { BucketGranularity }
@@ -78,7 +78,7 @@ function hourBucketExpr(tz: string): string {
  * legacy shape (toTimeZone(ts, 'UTC') is a no-op for a UTC-stored column).
  */
 export async function fetchPosthogSourcesByBucket(
-  ph: PosthogCredentials,
+  client: PosthogApiClient,
   dateFrom: string,
   dateTo: string,
   granularity: BucketGranularity,
@@ -107,28 +107,23 @@ export async function fetchPosthogSourcesByBucket(
   // `tzDateBucket`) so a "today" range maps to the user's local day, not UTC.
   const hogql = `SELECT ${timeExpr} AS bucket, ${POSTHOG_SOURCE_EXPR} AS src, ${AGG_EXPR[metric]} FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket, src ORDER BY bucket`
 
-  const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ph.apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogql } }),
-  })
-
-  if (!res.ok) {
-    const body = await res.text()
-    logger.error(`PostHog sources query failed: ${body}`)
+  try {
+    const json = (await client.queryHogql(hogql)) as {
+      results?: [unknown, string | null, number][]
+    }
+    const rows: SourceBucketRow[] = []
+    for (const [bucket, src, count] of json.results ?? []) {
+      rows.push({
+        bucketKey: normalizeBucketKey(bucket),
+        source: src ?? '',
+        value: Number(count) || 0,
+      })
+    }
+    return rows
+  } catch (err) {
+    logger.error(`PostHog sources query failed: ${String(err)}`)
     return []
   }
-
-  const json = (await res.json()) as { results?: [unknown, string | null, number][] }
-  const rows: SourceBucketRow[] = []
-  for (const [bucket, src, count] of json.results ?? []) {
-    rows.push({
-      bucketKey: normalizeBucketKey(bucket),
-      source: src ?? '',
-      value: Number(count) || 0,
-    })
-  }
-  return rows
 }
 
 /**
@@ -148,7 +143,7 @@ export async function fetchPosthogSourcesByBucket(
  * window as `fetchPosthogSourcesByBucket` so the two stay comparable.
  */
 export async function fetchPosthogVisitorsTotal(
-  ph: PosthogCredentials,
+  client: PosthogApiClient,
   dateFrom: string,
   dateTo: string,
   logger: Logger,
@@ -159,20 +154,13 @@ export async function fetchPosthogVisitorsTotal(
   const safeTo = escapeDateLiteral(dateTo)
   const hogql = `SELECT count(DISTINCT person_id) FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}'))`
 
-  const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ph.apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogql } }),
-  })
-
-  if (!res.ok) {
-    const body = await res.text()
-    logger.error(`PostHog visitors-total query failed: ${body}`)
+  try {
+    const json = (await client.queryHogql(hogql)) as { results?: [number][] }
+    return Number(json.results?.[0]?.[0]) || 0
+  } catch (err) {
+    logger.error(`PostHog visitors-total query failed: ${String(err)}`)
     return 0
   }
-
-  const json = (await res.json()) as { results?: [number][] }
-  return Number(json.results?.[0]?.[0]) || 0
 }
 
 /**
@@ -180,7 +168,7 @@ export async function fetchPosthogVisitorsTotal(
  * `tz` controls the timezone in which buckets are emitted (default UTC).
  */
 export async function fetchPosthogEventCountByBucket(
-  ph: PosthogCredentials,
+  client: PosthogApiClient,
   eventName: string,
   dateFrom: string,
   dateTo: string,
@@ -199,41 +187,28 @@ export async function fetchPosthogEventCountByBucket(
   // load-bearing because HogQL's AND binds tighter than BETWEEN.
   const hogql = `SELECT ${timeExpr} AS bucket, count() FROM events WHERE event = '${safeEvent}' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY bucket ORDER BY bucket`
 
-  const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ph.apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogql } }),
-  })
-
-  if (!res.ok) {
-    const body = await res.text()
-    logger.error(`PostHog event-count query failed: ${body}`)
+  try {
+    const json = (await client.queryHogql(hogql)) as { results?: [unknown, number][] }
+    return (json.results ?? []).map(([bucket, count]) => ({
+      bucketKey: normalizeBucketKey(bucket),
+      value: Number(count) || 0,
+    }))
+  } catch (err) {
+    logger.error(`PostHog event-count query failed: ${String(err)}`)
     return []
   }
-
-  const json = (await res.json()) as { results?: [unknown, number][] }
-  return (json.results ?? []).map(([bucket, count]) => ({
-    bucketKey: normalizeBucketKey(bucket),
-    value: Number(count) || 0,
-  }))
 }
 
 /**
  * Returns up to 200 distinct event names seen recently — used by the Settings conversion-event dropdown.
  */
 export async function listPosthogEventNames(
-  ph: PosthogCredentials,
+  client: PosthogApiClient,
   logger: Logger,
 ): Promise<string[]> {
-  const url = `${ph.host}/api/projects/${ph.projectId}/event_definitions/?limit=200`
   try {
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${ph.apiKey}` } })
-    if (!res.ok) {
-      logger.warn(`PostHog event_definitions responded ${res.status}`)
-      return []
-    }
-    const json = (await res.json()) as { results: { name: string }[] }
-    return json.results.map(r => r.name)
+    const json = await client.getEventDefinitions()
+    return (json.results ?? []).map(r => r.name)
   } catch (err) {
     logger.warn(`PostHog event definitions fetch error: ${String(err)}`)
     return []

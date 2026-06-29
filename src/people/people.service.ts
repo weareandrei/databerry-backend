@@ -1,5 +1,5 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
-import { SupabaseService } from '../supabase/supabase.service'
+import { PeopleRepository } from './people.repository'
 
 /**
  * Read-side service for the cross-platform people graph (Phase 1).
@@ -17,7 +17,7 @@ import { SupabaseService } from '../supabase/supabase.service'
 export class PeopleService {
   private readonly logger = new Logger(PeopleService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(private readonly peopleRepository: PeopleRepository) {}
 
   /**
    * List people in a project. Newest-first. `limit` caps the page
@@ -31,25 +31,13 @@ export class PeopleService {
     opts: { limit?: number; search?: string } = {},
   ) {
     const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500)
-    let query = this.supabaseService
-      .getClient()
-      .from('people')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('project_id', projectId)
-      .order('updated_at', { ascending: false })
-      .limit(limit)
+    const search =
+      opts.search && opts.search.trim() ? `%${opts.search.trim()}%` : undefined
 
-    if (opts.search && opts.search.trim()) {
-      const term = `%${opts.search.trim()}%`
-      // `or` across the two human-readable columns. ilike = case-
-      // insensitive. The partial email index doesn't serve ilike,
-      // but at the page sizes here a seq-scan within one project is
-      // fine; we revisit if a customer's people count makes it slow.
-      query = query.or(`primary_email.ilike.${term},display_name.ilike.${term}`)
-    }
-
-    const { data, error } = await query
+    const { data, error } = await this.peopleRepository.listByProject(userId, projectId, {
+      limit,
+      search,
+    })
     if (error) throw new Error(error.message)
     return (data ?? []).map(this.toPersonCamel)
   }
@@ -61,24 +49,13 @@ export class PeopleService {
    * information leak).
    */
   async getPerson(userId: string, personId: string) {
-    const { data: person, error } = await this.supabaseService
-      .getClient()
-      .from('people')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('id', personId)
-      .maybeSingle()
+    const { data: person, error } = await this.peopleRepository.findById(userId, personId)
 
     if (error) throw new Error(error.message)
     if (!person) throw new NotFoundException('Person not found')
 
-    const { data: identifiers, error: idErr } = await this.supabaseService
-      .getClient()
-      .from('people_identifiers')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('person_id', personId)
-      .order('created_at', { ascending: true })
+    const { data: identifiers, error: idErr } =
+      await this.peopleRepository.findIdentifiersByPersonId(userId, personId)
 
     if (idErr) throw new Error(idErr.message)
 
@@ -102,26 +79,18 @@ export class PeopleService {
 
     // Verify ownership first — a person from another user must 404
     // before we hand back any events.
-    const { data: person, error: pErr } = await this.supabaseService
-      .getClient()
-      .from('people')
-      .select('id')
-      .eq('user_id', userId)
-      .eq('id', personId)
-      .maybeSingle()
+    const { data: person, error: pErr } = await this.peopleRepository.findIdById(
+      userId,
+      personId,
+    )
     if (pErr) throw new Error(pErr.message)
     if (!person) throw new NotFoundException('Person not found')
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('people_events')
-      .select(
-        'id, occurred_at, properties, source_event_id, connection_id, event_definitions(event_key, display_name, source)',
-      )
-      .eq('user_id', userId)
-      .eq('person_id', personId)
-      .order('occurred_at', { ascending: false })
-      .limit(limit)
+    const { data, error } = await this.peopleRepository.findEventsByPersonId(
+      userId,
+      personId,
+      limit,
+    )
 
     if (error) throw new Error(error.message)
     return (data ?? []).map(this.toEventCamel)

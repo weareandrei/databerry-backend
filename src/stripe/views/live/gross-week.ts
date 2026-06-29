@@ -1,5 +1,6 @@
-import { fetchChargesSince } from '../stripe-api.helpers'
-import type { StripeGetter, ChartPoint } from '../stripe-api.helpers'
+import { fetchChargesSince } from '../../stripe-api.client'
+import type { StripeApiClient } from '../../stripe-api.client'
+import type { ChartPoint } from '../stripe-api.helpers'
 
 const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
@@ -8,7 +9,7 @@ const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
  * Used for Weekly and Monthly modes.
  */
 export async function computeDailyGross(
-  get: StripeGetter,
+  client: StripeApiClient,
   dateFrom: string,
   dateTo: string,
 ): Promise<ChartPoint[]> {
@@ -18,7 +19,7 @@ export async function computeDailyGross(
   const endUnixExclusive = Math.floor(end.getTime() / 1000) + 86_400
 
   const numDays = Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1
-  const charges = await fetchChargesSince(get, startUnix, endUnixExclusive)
+  const charges = await fetchChargesSince(client, startUnix, endUnixExclusive)
 
   const buckets: number[] = new Array(numDays).fill(0)
   for (const c of charges) {
@@ -42,7 +43,7 @@ export async function computeDailyGross(
 /**
  * stripe_gross_week — back-compat wrapper: daily chart from this week's Monday to today (UTC).
  */
-export async function computeGrossWeek(get: StripeGetter): Promise<ChartPoint[]> {
+export async function computeGrossWeek(client: StripeApiClient): Promise<ChartPoint[]> {
   const now = new Date()
   const day = now.getUTCDay()
   const daysSinceMonday = day === 0 ? 6 : day - 1
@@ -56,5 +57,5 @@ export async function computeGrossWeek(get: StripeGetter): Promise<ChartPoint[]>
   const fmt = (d: Date) =>
     `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
 
-  return computeDailyGross(get, fmt(monday), fmt(today))
+  return computeDailyGross(client, fmt(monday), fmt(today))
 }

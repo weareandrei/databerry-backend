@@ -1,6 +1,6 @@
 import { Logger } from '@nestjs/common'
 import { escapeDateLiteral, POSTHOG_SOURCE_EXPR, tzDateBucket } from './hogql-utils'
-import type { PosthogCredentials } from '../../connection/credentials'
+import { PosthogApiClient } from '../../posthog-api.client'
 
 export interface PosthogUserRow {
   /** PostHog `distinct_id` — treat as opaque user pseudo-ID. */
@@ -40,7 +40,7 @@ export interface PosthogUserRow {
  * request bounded.
  */
 export async function fetchPosthogUsersList(
-  ph: PosthogCredentials,
+  client: PosthogApiClient,
   dateFrom: string,
   dateTo: string,
   limit: number,
@@ -69,44 +69,37 @@ export async function fetchPosthogUsersList(
   // `any` just picks that stable value.
   const hogql = `SELECT distinct_id, any(${POSTHOG_SOURCE_EXPR}) AS src, dateDiff('second', min(timestamp), max(timestamp)) AS session_sec, max(timestamp) AS last_seen, any(properties.$geoip_country_code) AS country_code, any(properties.$geoip_country_name) AS country_name, any(properties.$geoip_city_name) AS city, count(distinct properties.$session_id) AS session_count FROM events WHERE event = '$pageview' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY distinct_id ORDER BY last_seen DESC LIMIT ${safeLimit}`
 
-  const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ph.apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogql } }),
-  })
+  try {
+    const json = (await client.queryHogql(hogql)) as {
+      results?: [
+        string,
+        string | null,
+        number | string,
+        string,
+        string | null,
+        string | null,
+        string | null,
+        number | string,
+      ][]
+    }
 
-  if (!res.ok) {
-    const body = await res.text()
-    logger.error(`PostHog users query failed: ${body}`)
+    const rows: PosthogUserRow[] = []
+    for (const r of json.results ?? []) {
+      const [pseudoId, src, sessionSec, lastSeen, countryCode, countryName, city, sessionCount] = r
+      rows.push({
+        pseudoId: String(pseudoId ?? ''),
+        source: src ?? '',
+        sessionSec: Number(sessionSec) || 0,
+        lastSeen: String(lastSeen ?? ''),
+        countryCode: countryCode ? String(countryCode).toUpperCase() : '',
+        countryName: countryName ? String(countryName) : '',
+        city: city ? String(city) : '',
+        sessionCount: Number(sessionCount) || 0,
+      })
+    }
+    return rows
+  } catch (err) {
+    logger.error(`PostHog users query failed: ${String(err)}`)
     return []
   }
-
-  const json = (await res.json()) as {
-    results?: [
-      string,        // distinct_id
-      string | null, // src
-      number | string, // session_sec
-      string,        // last_seen
-      string | null, // country_code
-      string | null, // country_name
-      string | null, // city
-      number | string, // session_count
-    ][]
-  }
-
-  const rows: PosthogUserRow[] = []
-  for (const r of json.results ?? []) {
-    const [pseudoId, src, sessionSec, lastSeen, countryCode, countryName, city, sessionCount] = r
-    rows.push({
-      pseudoId: String(pseudoId ?? ''),
-      source: src ?? '',
-      sessionSec: Number(sessionSec) || 0,
-      lastSeen: String(lastSeen ?? ''),
-      countryCode: countryCode ? String(countryCode).toUpperCase() : '',
-      countryName: countryName ? String(countryName) : '',
-      city: city ? String(city) : '',
-      sessionCount: Number(sessionCount) || 0,
-    })
-  }
-  return rows
 }

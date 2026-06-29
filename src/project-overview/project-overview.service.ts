@@ -1,20 +1,20 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { SupabaseService } from '../supabase/supabase.service'
+import { ConnectionsRepository } from '../connections/connections.repository'
+import { StripeRepository } from '../stripe/stripe.repository'
 import { UserSettingsService } from '../user-settings/user-settings.service'
 import {
   ProjectSettingsService,
   type ProjectSettings,
 } from '../project-settings/project-settings.service'
 import { GoogleAnalyticsOAuthService } from '../google-analytics/connection/oauth'
-import { getPosthogCredentials } from '../posthog/connection/credentials'
 import {
-  fetchSourcesByBucket as fetchGASourcesByBucket,
-  fetchMetricByBucket as fetchGAMetricByBucket,
-  fetchPagesList as fetchGAPagesList,
-  fetchVisitorsTotal as fetchGAVisitorsTotal,
+  GoogleAnalyticsDataClient,
   type SourceBucketRow as GASourceRow,
   type BucketGranularity,
-} from '../google-analytics/views/live/sources'
+} from '../google-analytics/google-analytics-data.client'
+import { getPosthogCredentials, PosthogCredentialsService } from '../posthog/connection/credentials'
+import { PosthogApiClient } from '../posthog/posthog-api.client'
 import {
   fetchPosthogSourcesByBucket,
   fetchPosthogEventCountByBucket,
@@ -270,6 +270,9 @@ export class ProjectOverviewService {
 
   constructor(
     private readonly supabaseService: SupabaseService,
+    private readonly connectionsRepository: ConnectionsRepository,
+    private readonly stripeRepository: StripeRepository,
+    private readonly posthogCredentialsService: PosthogCredentialsService,
     private readonly userSettingsService: UserSettingsService,
     private readonly projectSettingsService: ProjectSettingsService,
     private readonly gaOAuthService: GoogleAnalyticsOAuthService,
@@ -312,20 +315,13 @@ export class ProjectOverviewService {
     projectId: string,
   ): Promise<TrafficProvider | null> {
     const settings = await this.userSettingsService.get(userId)
-    const client = this.supabaseService.getClient()
 
     if (settings.preferredTrafficConnectionId) {
-      // Honour the historical scope rule — the preferred may be scoped
-      // to this project OR Common (the user explicitly chose "use this
-      // one everywhere"). Project-scoped-to-a-different-project is
-      // excluded by the `.or` filter.
-      const { data } = await client
-        .from('connections')
-        .select('id, type, project_id')
-        .eq('id', settings.preferredTrafficConnectionId)
-        .eq('user_id', userId)
-        .or(`project_id.eq.${projectId},project_id.is.null`)
-        .maybeSingle()
+      const { data } = await this.connectionsRepository.findPreferredTrafficConnection(
+        settings.preferredTrafficConnectionId,
+        userId,
+        projectId,
+      )
       if (data && (data.type === 'google_analytics' || data.type === 'posthog')) {
         return { type: data.type as 'google_analytics' | 'posthog', connectionId: data.id as string }
       }
@@ -334,14 +330,11 @@ export class ProjectOverviewService {
     // Strict project-specific lookup. No `.or(project_id.is.null)` —
     // see the docstring above for why Common is no longer an auto-pick.
     for (const type of ['google_analytics', 'posthog'] as const) {
-      const { data } = await client
-        .from('connections')
-        .select('id, project_id')
-        .eq('user_id', userId)
-        .eq('type', type)
-        .eq('project_id', projectId)
-        .limit(1)
-        .maybeSingle()
+      const { data } = await this.connectionsRepository.findProjectScopedByType(
+        userId,
+        type,
+        projectId,
+      )
       if (data) return { type, connectionId: data.id as string }
     }
 
@@ -466,11 +459,18 @@ export class ProjectOverviewService {
         try {
           const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
           const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
+          const gaClient = new GoogleAnalyticsDataClient(token, provider.connectionId)
           if (primaryMetric === 'visitors') {
-            const rows = await fetchGASourcesByBucket(token, provider.connectionId, propertyId, dateFrom, dateTo, gran)
+            const rows = await gaClient.fetchSourcesByBucket(propertyId, dateFrom, dateTo, gran)
             this.assignSourceRows(buckets, byBucketTotal, byBucketSources, rows)
           } else {
-            const rows = await fetchGAMetricByBucket(token, provider.connectionId, propertyId, 'screenPageViews', dateFrom, dateTo, gran)
+            const rows = await gaClient.fetchMetricByBucket(
+              propertyId,
+              'screenPageViews',
+              dateFrom,
+              dateTo,
+              gran,
+            )
             this.assignFlatRows(buckets, byBucketTotal, byBucketSources, rows, 'Total')
           }
           return { unavailable: false }
@@ -485,10 +485,10 @@ export class ProjectOverviewService {
       // why the chart's "Visitors" never matched PostHog's own
       // unique-visitor numbers.
       try {
-        const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+        const ph = await getPosthogCredentials(provider.connectionId, this.posthogCredentialsService)
         if (!ph) return { unavailable: true }
         const rows = await fetchPosthogSourcesByBucket(
-          ph,
+          new PosthogApiClient(ph),
           dateFrom,
           dateTo,
           gran,
@@ -509,10 +509,10 @@ export class ProjectOverviewService {
         return { unavailable: true }
       }
       try {
-        const ph = await getPosthogCredentials(projectSettings.conversionConnectionId, this.supabaseService)
+        const ph = await getPosthogCredentials(projectSettings.conversionConnectionId, this.posthogCredentialsService)
         if (!ph) return { unavailable: true }
         const rows = await fetchPosthogEventCountByBucket(
-          ph,
+          new PosthogApiClient(ph),
           projectSettings.conversionEvent,
           dateFrom,
           dateTo,
@@ -584,7 +584,13 @@ export class ProjectOverviewService {
         const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
         const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
         const metric = secondaryMetric === 'bounce_rate' ? 'bounceRate' : 'averageSessionDuration'
-        const rows = await fetchGAMetricByBucket(token, provider.connectionId, propertyId, metric, dateFrom, dateTo, gran)
+        const rows = await new GoogleAnalyticsDataClient(token, provider.connectionId).fetchMetricByBucket(
+          propertyId,
+          metric,
+          dateFrom,
+          dateTo,
+          gran,
+        )
         const byKey = new Map(rows.map(r => [r.bucketKey, r.value]))
         let count = 0
         let sum = 0
@@ -651,12 +657,18 @@ export class ProjectOverviewService {
     if (provider.type === 'google_analytics') {
       const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
       const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
-      const rows = await fetchGAMetricByBucket(token, provider.connectionId, propertyId, 'sessions', dateFrom, dateTo, gran)
+      const rows = await new GoogleAnalyticsDataClient(token, provider.connectionId).fetchMetricByBucket(
+        propertyId,
+        'sessions',
+        dateFrom,
+        dateTo,
+        gran,
+      )
       return new Map(rows.map(r => [r.bucketKey, r.value]))
     }
-    const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+    const ph = await getPosthogCredentials(provider.connectionId, this.posthogCredentialsService)
     if (!ph) return new Map()
-    const rows = await fetchPosthogSourcesByBucket(ph, dateFrom, dateTo, gran, this.logger, tz)
+    const rows = await fetchPosthogSourcesByBucket(new PosthogApiClient(ph), dateFrom, dateTo, gran, this.logger, tz)
     const out = new Map<string, number>()
     for (const r of rows) out.set(r.bucketKey, (out.get(r.bucketKey) ?? 0) + r.value)
     return out
@@ -671,9 +683,9 @@ export class ProjectOverviewService {
     gran: BucketGranularity,
     tz: string,
   ): Promise<Map<string, number>> {
-    const ph = await getPosthogCredentials(connectionId, this.supabaseService)
+    const ph = await getPosthogCredentials(connectionId, this.posthogCredentialsService)
     if (!ph) return new Map()
-    const rows = await fetchPosthogEventCountByBucket(ph, eventName, dateFrom, dateTo, gran, this.logger, tz)
+    const rows = await fetchPosthogEventCountByBucket(new PosthogApiClient(ph), eventName, dateFrom, dateTo, gran, this.logger, tz)
     return new Map(rows.map(r => [r.bucketKey, r.value]))
   }
 
@@ -691,11 +703,15 @@ export class ProjectOverviewService {
       if (provider.type === 'google_analytics') {
         const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
         const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
-        return await fetchGAVisitorsTotal(token, provider.connectionId, propertyId, dateFrom, dateTo)
+        return await new GoogleAnalyticsDataClient(token, provider.connectionId).fetchVisitorsTotal(
+          propertyId,
+          dateFrom,
+          dateTo,
+        )
       }
-      const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+      const ph = await getPosthogCredentials(provider.connectionId, this.posthogCredentialsService)
       if (!ph) return null
-      return await fetchPosthogVisitorsTotal(ph, dateFrom, dateTo, this.logger, tz)
+      return await fetchPosthogVisitorsTotal(new PosthogApiClient(ph), dateFrom, dateTo, this.logger, tz)
     } catch (err) {
       this.logger.warn(`visitors-total fetch failed: ${String(err)}`)
       return null
@@ -761,9 +777,7 @@ export class ProjectOverviewService {
       if (provider.type === 'google_analytics') {
         const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
         const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
-        const all = await fetchGASourcesByBucket(
-          token,
-          provider.connectionId,
+        const all = await new GoogleAnalyticsDataClient(token, provider.connectionId).fetchSourcesByBucket(
           propertyId,
           dateFrom,
           dateTo,
@@ -771,7 +785,7 @@ export class ProjectOverviewService {
         )
         rows = all.map(r => ({ source: r.source, value: r.value }))
       } else {
-        const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+        const ph = await getPosthogCredentials(provider.connectionId, this.posthogCredentialsService)
         if (ph) {
           // 'visitors' + the user's tz. The tz used to be omitted
           // (defaulted to UTC) while the CHART bucketed in the
@@ -779,7 +793,7 @@ export class ProjectOverviewService {
           // which events belong to "today" and their totals never
           // reconciled near midnight-adjacent hours.
           const all = await fetchPosthogSourcesByBucket(
-            ph,
+            new PosthogApiClient(ph),
             dateFrom,
             dateTo,
             gran,
@@ -866,10 +880,10 @@ export class ProjectOverviewService {
     }
 
     try {
-      const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+      const ph = await getPosthogCredentials(provider.connectionId, this.posthogCredentialsService)
       if (!ph) return { users: [], provider: 'posthog' }
 
-      const rows = await fetchPosthogUsersList(ph, dateFrom, dateTo, limit, this.logger)
+      const rows = await fetchPosthogUsersList(new PosthogApiClient(ph), dateFrom, dateTo, limit, this.logger)
       const users: OverviewUser[] = rows.map(r => {
         const n = normalizeSource(r.source)
         return {
@@ -917,11 +931,11 @@ export class ProjectOverviewService {
     }
 
     try {
-      const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+      const ph = await getPosthogCredentials(provider.connectionId, this.posthogCredentialsService)
       if (!ph) return { countries: [], provider: 'posthog' }
 
       const rows = await fetchPosthogCountriesList(
-        ph,
+        new PosthogApiClient(ph),
         dateFrom,
         dateTo,
         limit,
@@ -968,18 +982,16 @@ export class ProjectOverviewService {
       if (provider.type === 'google_analytics') {
         const token = await this.gaOAuthService.ensureFreshToken(provider.connectionId)
         const propertyId = await this.gaOAuthService.getPropertyId(provider.connectionId)
-        rows = await fetchGAPagesList(
-          token,
-          provider.connectionId,
+        rows = await new GoogleAnalyticsDataClient(token, provider.connectionId).fetchPagesList(
           propertyId,
           dateFrom,
           dateTo,
           limit,
         )
       } else {
-        const ph = await getPosthogCredentials(provider.connectionId, this.supabaseService)
+        const ph = await getPosthogCredentials(provider.connectionId, this.posthogCredentialsService)
         if (!ph) return { pages: [], provider: 'posthog' }
-        rows = await fetchPosthogPagesList(ph, dateFrom, dateTo, limit, this.logger, tz)
+        rows = await fetchPosthogPagesList(new PosthogApiClient(ph), dateFrom, dateTo, limit, this.logger, tz)
       }
     } catch (err) {
       this.logger.warn(`fetchPages provider error: ${String(err)}`)
@@ -1001,19 +1013,16 @@ export class ProjectOverviewService {
     connectionId: string,
   ): Promise<{ events: { name: string }[] }> {
     // Verify ownership
-    const { data: conn } = await this.supabaseService
-      .getClient()
-      .from('connections')
-      .select('id, type')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .maybeSingle()
+    const { data: conn } = await this.connectionsRepository.findIdAndTypeByIdAndUserId(
+      connectionId,
+      userId,
+    )
     if (!conn) return { events: [] }
 
     if (conn.type === 'posthog') {
-      const ph = await getPosthogCredentials(connectionId, this.supabaseService)
+      const ph = await getPosthogCredentials(connectionId, this.posthogCredentialsService)
       if (!ph) return { events: [] }
-      const names = await listPosthogEventNames(ph, this.logger)
+      const names = await listPosthogEventNames(new PosthogApiClient(ph), this.logger)
       return { events: names.map(name => ({ name })) }
     }
 
@@ -1061,14 +1070,10 @@ export class ProjectOverviewService {
     dateTo: string,
     gran: BucketGranularity,
   ): Promise<{ bucketUnix: number; value: number }[]> {
-    const client = this.supabaseService.getClient()
-
-    const { data: conns } = await client
-      .from('connections')
-      .select('id, type, project_id')
-      .eq('user_id', userId)
-      .in('type', ['stripe_manual', 'stripe'])
-      .or(`project_id.eq.${projectId},project_id.is.null`)
+    const { data: conns } = await this.connectionsRepository.findStripeConnectionsForProject(
+      userId,
+      projectId,
+    )
 
     if (!conns || conns.length === 0) return []
 
@@ -1077,10 +1082,16 @@ export class ProjectOverviewService {
 
     for (const c of conns) {
       try {
-        const accountId = await getStripeAccountIdForConnection(client, c.id as string)
+        const accountId = await getStripeAccountIdForConnection(
+          this.connectionsRepository,
+          c.id as string,
+        )
         if (!accountId) continue
 
-        const productFilter = await getConnectionProductFilter(client, c.id as string)
+        const productFilter = await getConnectionProductFilter(
+          this.connectionsRepository,
+          c.id as string,
+        )
 
         if (productFilter.length === 0) {
           // Unfiltered = "all products". Avoid double-counting if two
@@ -1090,7 +1101,7 @@ export class ProjectOverviewService {
         }
 
         const rows = await fetchStripeRevenueByBucketFromStorage(
-          client,
+          this.stripeRepository,
           accountId,
           dateFrom,
           dateTo,

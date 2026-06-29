@@ -1,0 +1,23 @@
+---
+description: Prefer full words in variable and parameter names — avoid abbreviations
+alwaysApply: true
+---
+
+# Naming: full words, not abbreviations
+
+Prefer readable full words in identifiers. Do not shorten when a longer name is clearer.
+
+## Prefer
+
+- `eventDefinitionsCache` not `defCache`, `eventDefCache`
+- `eventDefinitionId` not `defId`
+- `connection` not `conn`
+- `customer` not `cus`
+- `accumulator` not `acc`
+
+## Avoid
+
+- Dropping syllables: `def`, `cfg`, `ctx`, `msg`, `err` (except in very tight loop locals where the type is obvious)
+- Cryptic prefixes: `ev` → `event`, `ch` → `charge`
+
+Exception: widely accepted domain shorthand in this codebase (e.g. `userId`, `projectId`) is fine.

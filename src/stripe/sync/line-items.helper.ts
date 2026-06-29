@@ -1,5 +1,5 @@
 import type { Logger } from '@nestjs/common'
-import type { StripeGetter } from '../views/stripe-api.helpers'
+import type { StripeApiClient } from '../stripe-api.client'
 import type {
   StripeChargeRow,
   StripeCheckoutLineRow,
@@ -51,7 +51,7 @@ export interface ResolvedLineItem {
  * Pure data — no DB writes here. Caller handles upsert.
  */
 export async function resolveChargeLineItems(
-  get: StripeGetter,
+  client: StripeApiClient,
   charge: StripeChargeRow,
   logger?: Logger,
 ): Promise<ResolvedLineItem[]> {
@@ -75,7 +75,7 @@ export async function resolveChargeLineItems(
     // every invoiced charge in current Stripe API versions. Look up the
     // bridging `invoice_payment`.
     try {
-      const payments = (await get('invoice_payments', {
+      const payments = (await client.get('invoice_payments', {
         'payment[type]': 'payment_intent',
         'payment[payment_intent]': charge.payment_intent,
         limit: '1',
@@ -96,7 +96,7 @@ export async function resolveChargeLineItems(
     let invoice: StripeInvoiceRow | null = inlineInvoice
     if (!invoice) {
       try {
-        invoice = (await get(`invoices/${invoiceId}`, {
+        invoice = (await client.get(`invoices/${invoiceId}`, {
           'expand[]': 'lines.data.price',
         })) as unknown as StripeInvoiceRow
       } catch (err) {
@@ -127,7 +127,7 @@ export async function resolveChargeLineItems(
   // Session lookup (one-time non-subscription Checkout flow).
   if (charge.payment_intent) {
     try {
-      const sessions = (await get('checkout/sessions', {
+      const sessions = (await client.get('checkout/sessions', {
         payment_intent: charge.payment_intent,
         'expand[]': 'data.line_items.data.price',
         limit: '1',

@@ -1,11 +1,13 @@
-import type { SupabaseService } from '../../supabase/supabase.service'
+import type {
+  ConnectionsRepository,
+  StripeCredentialTable,
+} from '../../connections/connections.repository'
 import { localMidnightUtc } from '../../common/tz'
+import type { StripeRepository } from '../stripe.repository'
 import {
   subItemsTouchProducts,
   type PersistedSubItem,
 } from '../sync/mrr.helper'
-
-type Client = ReturnType<SupabaseService['getClient']>
 
 /**
  * `YYYY-MM-DD` + 1 day, as `YYYY-MM-DD`. Used as the exclusive upper bound
@@ -28,41 +30,30 @@ export interface ChargeRow {
   created: string // ISO timestamp
 }
 
+function credentialTableForType(type: string): StripeCredentialTable | null {
+  if (type === 'stripe_manual') return 'connections_stripe_manual'
+  if (type === 'stripe') return 'connections_stripe'
+  return null
+}
+
 /**
  * Resolve the stripe_account_id behind a connection (manual or OAuth).
  * Returns null if the connection isn't a Stripe one or the column hasn't
  * been populated yet.
  */
 export async function getStripeAccountIdForConnection(
-  client: Client,
+  connectionsRepo: ConnectionsRepository,
   connectionId: string,
 ): Promise<string | null> {
-  const { data: conn } = await client
-    .from('connections')
-    .select('type')
-    .eq('id', connectionId)
-    .maybeSingle()
+  const { data: conn } = await connectionsRepo.findTypeByConnectionId(connectionId)
 
   if (!conn) return null
   const type = conn.type as string
+  const table = credentialTableForType(type)
+  if (!table) return null
 
-  if (type === 'stripe_manual') {
-    const { data } = await client
-      .from('connections_stripe_manual')
-      .select('stripe_account_id')
-      .eq('connection_id', connectionId)
-      .maybeSingle()
-    return (data?.stripe_account_id as string | null) ?? null
-  }
-  if (type === 'stripe') {
-    const { data } = await client
-      .from('connections_stripe')
-      .select('stripe_account_id')
-      .eq('connection_id', connectionId)
-      .maybeSingle()
-    return (data?.stripe_account_id as string | null) ?? null
-  }
-  return null
+  const { data } = await connectionsRepo.findStripeAccountId(connectionId, table)
+  return (data?.stripe_account_id as string | null) ?? null
 }
 
 /**
@@ -76,34 +67,19 @@ export async function getStripeAccountIdForConnection(
  * old `connection_stripe_products` junction had with zero rows.
  */
 export async function getConnectionProductFilter(
-  client: Client,
+  connectionsRepo: ConnectionsRepository,
   connectionId: string,
 ): Promise<string[]> {
-  // Need the connection type first so we know which credential table to read.
-  // Non-Stripe connections (or unlinked rows) return `[]` — the "no filter"
-  // path the caller is already prepared for.
-  const { data: conn } = await client
-    .from('connections')
-    .select('type')
-    .eq('id', connectionId)
-    .maybeSingle()
+  const { data: conn } = await connectionsRepo.findTypeByConnectionId(connectionId)
 
   if (!conn) return []
-  const type = conn.type as string
-
-  const table =
-    type === 'stripe_manual'
-      ? 'connections_stripe_manual'
-      : type === 'stripe'
-        ? 'connections_stripe'
-        : null
+  const table = credentialTableForType(conn.type as string)
   if (!table) return []
 
-  const { data, error } = await client
-    .from(table)
-    .select('tracked_product_ids')
-    .eq('connection_id', connectionId)
-    .maybeSingle()
+  const { data, error } = await connectionsRepo.findTrackedProductIds(
+    connectionId,
+    table,
+  )
 
   if (error) throw new Error(`${table} tracked_product_ids read: ${error.message}`)
   return (data?.tracked_product_ids as string[] | null) ?? []
@@ -126,30 +102,22 @@ export async function getConnectionProductFilter(
  * them. They DO appear in unfiltered queries.
  */
 export async function fetchAccountCharges(
-  client: Client,
+  stripeRepo: StripeRepository,
   stripeAccountId: string,
   dateFrom: string,
   dateTo: string,
   productIds: string[] = [],
   tz: string = 'UTC',
 ): Promise<ChargeRow[]> {
-  // tz-aware bounds: "today" means midnight-to-midnight in the user's
-  // timezone, expressed as UTC instants. For UTC users this collapses to
-  // the legacy `${dateFrom}T00:00:00Z` form; for everyone else a charge
-  // created at 11pm Bucharest local on Apr 30 still falls inside Apr 30
-  // even though its UTC stamp is Apr 30 20:00.
   const fromISO = localMidnightUtc(dateFrom, tz).toISOString()
   const toExclusiveISO = localMidnightUtc(addOneDay(dateTo), tz).toISOString()
 
   if (productIds.length === 0) {
-    // Fast path — no product filter, sum charges directly.
-    const { data, error } = await client
-      .from('stripe_charges')
-      .select('amount, created')
-      .eq('stripe_account_id', stripeAccountId)
-      .eq('status', 'succeeded')
-      .gte('created', fromISO)
-      .lt('created', toExclusiveISO)
+    const { data, error } = await stripeRepo.findSucceededChargesInRange(
+      stripeAccountId,
+      fromISO,
+      toExclusiveISO,
+    )
 
     if (error) throw new Error(`stripe_charges read: ${error.message}`)
     return (data ?? []).map(r => ({
@@ -158,15 +126,10 @@ export async function fetchAccountCharges(
     }))
   }
 
-  // Filtered path — sum line-item amounts, group back into "synthetic charges"
-  // keyed by charge_id so the caller can still bucket by `created`. We do
-  // this in two queries (line items, then their parent charges) because
-  // Supabase's PostgREST embedding doesn't aggregate cleanly here.
-  const { data: liRows, error: liErr } = await client
-    .from('stripe_line_items')
-    .select('charge_id, amount')
-    .eq('stripe_account_id', stripeAccountId)
-    .in('product_id', productIds)
+  const { data: liRows, error: liErr } = await stripeRepo.findLineItemsByAccountAndProducts(
+    stripeAccountId,
+    productIds,
+  )
 
   if (liErr) throw new Error(`stripe_line_items read: ${liErr.message}`)
   if (!liRows || liRows.length === 0) return []
@@ -178,13 +141,8 @@ export async function fetchAccountCharges(
   }
 
   const chargeIds = Array.from(sumByCharge.keys())
-  const { data: chargeRows, error: chargeErr } = await client
-    .from('stripe_charges')
-    .select('id, created')
-    .in('id', chargeIds)
-    .eq('status', 'succeeded')
-    .gte('created', fromISO)
-    .lt('created', toExclusiveISO)
+  const { data: chargeRows, error: chargeErr } =
+    await stripeRepo.findSucceededChargesByIdsInRange(chargeIds, fromISO, toExclusiveISO)
 
   if (chargeErr) throw new Error(`stripe_charges read (filtered): ${chargeErr.message}`)
 
@@ -193,19 +151,6 @@ export async function fetchAccountCharges(
     created: r.created as string,
   }))
 }
-
-// `nextDayISO` was the UTC-only predecessor of
-// `localMidnightUtc(addOneDay(dateTo), tz)`. Removed once `tz` was threaded
-// through every charge-range read; if you find yourself wanting it back,
-// you almost certainly mean the tz-aware form.
-
-// ──────────────────────────────────────────────────────────────────────────
-// SaaS-metric reads (MRR, active subs, top customers, churn). All operate on
-// `stripe_subscriptions` + `stripe_customers`, populated by the sync layer.
-// Per-connection product filter (when `productIds.length > 0`) is applied
-// in-app via JSONB walk on `items`. JSONB-walk overhead is fine at the
-// solo-founder scale we target (most accounts have <1k subs).
-// ──────────────────────────────────────────────────────────────────────────
 
 export interface ActiveSubsAndMrrResult {
   activeSubs: number
@@ -222,27 +167,24 @@ const ACTIVE_STATUSES = ['active', 'trialing'] as const
  * `productIds`.
  */
 export async function fetchActiveSubsAndMrr(
-  client: Client,
+  stripeRepo: StripeRepository,
   stripeAccountId: string,
   productIds: string[] = [],
 ): Promise<ActiveSubsAndMrrResult> {
-  const { data, error } = await client
-    .from('stripe_subscriptions')
-    .select('id, monthly_amount_cents, items')
-    .eq('stripe_account_id', stripeAccountId)
-    .in('status', ACTIVE_STATUSES as unknown as string[])
+  const { data, error } = await stripeRepo.findActiveSubscriptions(
+    stripeAccountId,
+    ACTIVE_STATUSES as unknown as string[],
+  )
 
   if (error) throw new Error(`stripe_subscriptions read (mrr): ${error.message}`)
 
   const rows = data ?? []
   if (productIds.length === 0) {
-    // Fast path — no filter, sum directly.
     let mrr = 0
     for (const r of rows) mrr += Number(r.monthly_amount_cents) || 0
     return { activeSubs: rows.length, mrrCents: mrr }
   }
 
-  // Filter path — JSONB walk to keep only subs touching the product set.
   let activeSubs = 0
   let mrr = 0
   for (const r of rows) {
@@ -258,8 +200,6 @@ export interface TopCustomerRow {
   customerId: string
   name: string | null
   email: string | null
-  /** ISO 3166-1 alpha-2 (e.g. 'RO'). Null when Stripe never collected an
-   *  address for the customer, or the address has no country. */
   addressCountry: string | null
   addressCity: string | null
   amountCents: number
@@ -276,7 +216,7 @@ export interface TopCustomerRow {
  * still count in the existing revenue tiles.
  */
 export async function fetchTopCustomers(
-  client: Client,
+  stripeRepo: StripeRepository,
   stripeAccountId: string,
   productIds: string[],
   dateFrom: string,
@@ -284,25 +224,17 @@ export async function fetchTopCustomers(
   limit = 10,
   tz: string = 'UTC',
 ): Promise<TopCustomerRow[]> {
-  // We need the per-charge `customer_id` alongside the (filtered) amount.
-  // `fetchAccountCharges` returns ChargeRow which intentionally hides
-  // customer_id (it's bucket-by-day-only). Re-implement the two paths
-  // narrowly here with `customer_id` included.
-  //
-  // tz-aware bounds: see comment in `fetchAccountCharges`.
   const fromISO = localMidnightUtc(dateFrom, tz).toISOString()
   const toExclusiveISO = localMidnightUtc(addOneDay(dateTo), tz).toISOString()
 
   const sumByCustomer = new Map<string, number>()
 
   if (productIds.length === 0) {
-    const { data, error } = await client
-      .from('stripe_charges')
-      .select('amount, customer_id')
-      .eq('stripe_account_id', stripeAccountId)
-      .eq('status', 'succeeded')
-      .gte('created', fromISO)
-      .lt('created', toExclusiveISO)
+    const { data, error } = await stripeRepo.findSucceededChargesWithCustomerInRange(
+      stripeAccountId,
+      fromISO,
+      toExclusiveISO,
+    )
 
     if (error) throw new Error(`stripe_charges read (top customers): ${error.message}`)
 
@@ -312,13 +244,10 @@ export async function fetchTopCustomers(
       sumByCustomer.set(cid, (sumByCustomer.get(cid) ?? 0) + Number(r.amount))
     }
   } else {
-    // Same shape as `fetchAccountCharges`'s filter path: sum line-item
-    // amounts per charge, then look up parent charge for date + customer.
-    const { data: liRows, error: liErr } = await client
-      .from('stripe_line_items')
-      .select('charge_id, amount')
-      .eq('stripe_account_id', stripeAccountId)
-      .in('product_id', productIds)
+    const { data: liRows, error: liErr } = await stripeRepo.findLineItemsByAccountAndProducts(
+      stripeAccountId,
+      productIds,
+    )
     if (liErr) throw new Error(`stripe_line_items read (top customers): ${liErr.message}`)
     if (!liRows || liRows.length === 0) return []
 
@@ -329,14 +258,15 @@ export async function fetchTopCustomers(
     }
 
     const chargeIds = Array.from(sumByCharge.keys())
-    const { data: chargeRows, error: chargeErr } = await client
-      .from('stripe_charges')
-      .select('id, customer_id')
-      .in('id', chargeIds)
-      .eq('status', 'succeeded')
-      .gte('created', fromISO)
-      .lt('created', toExclusiveISO)
-    if (chargeErr) throw new Error(`stripe_charges read (top customers, filtered): ${chargeErr.message}`)
+    const { data: chargeRows, error: chargeErr } =
+      await stripeRepo.findSucceededChargesWithCustomerByIdsInRange(
+        chargeIds,
+        fromISO,
+        toExclusiveISO,
+      )
+    if (chargeErr) {
+      throw new Error(`stripe_charges read (top customers, filtered): ${chargeErr.message}`)
+    }
 
     for (const r of chargeRows ?? []) {
       const cid = r.customer_id as string | null
@@ -348,17 +278,12 @@ export async function fetchTopCustomers(
 
   if (sumByCustomer.size === 0) return []
 
-  // Top N by amount.
   const ranked = Array.from(sumByCustomer.entries())
     .sort((a, b) => b[1] - a[1])
     .slice(0, limit)
 
-  // Resolve names/emails/location in a single round trip.
   const ids = ranked.map(([cid]) => cid)
-  const { data: custRows, error: custErr } = await client
-    .from('stripe_customers')
-    .select('id, name, email, address_country, address_city')
-    .in('id', ids)
+  const { data: custRows, error: custErr } = await stripeRepo.findCustomersByIds(ids)
   if (custErr) throw new Error(`stripe_customers read: ${custErr.message}`)
 
   interface CustomerMeta {
@@ -391,7 +316,6 @@ export async function fetchTopCustomers(
 }
 
 export interface ChurnRateResult {
-  /** Decimal in [0, 1]. Caller formats as percent. */
   churnRate: number
   canceled30d: number
   activeNow: number
@@ -415,26 +339,23 @@ export interface ChurnRateResult {
  * worth designing without real user signal.
  */
 export async function fetchChurnRate30d(
-  client: Client,
+  stripeRepo: StripeRepository,
   stripeAccountId: string,
 ): Promise<ChurnRateResult> {
   const thirtyDaysAgoISO = new Date(Date.now() - 30 * 86_400_000).toISOString()
 
   const [activeRes, canceledRes] = await Promise.all([
-    client
-      .from('stripe_subscriptions')
-      .select('id', { count: 'exact', head: true })
-      .eq('stripe_account_id', stripeAccountId)
-      .in('status', ACTIVE_STATUSES as unknown as string[]),
-    client
-      .from('stripe_subscriptions')
-      .select('id', { count: 'exact', head: true })
-      .eq('stripe_account_id', stripeAccountId)
-      .gte('canceled_at', thirtyDaysAgoISO),
+    stripeRepo.countActiveSubscriptions(
+      stripeAccountId,
+      ACTIVE_STATUSES as unknown as string[],
+    ),
+    stripeRepo.countCanceledSubscriptionsSince(stripeAccountId, thirtyDaysAgoISO),
   ])
 
   if (activeRes.error) throw new Error(`stripe_subscriptions count active: ${activeRes.error.message}`)
-  if (canceledRes.error) throw new Error(`stripe_subscriptions count canceled: ${canceledRes.error.message}`)
+  if (canceledRes.error) {
+    throw new Error(`stripe_subscriptions count canceled: ${canceledRes.error.message}`)
+  }
 
   const activeNow = activeRes.count ?? 0
   const canceled30d = canceledRes.count ?? 0

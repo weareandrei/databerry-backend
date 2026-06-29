@@ -1,7 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { Cron } from '@nestjs/schedule'
 import { SupabaseService } from '../supabase/supabase.service'
-import { getPosthogCredentials } from '../posthog/connection/credentials'
+import { ConnectionsRepository } from '../connections/connections.repository'
+import { StripeRepository } from '../stripe/stripe.repository'
+import { ViewsRepository } from '../views/views.repository'
+import { PosthogCredentialsService } from '../posthog/connection/credentials'
+import { PosthogApiClient } from '../posthog/posthog-api.client'
 import { fetchAccountCharges, getConnectionProductFilter, getStripeAccountIdForConnection } from '../stripe/views/storage-queries'
 
 interface PendingRow {
@@ -22,7 +26,13 @@ interface PendingRow {
 export class SchedulerService {
   private readonly logger = new Logger(SchedulerService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly viewsRepository: ViewsRepository,
+    private readonly posthogCredentialsService: PosthogCredentialsService,
+    private readonly supabaseService: SupabaseService,
+    private readonly connectionsRepository: ConnectionsRepository,
+    private readonly stripeRepository: StripeRepository,
+  ) {}
 
   @Cron('0 */30 * * * *')
   async syncPendingViews(): Promise<void> {
@@ -32,13 +42,10 @@ export class SchedulerService {
 
     this.logger.log(`\n  ► syncPendingViews  dates=[${yesterday}, ${today}]`)
 
-    const client = this.supabaseService.getClient()
-
-    const { data: rows, error } = await client
-      .from('views_values')
-      .select('id, view_id, created_at, views!inner(type, connection_id, config, connections!inner(type))')
-      .eq('needs_sync', true)
-      .in('created_at', [today, yesterday])
+    const { data: rows, error } = await this.viewsRepository.findPendingSyncRows([
+      today,
+      yesterday,
+    ])
 
     if (error) {
       this.logger.error(`  ✗ Failed to query pending rows\n  ${error.message}`)
@@ -55,10 +62,7 @@ export class SchedulerService {
     for (const row of rows as unknown as PendingRow[]) {
       try {
         const value = await this.fetchValue(row)
-        const { error: updateErr } = await client
-          .from('views_values')
-          .update({ value, needs_sync: false, updated_at: new Date().toISOString() })
-          .eq('id', row.id)
+        const { error: updateErr } = await this.viewsRepository.markValueSynced(row.id, value)
 
         if (updateErr) {
           this.logger.error(`  ✗ Failed to write synced value for id=${row.id}\n  ${updateErr.message}`)
@@ -68,7 +72,6 @@ export class SchedulerService {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err)
         this.logger.error(`  ✗ Sync failed for views_values.id=${row.id}\n  ${msg}`)
-        // Leave needs_sync = true — will retry on next scheduler run
       }
     }
   }
@@ -96,46 +99,42 @@ export class SchedulerService {
       return '0'
     }
 
-    const ph = await getPosthogCredentials(connectionId, this.supabaseService)
+    const ph = await this.posthogCredentialsService.getCredentials(connectionId)
     if (!ph) throw new Error(`PostHog credentials not found for connection ${connectionId}`)
 
-    // Use row.created_at so yesterday's sync queries the correct date
+    const client = new PosthogApiClient(ph)
     const safeEvent = eventName.replace(/'/g, "\\'")
     const hogqlQuery = `SELECT count() FROM events WHERE event = '${safeEvent}' AND toDate(timestamp) = toDate('${row.created_at}')`
 
-    const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${ph.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogqlQuery } }),
-    })
-
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      throw new Error(`PostHog query API ${res.status}: ${JSON.stringify(body)}`)
+    try {
+      const json = (await client.queryHogql(hogqlQuery)) as { results?: [[number]] }
+      return String(json.results?.[0]?.[0] ?? 0)
+    } catch (err) {
+      throw new Error(`PostHog query API: ${String(err)}`)
     }
-
-    const json = (await res.json()) as { results?: [[number]] }
-    return String(json.results?.[0]?.[0] ?? 0)
   }
 
   private async fetchStripeRevenue(row: PendingRow): Promise<string> {
-    // Stripe data lives in Supabase now (see stripe/sync). The "needs_sync"
-    // flag for Stripe rows is legacy — webhooks push charges into
-    // `stripe_charges` directly, and the nightly reconcile catches gaps.
-    // This handler simply reads the same Supabase tables to fill in the
-    // tile cache (`views_values.value`) for cross-provider consistency.
-    const client = this.supabaseService.getClient()
     const connectionId = row.views.connection_id
 
-    const accountId = await getStripeAccountIdForConnection(client, connectionId)
+    const accountId = await getStripeAccountIdForConnection(
+      this.connectionsRepository,
+      connectionId,
+    )
     if (!accountId) return '0'
 
-    const productFilter = await getConnectionProductFilter(client, connectionId)
+    const productFilter = await getConnectionProductFilter(
+      this.connectionsRepository,
+      connectionId,
+    )
     const date = row.created_at
-    const charges = await fetchAccountCharges(client, accountId, date, date, productFilter)
+    const charges = await fetchAccountCharges(
+      this.stripeRepository,
+      accountId,
+      date,
+      date,
+      productFilter,
+    )
 
     const total = charges.reduce((sum, c) => sum + c.amount, 0)
     return String(total)

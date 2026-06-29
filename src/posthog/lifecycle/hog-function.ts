@@ -1,12 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common'
-import { SupabaseService } from '../../supabase/supabase.service'
-import { getPosthogCredentials } from '../connection/credentials'
+import { PosthogApiClient } from '../posthog-api.client'
+import { getPosthogCredentials, PosthogCredentialsService } from '../connection/credentials'
 
 @Injectable()
 export class PosthogLifecycleService {
   private readonly logger = new Logger(PosthogLifecycleService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(private readonly posthogCredentialsService: PosthogCredentialsService) {}
 
   async createHogFunction(
     connectionId: string,
@@ -24,8 +24,9 @@ export class PosthogLifecycleService {
       `\n  ► createHogFunction\n  connectionId : ${connectionId}\n  viewId       : ${viewId}\n  eventName    : ${eventName}`,
     )
 
-    const ph = await getPosthogCredentials(connectionId, this.supabaseService)
+    const ph = await getPosthogCredentials(connectionId, this.posthogCredentialsService)
     if (!ph) return null
+    const client = new PosthogApiClient(ph)
 
     const webhookUrl = `${webhookBaseUrl}/webhooks/posthog/${connectionId}/${viewId}`
 
@@ -62,26 +63,16 @@ if (res.status >= 400) {
       `  → calling PostHog\n  host      : ${ph.host}\n  projectId : ${ph.projectId}\n  url       : ${webhookUrl}`,
     )
 
-    const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/hog_functions/`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${ph.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    })
-
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
+    try {
+      const json = await client.createHogFunction(payload)
+      this.logger.log(`  ✓ hog function created  id: ${json.id}`)
+      return json.id
+    } catch (err) {
       this.logger.error(
-        `  ✗ PostHog rejected hog function ${res.status}\n  body : ${JSON.stringify(body, null, 2).replace(/\n/g, '\n  ')}`,
+        `  ✗ PostHog rejected hog function\n  body : ${String(err).replace(/\n/g, '\n  ')}`,
       )
-      throw new Error(`PostHog rejected hog function ${res.status}: ${JSON.stringify(body)}`)
+      throw err
     }
-
-    const json = (await res.json()) as { id: string }
-    this.logger.log(`  ✓ hog function created  id: ${json.id}`)
-    return json.id
   }
 
   async deleteHogFunction(connectionId: string, hogFunctionId: string): Promise<void> {
@@ -89,29 +80,17 @@ if (res.status >= 400) {
       `\n  ► deleteHogFunction\n  connectionId  : ${connectionId}\n  hogFunctionId : ${hogFunctionId}`,
     )
 
-    const ph = await getPosthogCredentials(connectionId, this.supabaseService)
+    const ph = await getPosthogCredentials(connectionId, this.posthogCredentialsService)
     if (!ph) return
+    const client = new PosthogApiClient(ph)
 
-    const res = await fetch(
-      `${ph.host}/api/projects/${ph.projectId}/hog_functions/${hogFunctionId}/`,
-      {
-        method: 'PATCH',
-        headers: {
-          Authorization: `Bearer ${ph.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ deleted: true }),
-      },
-    )
-
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
+    try {
+      await client.deleteHogFunction(hogFunctionId)
+      this.logger.log(`  ✓ hog function deleted`)
+    } catch (err) {
       this.logger.error(
-        `  ✗ PostHog delete failed ${res.status}\n  body : ${JSON.stringify(body, null, 2).replace(/\n/g, '\n  ')}`,
+        `  ✗ PostHog delete failed\n  body : ${String(err).replace(/\n/g, '\n  ')}`,
       )
-      return
     }
-
-    this.logger.log(`  ✓ hog function deleted`)
   }
 }

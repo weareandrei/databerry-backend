@@ -1,7 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common'
-import { SupabaseService } from '../../supabase/supabase.service'
-import { makeStripeGetter, type StripeGetter } from '../views/stripe-api.helpers'
-import { ensureSyncedThrough } from './ensure-synced.helper'
+import { ConnectionsRepository } from '../../connections/connections.repository'
+import { StripeRepository } from '../stripe.repository'
+import { StripeApiClient } from '../stripe-api.client'
+import { ensureSyncedThrough, type StripeSyncRepos } from './ensure-synced.helper'
 import {
   setBackfillStatus,
   upsertAccount,
@@ -52,7 +53,17 @@ function deriveLivemodeFromKey(key: string): boolean {
 export class StripeBackfillService {
   private readonly logger = new Logger(StripeBackfillService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly stripeRepository: StripeRepository,
+    private readonly connectionsRepository: ConnectionsRepository,
+  ) {}
+
+  private syncRepos(): StripeSyncRepos {
+    return {
+      stripe: this.stripeRepository,
+      connections: this.connectionsRepository,
+    }
+  }
 
   /**
    * Resolve a Stripe account from raw credentials (without needing an
@@ -68,12 +79,12 @@ export class StripeBackfillService {
    * token (`sk_test_*` / `sk_live_*`), which encodes mode the same way.
    */
   async resolveAccountFromCredentials(
-    get: StripeGetter,
+    client: StripeApiClient,
     key: string,
   ): Promise<StripeAccountRow> {
     let account: StripeAccountRow
     try {
-      account = (await get('account')) as unknown as StripeAccountRow
+      account = (await client.get('account')) as unknown as StripeAccountRow
     } catch (err) {
       // Restricted keys created per our setup instructions (Read on
       // Charges / Customers / Subscriptions / Products) do NOT carry
@@ -97,7 +108,7 @@ export class StripeBackfillService {
         `  → /v1/account is scope-limited for this restricted key; recovered ${acctId} from the error. Probing Charges read…`,
       )
       try {
-        await get('charges', { limit: '1' })
+        await client.get('charges', { limit: '1' })
       } catch (probeErr) {
         const probeMsg =
           probeErr instanceof Error ? probeErr.message : String(probeErr)
@@ -132,7 +143,7 @@ export class StripeBackfillService {
    * manual-API-key connection creation.
    */
   async resolveAccountFromApiKey(apiKey: string): Promise<StripeAccountRow> {
-    return this.resolveAccountFromCredentials(makeStripeGetter(apiKey), apiKey)
+    return this.resolveAccountFromCredentials(new StripeApiClient(apiKey), apiKey)
   }
 
   /**
@@ -147,13 +158,8 @@ export class StripeBackfillService {
    * Fire-and-forget from the caller — does not block connection creation.
    */
   async backfillAccount(stripeAccountId: string): Promise<void> {
-    const client = this.supabaseService.getClient()
-
-    const { data: existing } = await client
-      .from('stripe_accounts')
-      .select('backfill_status, backfill_started_at')
-      .eq('id', stripeAccountId)
-      .maybeSingle()
+    const { data: existing } =
+      await this.stripeRepository.findBackfillStatusAndStartedAt(stripeAccountId)
 
     if (!existing) {
       this.logger.warn(`  ⚠ backfillAccount: ${stripeAccountId} row missing — caller must upsertAccount first`)
@@ -187,7 +193,7 @@ export class StripeBackfillService {
     this.logger.log(`\n  ► backfillAccount START  account=${stripeAccountId}  window=${BACKFILL_DAYS}d`)
 
     try {
-      await setBackfillStatus(client, stripeAccountId, 'in_progress')
+      await setBackfillStatus(this.stripeRepository, stripeAccountId, 'in_progress')
       this.logger.log(`  → status=in_progress  account=${stripeAccountId}`)
 
       const now = Math.floor(Date.now() / 1000)
@@ -197,7 +203,7 @@ export class StripeBackfillService {
       // full catalogue (picker), customer table (top-customers tile), and
       // subscription set (MRR/churn).
       const result = await ensureSyncedThrough(
-        client,
+        this.syncRepos(),
         stripeAccountId,
         since,
         now,
@@ -210,15 +216,15 @@ export class StripeBackfillService {
         this.logger,
       )
 
-      const { error: throughErr } = await client
-        .from('stripe_accounts')
-        .update({ backfilled_through: new Date(since * 1000).toISOString() })
-        .eq('id', stripeAccountId)
+      const { error: throughErr } = await this.stripeRepository.updateAccount(
+        stripeAccountId,
+        { backfilled_through: new Date(since * 1000).toISOString() },
+      )
       if (throughErr) {
         this.logger.warn(`  ⚠ failed to set backfilled_through: ${throughErr.message}`)
       }
 
-      await setBackfillStatus(client, stripeAccountId, 'complete')
+      await setBackfillStatus(this.stripeRepository, stripeAccountId, 'complete')
       this.logger.log(
         `  ✓ backfillAccount END    account=${stripeAccountId}  products=${result.productCount}  charges=${result.chargeCount}  customers=${result.customerCount}  subs=${result.subCount}  window=${BACKFILL_DAYS}d`,
       )
@@ -227,7 +233,7 @@ export class StripeBackfillService {
       const stack = err instanceof Error ? err.stack : undefined
       this.logger.error(`  ✗ backfillAccount FAILED  account=${stripeAccountId}  msg="${msg}"`)
       if (stack) this.logger.error(stack)
-      await setBackfillStatus(client, stripeAccountId, 'error', msg).catch(() => {})
+      await setBackfillStatus(this.stripeRepository, stripeAccountId, 'error', msg).catch(() => {})
     }
   }
 
@@ -243,8 +249,7 @@ export class StripeBackfillService {
    * twice.
    */
   async upsertAccountRow(account: StripeAccountRow): Promise<void> {
-    const client = this.supabaseService.getClient()
-    await upsertAccount(client, account)
+    await upsertAccount(this.stripeRepository, account)
   }
 
   /**
@@ -252,7 +257,7 @@ export class StripeBackfillService {
    * actual work runs in the background via `backfillAccount`. Callers
    * MUST have already (a) upserted the `stripe_accounts` row and
    * (b) inserted the credential row, otherwise the backfill's
-   * `makeStripeGetterForAccount` lookup will fail to find credentials
+   * `createStripeApiClientForAccount` lookup will fail to find credentials
    * and the run will end in `backfill_status='error'`.
    */
   kickBackfill(stripeAccountId: string): void {
@@ -282,13 +287,9 @@ export class StripeBackfillService {
   }
 
   private async runReconnectSync(stripeAccountId: string): Promise<void> {
-    const client = this.supabaseService.getClient()
     try {
-      const { data: existing } = await client
-        .from('stripe_accounts')
-        .select('backfill_status, last_synced_at')
-        .eq('id', stripeAccountId)
-        .maybeSingle()
+      const { data: existing } =
+        await this.stripeRepository.findBackfillStatusAndLastSyncedAt(stripeAccountId)
 
       if (!existing) {
         this.logger.warn(
@@ -321,7 +322,7 @@ export class StripeBackfillService {
       )
 
       const result = await ensureSyncedThrough(
-        client,
+        this.syncRepos(),
         stripeAccountId,
         since,
         now,
@@ -365,8 +366,7 @@ export class StripeBackfillService {
    * in the background.
    */
   async retryBackfill(stripeAccountId: string): Promise<void> {
-    const client = this.supabaseService.getClient()
-    await setBackfillStatus(client, stripeAccountId, 'pending')
+    await setBackfillStatus(this.stripeRepository, stripeAccountId, 'pending')
     void this.backfillAccount(stripeAccountId)
   }
 }

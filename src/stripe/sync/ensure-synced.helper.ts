@@ -1,6 +1,7 @@
 import type { Logger } from '@nestjs/common'
-import type { SupabaseService } from '../../supabase/supabase.service'
-import { makeStripeGetterForAccount } from './account-getter.helper'
+import type { ConnectionsRepository } from '../../connections/connections.repository'
+import type { StripeRepository } from '../stripe.repository'
+import { createStripeApiClientForAccount } from './account-getter.helper'
 import { bumpLastSyncedAt } from './persist.helper'
 import {
   syncCharges,
@@ -9,7 +10,10 @@ import {
   syncSubscriptions,
 } from './sync-range.helper'
 
-type Client = ReturnType<SupabaseService['getClient']>
+export interface StripeSyncRepos {
+  stripe: StripeRepository
+  connections: ConnectionsRepository
+}
 
 /**
  * What triggered this sync — used purely for logging so we can correlate
@@ -63,7 +67,7 @@ export interface SyncResult {
  *     reconcile / backfill / reload do.
  */
 export async function ensureSyncedThrough(
-  client: Client,
+  repos: StripeSyncRepos,
   stripeAccountId: string,
   sinceUnix: number,
   untilUnix: number,
@@ -71,21 +75,21 @@ export async function ensureSyncedThrough(
   logger?: Logger,
 ): Promise<SyncResult> {
   const tag = opts.triggeredBy ?? 'sync'
-  const get = await makeStripeGetterForAccount(client, stripeAccountId)
+  const client = await createStripeApiClientForAccount(repos.connections, stripeAccountId)
 
   // Products first when included, so the picker UI sees fresh data before
   // the slower charges pass finishes (matches the existing backfill order).
   const productCount = opts.includeProducts
-    ? await syncProducts(client, stripeAccountId, get, logger)
+    ? await syncProducts(repos.stripe, stripeAccountId, client, logger)
     : undefined
   if (productCount !== undefined) {
     logger?.log(`    [${tag}] syncProducts done — ${productCount}`)
   }
 
   const chargeCount = await syncCharges(
-    client,
+    repos.stripe,
     stripeAccountId,
-    get,
+    client,
     sinceUnix,
     untilUnix,
     logger,
@@ -97,14 +101,14 @@ export async function ensureSyncedThrough(
   )
 
   const customerCount = opts.includeCustomers
-    ? await syncCustomers(client, stripeAccountId, get, logger)
+    ? await syncCustomers(repos.stripe, stripeAccountId, client, logger)
     : undefined
   if (customerCount !== undefined) {
     logger?.log(`    [${tag}] syncCustomers done — ${customerCount}`)
   }
 
   const subCount = opts.includeSubscriptions
-    ? await syncSubscriptions(client, stripeAccountId, get, logger)
+    ? await syncSubscriptions(repos.stripe, stripeAccountId, client, logger)
     : undefined
   if (subCount !== undefined) {
     logger?.log(`    [${tag}] syncSubscriptions done — ${subCount}`)
@@ -113,7 +117,7 @@ export async function ensureSyncedThrough(
   // Single owner of last_synced_at. Bumping only on full success means a
   // mid-sync exception leaves the timestamp untouched — the next caller
   // (whatever it is) will cover the same window again.
-  await bumpLastSyncedAt(client, stripeAccountId)
+  await bumpLastSyncedAt(repos.stripe, stripeAccountId)
 
   return { chargeCount, productCount, customerCount, subCount }
 }

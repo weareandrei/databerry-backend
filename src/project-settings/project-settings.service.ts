@@ -1,5 +1,6 @@
 import { ForbiddenException, Injectable, Logger } from '@nestjs/common'
-import { SupabaseService } from '../supabase/supabase.service'
+import { ProjectsRepository } from '../projects/projects.repository'
+import { ProjectSettingsRepository } from './project-settings.repository'
 
 export interface UpdateProjectSettingsDto {
   conversionConnectionId?: string | null
@@ -16,18 +17,15 @@ export interface ProjectSettings {
 export class ProjectSettingsService {
   private readonly logger = new Logger(ProjectSettingsService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly projectSettingsRepository: ProjectSettingsRepository,
+    private readonly projectsRepository: ProjectsRepository,
+  ) {}
 
   async get(projectId: string, userId: string): Promise<ProjectSettings> {
     await this.assertProjectOwner(projectId, userId)
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('project_settings')
-      .select('*')
-      .eq('project_id', projectId)
-      .maybeSingle()
-
+    const { data, error } = await this.projectSettingsRepository.findByProjectId(projectId)
     if (error) throw new Error(error.message)
 
     if (!data) {
@@ -56,25 +54,14 @@ export class ProjectSettingsService {
       patch.conversion_connection_id = dto.conversionConnectionId
     if (dto.conversionEvent !== undefined) patch.conversion_event = dto.conversionEvent
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('project_settings')
-      .upsert(patch, { onConflict: 'project_id' })
-      .select()
-      .single()
-
+    const { data, error } = await this.projectSettingsRepository.upsert(patch)
     if (error) throw new Error(error.message)
     this.logger.log(`  ✓ project_settings upserted for ${projectId}`)
     return this.toCamel(data)
   }
 
   private async assertProjectOwner(projectId: string, userId: string) {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('projects')
-      .select('user_id')
-      .eq('id', projectId)
-      .maybeSingle()
+    const { data, error } = await this.projectsRepository.findOwnerId(projectId)
     if (error) throw new Error(error.message)
     if (!data || data.user_id !== userId) {
       throw new ForbiddenException('Project not found')

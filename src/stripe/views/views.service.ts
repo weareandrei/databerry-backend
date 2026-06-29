@@ -1,8 +1,9 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
-import { SupabaseService } from '../../supabase/supabase.service'
+import { ConnectionsRepository } from '../../connections/connections.repository'
 import { ViewsService } from '../../views/views.service'
 import { ConnectionMissingException } from '../../common/integration-errors'
 import { buildViewFetchContext } from '../../common/view-fetch-context'
+import { StripeRepository } from '../stripe.repository'
 import {
   fetchAccountCharges,
   fetchActiveSubsAndMrr,
@@ -63,7 +64,8 @@ export class StripeViewsService {
   private readonly logger = new Logger(StripeViewsService.name)
 
   constructor(
-    private readonly supabaseService: SupabaseService,
+    private readonly connectionsRepository: ConnectionsRepository,
+    private readonly stripeRepository: StripeRepository,
     private readonly viewsService: ViewsService,
   ) {}
 
@@ -143,30 +145,30 @@ export class StripeViewsService {
     userId: string,
     cacheDate: string,
   ): Promise<{ value: string | null; unavailable?: boolean }> {
-    const client = this.supabaseService.getClient()
-
-    const { data: conn } = await client
-      .from('connections')
-      .select('id')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .maybeSingle()
+    const { data: conn } = await this.connectionsRepository.findIdByConnectionAndUser(
+      connectionId,
+      userId,
+    )
     if (!conn) throw new ConnectionMissingException('stripe', connectionId)
 
-    const accountId = await getStripeAccountIdForConnection(client, connectionId)
+    const accountId = await getStripeAccountIdForConnection(
+      this.connectionsRepository,
+      connectionId,
+    )
     if (!accountId) return { value: null, unavailable: true }
 
     let value: string
 
     if (viewType === 'stripe_churn_rate') {
-      // v1 limitation: ignores the per-connection product filter. Documented
-      // in `fetchChurnRate30d`'s docstring.
-      const { churnRate } = await fetchChurnRate30d(client, accountId)
+      const { churnRate } = await fetchChurnRate30d(this.stripeRepository, accountId)
       value = (churnRate * 100).toFixed(1)
     } else {
-      const productFilter = await getConnectionProductFilter(client, connectionId)
+      const productFilter = await getConnectionProductFilter(
+        this.connectionsRepository,
+        connectionId,
+      )
       const { activeSubs, mrrCents } = await fetchActiveSubsAndMrr(
-        client,
+        this.stripeRepository,
         accountId,
         productFilter,
       )
@@ -202,22 +204,24 @@ export class StripeViewsService {
       `\n  ► fetchTopCustomers  connectionId=${connectionId}  ${from}→${to}  tz=${tz}`,
     )
 
-    const client = this.supabaseService.getClient()
-
-    const { data: conn } = await client
-      .from('connections')
-      .select('id')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .maybeSingle()
+    const { data: conn } = await this.connectionsRepository.findIdByConnectionAndUser(
+      connectionId,
+      userId,
+    )
     if (!conn) throw new ConnectionMissingException('stripe', connectionId)
 
-    const accountId = await getStripeAccountIdForConnection(client, connectionId)
+    const accountId = await getStripeAccountIdForConnection(
+      this.connectionsRepository,
+      connectionId,
+    )
     if (!accountId) return { customers: [], unavailable: true }
 
-    const productFilter = await getConnectionProductFilter(client, connectionId)
+    const productFilter = await getConnectionProductFilter(
+      this.connectionsRepository,
+      connectionId,
+    )
     const customers = await fetchTopCustomers(
-      client,
+      this.stripeRepository,
       accountId,
       productFilter,
       from,
@@ -295,26 +299,24 @@ export class StripeViewsService {
     dateTo: string,
     tz: string = 'UTC',
   ): Promise<{ rows: ChargeRow[]; accountId: string | null }> {
-    const client = this.supabaseService.getClient()
-
-    // Ownership check — same pattern as the old `getApiKey` helper.
-    const { data: conn } = await client
-      .from('connections')
-      .select('id')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .maybeSingle()
-    // 410 (not 404) so the frontend can route this into the inline
-    // reassign-connection dialog instead of the generic error badge — the
-    // view's `connection_id` FK is dangling, not absent.
+    const { data: conn } = await this.connectionsRepository.findIdByConnectionAndUser(
+      connectionId,
+      userId,
+    )
     if (!conn) throw new ConnectionMissingException('stripe', connectionId)
 
-    const accountId = await getStripeAccountIdForConnection(client, connectionId)
+    const accountId = await getStripeAccountIdForConnection(
+      this.connectionsRepository,
+      connectionId,
+    )
     if (!accountId) return { rows: [], accountId: null }
 
-    const productFilter = await getConnectionProductFilter(client, connectionId)
+    const productFilter = await getConnectionProductFilter(
+      this.connectionsRepository,
+      connectionId,
+    )
     const rows = await fetchAccountCharges(
-      client,
+      this.stripeRepository,
       accountId,
       dateFrom,
       dateTo,

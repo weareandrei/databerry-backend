@@ -1,14 +1,14 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
-import { SupabaseService } from '../../supabase/supabase.service'
 import { GoogleAnalyticsOAuthService } from './oauth'
-import type { GAProperty } from './oauth'
+import type { GAProperty } from '../google-analytics-admin.client'
+import { GoogleAnalyticsRepository } from './google-analytics.repository'
 
 @Injectable()
 export class GoogleAnalyticsPropertiesService {
   private readonly logger = new Logger(GoogleAnalyticsPropertiesService.name)
 
   constructor(
-    private readonly supabaseService: SupabaseService,
+    private readonly gaRepository: GoogleAnalyticsRepository,
     private readonly oauthService: GoogleAnalyticsOAuthService,
   ) {}
 
@@ -29,11 +29,11 @@ export class GoogleAnalyticsPropertiesService {
     const prop = properties.find(p => p.id === propertyId)
     if (!prop) throw new NotFoundException(`Property ${propertyId} not found or not accessible`)
 
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('connections_google_analytics')
-      .update({ property_id: propertyId, property_name: prop.displayName })
-      .eq('connection_id', connectionId)
+    const { error } = await this.gaRepository.updateProperty(
+      connectionId,
+      propertyId,
+      prop.displayName,
+    )
     if (error) throw new Error(`Failed to save GA property: ${error.message}`)
 
     this.logger.log(`Saved GA property ${propertyId} (${prop.displayName}) for connection ${connectionId}`)

@@ -1,16 +1,16 @@
-import {
-  IntegrationReauthRequiredException,
-  IntegrationUpstreamException,
-} from '../../../common/integration-errors'
+import { Logger } from '@nestjs/common'
 import { localMidnightUtc } from '../../../common/tz'
+import { CalendlyApiClient } from '../../calendly-api.client'
 
-const BASE_API = 'https://api.calendly.com'
+export interface CalendlyMeeting {
+  startTime: string
+  endTime: string
+  name: string
+  bookingUri: string
+  invitees: { name: string; email: string }[]
+  description: string | null
+}
 
-/**
- * UTC instant of `dateStr`'s midnight in `tz`. When `dateStr` is omitted we
- * fall back to "today as observed from UTC" — caller-side wrappers
- * (`computeMeetingsRange`) can supply both args to override.
- */
 function dayStart(dateStr: string | undefined, tz: string): Date {
   if (!dateStr) {
     const now = new Date()
@@ -21,8 +21,6 @@ function dayStart(dateStr: string | undefined, tz: string): Date {
 }
 
 function dayAfter(dateStr: string | undefined, tz: string): Date {
-  // dayStart, +1 day at the same wall-clock — re-resolve via localMidnightUtc
-  // so DST transitions don't drift the bound.
   if (!dateStr) {
     const now = new Date()
     const todayStr = `${now.getUTCFullYear()}-${pad2(now.getUTCMonth() + 1)}-${pad2(now.getUTCDate())}`
@@ -41,11 +39,6 @@ function addOneDay(yyyymmdd: string): string {
   return `${next.getUTCFullYear()}-${pad2(next.getUTCMonth() + 1)}-${pad2(next.getUTCDate())}`
 }
 
-/**
- * Returns the count of active scheduled events for a date range.
- * When both args are omitted, counts today (in `tz`) — same as the old
- * `computeMeetingsToday` behaviour but tz-aware.
- */
 export async function computeMeetingsRange(
   token: string,
   connectionId: string,
@@ -58,9 +51,6 @@ export async function computeMeetingsRange(
   return String(events.length)
 }
 
-/**
- * Back-compat wrapper for today's meeting count.
- */
 export async function computeMeetingsToday(
   token: string,
   connectionId: string,
@@ -70,11 +60,6 @@ export async function computeMeetingsToday(
   return computeMeetingsRange(token, connectionId, userUri, undefined, undefined, tz)
 }
 
-/**
- * Fetch all scheduled events in [dateFrom, dateTo] (inclusive). Day
- * boundaries are evaluated in `tz` — i.e. "Apr 30" means 00:00–24:00 in
- * `tz`, not UTC.
- */
 export async function getEventsInRange(
   token: string,
   connectionId: string,
@@ -86,43 +71,13 @@ export async function getEventsInRange(
   const min = dayStart(dateFrom, tz)
   const max = dayAfter(dateTo ?? dateFrom, tz)
 
-  const url = new URL(`${BASE_API}/scheduled_events`)
-  url.searchParams.set('user', userUri)
-  url.searchParams.set('min_start_time', min.toISOString())
-  url.searchParams.set('max_start_time', max.toISOString())
-  url.searchParams.set('status', 'active')
-  url.searchParams.set('count', '100')
-
-  const res = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${token}` },
+  return new CalendlyApiClient(token, connectionId).listScheduledEvents({
+    userUri,
+    minStartTime: min.toISOString(),
+    maxStartTime: max.toISOString(),
   })
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => '')
-    // 401 here is unusual (we just refreshed) but real — it can happen if
-    // the user's Calendly account was disabled, or the org membership
-    // changed. Surface as reauth so the user gets the right prompt.
-    if (res.status === 401 || res.status === 403) {
-      throw new IntegrationReauthRequiredException(
-        'calendly',
-        connectionId,
-        `Calendly API: ${body.slice(0, 200)}`,
-      )
-    }
-    throw new IntegrationUpstreamException(
-      'calendly',
-      connectionId,
-      `Calendly API (${res.status}): ${body.slice(0, 200)}`,
-    )
-  }
-
-  const data = (await res.json()) as { collection: Record<string, unknown>[] }
-  return data.collection
 }
 
-/**
- * Back-compat wrapper — today's events only.
- */
 export async function getTodayEvents(
   token: string,
   connectionId: string,
@@ -130,4 +85,46 @@ export async function getTodayEvents(
   tz: string = 'UTC',
 ): Promise<Record<string, unknown>[]> {
   return getEventsInRange(token, connectionId, userUri, undefined, undefined, tz)
+}
+
+/**
+ * calendly_meetings_list
+ * Returns full meeting details (with invitees) for all active events in
+ * [dateFrom, dateTo]. Day boundaries are evaluated in `tz` (default UTC).
+ */
+export async function computeMeetingsList(
+  token: string,
+  connectionId: string,
+  userUri: string,
+  logger: Logger,
+  dateFrom?: string,
+  dateTo?: string,
+  tz: string = 'UTC',
+): Promise<CalendlyMeeting[]> {
+  const events = await getEventsInRange(token, connectionId, userUri, dateFrom, dateTo, tz)
+  const apiClient = new CalendlyApiClient(token, connectionId)
+  const meetings: CalendlyMeeting[] = []
+
+  for (const event of events) {
+    const uri = event.uri as string
+    const uuid = uri.split('/').pop()!
+
+    let invitees: { name: string; email: string }[] = []
+    try {
+      invitees = await apiClient.listInvitees(uuid)
+    } catch {
+      logger.warn(`Failed to fetch invitees for event ${uuid}`)
+    }
+
+    meetings.push({
+      startTime: event.start_time as string,
+      endTime: event.end_time as string,
+      name: event.name as string,
+      bookingUri: uri,
+      invitees,
+      description: (event.description ?? null) as string | null,
+    })
+  }
+
+  return meetings
 }

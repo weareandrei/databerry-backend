@@ -1,12 +1,11 @@
 import { Module } from '@nestjs/common'
-import { SupabaseModule } from '../supabase/supabase.module'
 import { UserSettingsController } from './user-settings.controller'
 import { UserSettingsService } from './user-settings.service'
+import { UserSettingsRepository } from './user-settings.repository'
 
 @Module({
-  imports: [SupabaseModule],
   controllers: [UserSettingsController],
-  providers: [UserSettingsService],
+  providers: [UserSettingsRepository, UserSettingsService],
   exports: [UserSettingsService],
 })
 export class UserSettingsModule {}

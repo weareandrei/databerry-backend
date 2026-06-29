@@ -4,9 +4,9 @@ import {
   BadRequestException,
   InternalServerErrorException,
 } from '@nestjs/common'
-import { SupabaseService } from '../../supabase/supabase.service'
+import { ConnectionsRepository } from '../../connections/connections.repository'
 import { StripeBackfillService } from '../sync/backfill.service'
-import { makeStripeGetter } from '../views/stripe-api.helpers'
+import { StripeApiClient } from '../stripe-api.client'
 import { encryptForUser } from '../../common/crypto/encryption'
 
 /**
@@ -41,7 +41,7 @@ export class StripeOAuthService {
   private readonly logger = new Logger(StripeOAuthService.name)
 
   constructor(
-    private readonly supabaseService: SupabaseService,
+    private readonly connectionsRepository: ConnectionsRepository,
     private readonly backfillService: StripeBackfillService,
   ) {}
 
@@ -133,8 +133,6 @@ export class StripeOAuthService {
 
     this.logger.log(`  → stripe_account_id : ${stripeAccountId}`)
 
-    const client = this.supabaseService.getClient()
-
     // Discover account metadata BEFORE writing anything. The connections_stripe
     // row FKs into `stripe_accounts.id`, so the parent row must exist before
     // we insert credentials. Doing the /v1/account call up-front also lets a
@@ -146,7 +144,7 @@ export class StripeOAuthService {
     let accountRow: Awaited<ReturnType<StripeBackfillService['resolveAccountFromCredentials']>>
     try {
       accountRow = await this.backfillService.resolveAccountFromCredentials(
-        makeStripeGetter(accessToken),
+        new StripeApiClient(accessToken),
         accessToken,
       )
     } catch (err) {
@@ -161,21 +159,18 @@ export class StripeOAuthService {
 
     await this.backfillService.upsertAccountRow(accountRow)
 
-    const { data: connection, error: connError } = await client
-      .from('connections')
-      .insert({ name: 'Stripe', type: 'stripe', user_id: userId })
-      .select()
-      .single()
+    const { data: connection, error: connError } = await this.connectionsRepository.insert({
+      name: 'Stripe',
+      type: 'stripe',
+      user_id: userId,
+    })
 
     if (connError) {
       this.logger.error(`  ✗ Failed to insert connection\n  ${connError.message}`)
       throw new OAuthCallbackError('credentials_save', connError.message)
     }
 
-    // Encrypt OAuth tokens with the per-user envelope before write —
-    // see `common/crypto/encryption.ts` for the algorithm rationale.
-    // `userId` is decoded from the OAuth state at the top of this method.
-    const { error: stripeError } = await client.from('connections_stripe').insert({
+    const { error: stripeError } = await this.connectionsRepository.insertOAuthCredential({
       connection_id: connection.id,
       stripe_account_id: stripeAccountId,
       access_token: encryptForUser(accessToken, userId),
@@ -184,7 +179,7 @@ export class StripeOAuthService {
     })
 
     if (stripeError) {
-      await client.from('connections').delete().eq('id', connection.id)
+      await this.connectionsRepository.deleteById(connection.id)
       this.logger.error(`  ✗ Failed to insert connections_stripe\n  ${stripeError.message}`)
       throw new OAuthCallbackError('credentials_save', stripeError.message)
     }

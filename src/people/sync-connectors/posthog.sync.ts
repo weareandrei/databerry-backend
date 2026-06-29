@@ -1,16 +1,13 @@
 import { Injectable, Logger } from '@nestjs/common'
-import { SupabaseService } from '../../supabase/supabase.service'
+import { PeopleRepository } from '../people.repository'
 import { PeopleMatchingService } from '../people-matching.service'
 import { PeopleEventsService, type ObservedEvent } from '../people-events.service'
-import { getPosthogCredentials } from '../../posthog/connection/credentials'
-
-/** Resolved PostHog credentials (host + project + API key). */
-type PosthogCreds = { host: string; projectId: string; apiKey: string }
+import { PeopleSyncStatus } from '../sync-status'
+import { getPosthogCredentials, PosthogCredentialsService } from '../../posthog/connection/credentials'
+import { PosthogApiClient } from '../../posthog/posthog-api.client'
 
 /**
- * PostHog → people initializer (Phase 2, second adapter).
- *
- * Pulls every person from a PostHog project and feeds each into the
+ * PostHog → people sync. Pulls every person from a PostHog project and feeds each into the
  * matcher. A PostHog person carries:
  *   - one or more `distinct_ids` → each becomes a `posthog`
  *     identifier (this is what makes phone+PC merge once the SDK or
@@ -30,36 +27,37 @@ type PosthogCreds = { host: string; projectId: string; apiKey: string }
  * bounded history, every run after only the delta, and a failure leaves
  * identity synced and retries the same window next time.
  *
- * Re-runnable + idempotent, same as the Stripe initializer.
+ * Re-runnable + idempotent, same as the Stripe sync.
  */
 @Injectable()
-export class PosthogPeopleInitializer {
-  private readonly logger = new Logger(PosthogPeopleInitializer.name)
+export class PosthogSync {
+  private readonly logger = new Logger(PosthogSync.name)
 
   constructor(
-    private readonly supabaseService: SupabaseService,
+    private readonly posthogCredentialsService: PosthogCredentialsService,
+    private readonly peopleRepository: PeopleRepository,
     private readonly matching: PeopleMatchingService,
     private readonly events: PeopleEventsService,
   ) {}
 
   /**
-   * Initialize people for one PostHog connection into one project.
+   * Sync people for one PostHog connection into one project.
    * Returns the count of persons processed.
    */
-  async initialize(
+  async sync(
     connectionId: string,
     projectId: string,
     userId: string,
   ): Promise<{ processed: number }> {
-    const creds = await getPosthogCredentials(connectionId, this.supabaseService)
+    const creds = await getPosthogCredentials(connectionId, this.posthogCredentialsService)
     if (!creds) throw new Error('PostHog credentials not found')
+    const client = new PosthogApiClient(creds)
 
     let processed = 0 // SUCCESSFUL upserts (not attempts)
     let firstError: string | null = null
     // PostHog paginates with a fully-formed `next` URL. Start at the
     // persons endpoint; follow `next` until exhausted or the page cap.
-    let url: string | null =
-      `${creds.host}/api/projects/${creds.projectId}/persons/?limit=100`
+    let nextUrl: string | null = null
     const MAX_PAGES = 100 // 100 × 100 = 10k persons per run; re-runs continue.
 
     // TRUE last-activity per distinct_id, in ONE HogQL pass (mirrors the
@@ -69,25 +67,14 @@ export class PosthogPeopleInitializer {
     // Best-effort: if the query fails we fall back to first-seen.
     let lastSeenByDid = new Map<string, string>()
     try {
-      lastSeenByDid = await this.fetchLastSeenByDistinctId(creds)
+      lastSeenByDid = await this.fetchLastSeenByDistinctId(client)
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err)
       this.logger.warn(`PostHog last-seen query failed; using first-seen: ${detail}`)
     }
 
-    for (let page = 0; page < MAX_PAGES && url; page++) {
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${creds.apiKey}` },
-      })
-      if (!res.ok) {
-        const body = await res.text().catch(() => '')
-        throw new Error(`PostHog persons API ${res.status}: ${body.slice(0, 200)}`)
-      }
-
-      const json = (await res.json()) as {
-        results?: PosthogPerson[]
-        next?: string | null
-      }
+    for (let page = 0; page < MAX_PAGES && (page === 0 || nextUrl); page++) {
+      const json = await client.getPersonsPage(nextUrl)
       const persons = json.results ?? []
       if (persons.length === 0) break
 
@@ -102,7 +89,7 @@ export class PosthogPeopleInitializer {
         }
       }
 
-      url = json.next ?? null
+      nextUrl = json.next ?? null
     }
 
     // Attempted persons but NONE succeeded → systemic failure (missing
@@ -121,7 +108,7 @@ export class PosthogPeopleInitializer {
     // identity synced and just retries the same window next time.
     let newWatermark: string | null = null
     try {
-      newWatermark = await this.syncEvents(userId, projectId, connectionId, creds)
+      newWatermark = await this.syncEvents(userId, projectId, connectionId, client)
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err)
       this.logger.warn(`PostHog event sync failed for ${connectionId}: ${detail}`)
@@ -129,7 +116,7 @@ export class PosthogPeopleInitializer {
 
     await this.markSynced(connectionId, projectId, userId, newWatermark)
     this.logger.log(
-      `PostHog people init done  connection=${connectionId} project=${projectId} persons=${processed}`,
+      `PostHog people sync done  connection=${connectionId} project=${projectId} persons=${processed}`,
     )
     return { processed }
   }
@@ -216,15 +203,15 @@ export class PosthogPeopleInitializer {
     userId: string,
     projectId: string,
     connectionId: string,
-    creds: PosthogCreds,
+    client: PosthogApiClient,
   ): Promise<string | null> {
     const watermark = await this.readWatermark(connectionId, userId)
     const personByDid = await this.loadPersonByDistinctId(connectionId, userId)
     if (personByDid.size === 0) return watermark // no people yet → nothing to attach
 
-    const rawEvents = await this.fetchEventsSince(creds, watermark)
+    const rawEvents = await this.fetchEventsSince(client, watermark)
 
-    const defCache = new Map<string, string>()
+    const eventDefinitionsCache = new Map<string, string>()
     const batch: (ObservedEvent & { personId: string })[] = []
     let maxIso = watermark
     for (const e of rawEvents) {
@@ -242,20 +229,17 @@ export class PosthogPeopleInitializer {
       if (!maxIso || e.occurredAt > maxIso) maxIso = e.occurredAt
     }
 
-    await this.events.recordEventsBatch(userId, projectId, connectionId, 'posthog', batch, defCache)
+    await this.events.recordEventsBatch(userId, projectId, connectionId, 'posthog', batch, eventDefinitionsCache)
     return maxIso
   }
 
   /** The watermark — timestamp of the latest event we've ingested for
    *  this connection. Null on the first sync. */
   private async readWatermark(connectionId: string, userId: string): Promise<string | null> {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('connection_sync_state')
-      .select('last_event_at')
-      .eq('connection_id', connectionId)
-      .eq('user_id', userId)
-      .maybeSingle()
+    const { data, error } = await this.peopleRepository.findLastEventAt(
+      connectionId,
+      userId,
+    )
     if (error) throw new Error(error.message)
     return (data as { last_event_at?: string | null } | null)?.last_event_at ?? null
   }
@@ -272,14 +256,13 @@ export class PosthogPeopleInitializer {
     const map = new Map<string, string>()
     const PAGE = 1000
     for (let from = 0; ; from += PAGE) {
-      const { data, error } = await this.supabaseService
-        .getClient()
-        .from('people_identifiers')
-        .select('external_id, person_id')
-        .eq('user_id', userId)
-        .eq('connection_id', connectionId)
-        .eq('source', 'posthog')
-        .range(from, from + PAGE - 1)
+      const { data, error } = await this.peopleRepository.findIdentifiersByConnectionSourcePage(
+        userId,
+        connectionId,
+        'posthog',
+        from,
+        from + PAGE - 1,
+      )
       if (error) throw new Error(error.message)
       const rows = data ?? []
       for (const r of rows) {
@@ -300,23 +283,16 @@ export class PosthogPeopleInitializer {
    * Returns Map<distinct_id, ISO-8601 UTC>, timestamps normalised to a
    * single canonical form so downstream comparisons are reliable.
    */
-  private async fetchLastSeenByDistinctId(creds: PosthogCreds): Promise<Map<string, string>> {
+  private async fetchLastSeenByDistinctId(client: PosthogApiClient): Promise<Map<string, string>> {
     const hogql =
       'SELECT distinct_id, max(timestamp) AS last_seen FROM events ' +
       'WHERE timestamp > now() - INTERVAL 365 DAY GROUP BY distinct_id'
-    const res = await fetch(`${creds.host}/api/projects/${creds.projectId}/query/`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${creds.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogql } }),
-    })
-    if (!res.ok) {
-      const body = await res.text().catch(() => '')
-      throw new Error(`PostHog last-seen query ${res.status}: ${body.slice(0, 200)}`)
+    let json: { results?: [string, string][] }
+    try {
+      json = (await client.queryHogql(hogql)) as { results?: [string, string][] }
+    } catch (err) {
+      throw new Error(`PostHog last-seen query: ${String(err).slice(0, 200)}`)
     }
-    const json = (await res.json()) as { results?: [string, string][] }
     const map = new Map<string, string>()
     for (const row of json.results ?? []) {
       const iso = toIsoUtc(row?.[1])
@@ -333,7 +309,7 @@ export class PosthogPeopleInitializer {
    * Selects only the columns we render, to keep the response lean.
    */
   private async fetchEventsSince(
-    creds: PosthogCreds,
+    client: PosthogApiClient,
     watermark: string | null,
   ): Promise<(ObservedEvent & { distinctId: string })[]> {
     // Watermark → epoch seconds (timezone-proof); first run → last 90 days.
@@ -347,20 +323,13 @@ export class PosthogPeopleInitializer {
       `FROM events WHERE ${since} ` +
       'ORDER BY timestamp ASC LIMIT 25000'
 
-    const res = await fetch(`${creds.host}/api/projects/${creds.projectId}/query/`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${creds.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogql } }),
-    })
-    if (!res.ok) {
-      const body = await res.text().catch(() => '')
-      throw new Error(`PostHog events query ${res.status}: ${body.slice(0, 200)}`)
+    let json: { results?: unknown[][] }
+    try {
+      json = (await client.queryHogql(hogql)) as { results?: unknown[][] }
+    } catch (err) {
+      throw new Error(`PostHog events query: ${String(err).slice(0, 200)}`)
     }
 
-    const json = (await res.json()) as { results?: unknown[][] }
     const out: (ObservedEvent & { distinctId: string })[] = []
     for (const row of json.results ?? []) {
       const distinctId = asString(row?.[0])
@@ -395,13 +364,10 @@ export class PosthogPeopleInitializer {
     connectionId: string,
     userId: string,
   ): Promise<void> {
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('people_events')
-      .delete()
-      .eq('user_id', userId)
-      .eq('connection_id', connectionId)
-      .like('source_event_id', '%:first_seen')
+    const { error } = await this.peopleRepository.deleteSyntheticFirstSeen(
+      userId,
+      connectionId,
+    )
     if (error) {
       this.logger.warn(`first_seen cleanup failed for ${connectionId}: ${error.message}`)
     }
@@ -423,17 +389,18 @@ export class PosthogPeopleInitializer {
       project_id: projectId,
       user_id: userId,
       last_synced_at: new Date().toISOString(),
-      last_status: 'people_initialized',
+      // Always `Initialized` (never `Backfilling`): PostHog's person scan
+      // re-pages from the top each run rather than resuming a cursor, so
+      // re-triggering wouldn't advance a capped scan — events stay
+      // incremental via the `last_event_at` watermark instead.
+      last_status: PeopleSyncStatus.Initialized,
       last_error: null,
     }
     // Only advance the watermark when we actually ingested newer events —
     // omitting the column leaves the existing value untouched.
     if (lastEventAt) payload.last_event_at = lastEventAt
 
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('connection_sync_state')
-      .upsert(payload, { onConflict: 'connection_id' })
+    const { error } = await this.peopleRepository.upsertSyncState(payload)
     if (error) {
       this.logger.warn(`Could not record sync state for ${connectionId}: ${error.message}`)
     }

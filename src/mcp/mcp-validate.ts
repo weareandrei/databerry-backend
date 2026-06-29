@@ -9,11 +9,7 @@
  * 400 to the user.
  */
 
-import {
-  mcpInitialize,
-  mcpListTools,
-  type McpAuthType,
-} from './mcp-client'
+import { McpClient, type McpAuthType } from './mcp.client'
 
 // Re-export so the existing import sites in `connections.service.ts`
 // don't need to change.
@@ -40,6 +36,7 @@ export async function validateMcpConnection(input: McpValidateInput): Promise<vo
   // exposure works for THIS caller (some servers gate tool exposure
   // behind extra scopes that the handshake doesn't surface). We don't
   // store the tool list here; chat-time fetches it fresh.
-  await mcpInitialize(input)
-  await mcpListTools(input)
+  const client = new McpClient(input)
+  await client.initialize()
+  await client.listTools()
 }

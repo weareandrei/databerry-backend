@@ -1,4 +1,4 @@
-import type { SupabaseService } from '../supabase/supabase.service'
+import type { ViewsRepository } from './views.repository'
 
 /**
  * Marks a views_values row for (viewId, date) as needing a scheduler sync.
@@ -12,18 +12,8 @@ import type { SupabaseService } from '../supabase/supabase.service'
 export async function markNeedsSync(
   viewId: string,
   date: string,
-  client: ReturnType<SupabaseService['getClient']>,
+  viewsRepository: ViewsRepository,
 ): Promise<void> {
-  const { error } = await client
-    .from('views_values')
-    .insert({ view_id: viewId, created_at: date, value: '0', needs_sync: true })
-
-  if (error?.code === '23505') {
-    // Unique constraint hit — row already exists; just raise the flag, preserve the value
-    await client
-      .from('views_values')
-      .update({ needs_sync: true })
-      .eq('view_id', viewId)
-      .eq('created_at', date)
-  }
+  const { error } = await viewsRepository.markValueNeedsSync(viewId, date)
+  if (error) throw new Error(error.message)
 }

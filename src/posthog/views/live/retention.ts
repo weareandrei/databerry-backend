@@ -4,7 +4,7 @@ import {
   escapeStringLiteral,
   tzDateBucket,
 } from './hogql-utils'
-import type { PosthogCredentials } from '../../connection/credentials'
+import { PosthogApiClient } from '../../posthog-api.client'
 
 export type RetentionPeriod = 'day' | 'week'
 
@@ -123,7 +123,7 @@ interface CohortSizeRow {
  * which on solo-founder-scale data is invisible.
  */
 export async function fetchPosthogRetention(
-  ph: PosthogCredentials,
+  client: PosthogApiClient,
   config: RetentionConfig,
   dateTo: string,
   logger: Logger,
@@ -135,19 +135,14 @@ export async function fetchPosthogRetention(
   const sizesHogql = `SELECT cohort_start, count(DISTINCT person_id) FROM (${cohortQuery}) GROUP BY cohort_start ORDER BY cohort_start`
   logger.log(`  → posthog retention sizes HogQL: ${sizesHogql}`)
 
-  const sizesRes = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ph.apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: { kind: 'HogQLQuery', query: sizesHogql } }),
-  })
-
-  if (!sizesRes.ok) {
-    const body = await sizesRes.text()
-    logger.error(`PostHog retention cohort-sizes failed: ${body}`)
+  let sizesJson: { results?: [string, number | string][] }
+  try {
+    sizesJson = (await client.queryHogql(sizesHogql)) as { results?: [string, number | string][] }
+  } catch (err) {
+    logger.error(`PostHog retention cohort-sizes failed: ${String(err)}`)
     return { cohorts: [], periodLabel: config.period }
   }
 
-  const sizesJson = (await sizesRes.json()) as { results?: [string, number | string][] }
   const cohortSizes: CohortSizeRow[] = (sizesJson.results ?? []).map(([d, n]) => ({
     cohortStart: String(d ?? ''),
     size: Number(n) || 0,
@@ -159,20 +154,14 @@ export async function fetchPosthogRetention(
 
   // Returns matrix.
   logger.log(`  → posthog retention returns HogQL: ${returnsQuery}`)
-  const returnsRes = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ph.apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: { kind: 'HogQLQuery', query: returnsQuery } }),
-  })
-
-  if (!returnsRes.ok) {
-    const body = await returnsRes.text()
-    logger.error(`PostHog retention returns failed: ${body}`)
+  let returnsJson: { results?: [string, number | string, number | string][] }
+  try {
+    returnsJson = (await client.queryHogql(returnsQuery)) as {
+      results?: [string, number | string, number | string][]
+    }
+  } catch (err) {
+    logger.error(`PostHog retention returns failed: ${String(err)}`)
     return { cohorts: [], periodLabel: config.period }
-  }
-
-  const returnsJson = (await returnsRes.json()) as {
-    results?: [string, number | string, number | string][]
   }
 
   // Stitch: lookup cohort_start → row index, fill `returns[period_offset]`.

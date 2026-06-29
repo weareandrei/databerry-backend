@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common'
-import { SupabaseService } from '../supabase/supabase.service'
+import { ConnectionsRepository } from '../connections/connections.repository'
 import { PosthogLifecycleService } from '../posthog/lifecycle/hog-function'
+import { ViewsRepository } from './views.repository'
 
 /**
  * View types that *intentionally* have no `connection_id` — the server
@@ -37,7 +38,8 @@ export class ViewsService {
   private readonly logger = new Logger(ViewsService.name)
 
   constructor(
-    private readonly supabaseService: SupabaseService,
+    private readonly viewsRepository: ViewsRepository,
+    private readonly connectionsRepository: ConnectionsRepository,
     private readonly posthogLifecycleService: PosthogLifecycleService,
   ) {}
 
@@ -46,27 +48,7 @@ export class ViewsService {
       `\n  ► getViewsByFolder\n  folderId : ${folderId}\n  userId   : ${userId}\n  dateFrom : ${dateFrom ?? 'none'}\n  dateTo   : ${dateTo ?? 'none'}`,
     )
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('views')
-      .select('*, views_values(value, created_at)')
-      .eq('folder_id', folderId)
-      .eq('user_id', userId)
-      // Primary sort: explicit per-container `position` (set by the
-      // drag-reorder endpoint, defaults to insertion order). Secondary
-      // sort: `created_at` then `id` so reads stay deterministic if two
-      // positions ever collide (the index is non-unique by design — see
-      // the 2026-05 migration).
-      //
-      // `nullsFirst: false` makes the fallback explicit: views without
-      // a saved position (legacy rows, partial migration, or a future
-      // insert path that misses the explicit `position` write) fall to
-      // the END and the secondary `created_at` sort places them in
-      // creation order. The user can then drag them to reorder, which
-      // writes a real position.
-      .order('position', { ascending: true, nullsFirst: false })
-      .order('created_at', { ascending: true })
-      .order('id', { ascending: true })
+    const { data, error } = await this.viewsRepository.findByFolderWithValues(folderId, userId)
 
     if (error) throw new Error(error.message)
     const healed = await this.healOrphans(data ?? [], userId)
@@ -78,28 +60,7 @@ export class ViewsService {
       `\n  ► getViewsByProject\n  projectId : ${projectId}\n  userId    : ${userId}\n  dateFrom  : ${dateFrom ?? 'none'}\n  dateTo    : ${dateTo ?? 'none'}`,
     )
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('views')
-      .select('*, views_values(value, created_at)')
-      .eq('project_id', projectId)
-      .is('folder_id', null)
-      .eq('user_id', userId)
-      // Primary sort: explicit per-container `position` (set by the
-      // drag-reorder endpoint, defaults to insertion order). Secondary
-      // sort: `created_at` then `id` so reads stay deterministic if two
-      // positions ever collide (the index is non-unique by design — see
-      // the 2026-05 migration).
-      //
-      // `nullsFirst: false` makes the fallback explicit: views without
-      // a saved position (legacy rows, partial migration, or a future
-      // insert path that misses the explicit `position` write) fall to
-      // the END and the secondary `created_at` sort places them in
-      // creation order. The user can then drag them to reorder, which
-      // writes a real position.
-      .order('position', { ascending: true, nullsFirst: false })
-      .order('created_at', { ascending: true })
-      .order('id', { ascending: true })
+    const { data, error } = await this.viewsRepository.findByProjectWithValues(projectId, userId)
 
     if (error) throw new Error(error.message)
     const healed = await this.healOrphans(data ?? [], userId)
@@ -120,11 +81,7 @@ export class ViewsService {
    * surfaces the failure to logs).
    */
   async countByUser(userId: string): Promise<number> {
-    const { count, error } = await this.supabaseService
-      .getClient()
-      .from('views')
-      .select('id', { count: 'exact', head: true })
-      .eq('user_id', userId)
+    const { count, error } = await this.viewsRepository.countByUser(userId)
     if (error) {
       this.logger.warn(`countByUser failed (user=${userId}): ${error.message}`)
       return 0
@@ -135,27 +92,7 @@ export class ViewsService {
   async getPinnedViews(userId: string) {
     this.logger.log(`\n  ► getPinnedViews\n  userId : ${userId}`)
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('views')
-      .select('*, views_values(value, created_at)')
-      .eq('user_id', userId)
-      .eq('is_pinned', true)
-      // Primary sort: explicit per-container `position` (set by the
-      // drag-reorder endpoint, defaults to insertion order). Secondary
-      // sort: `created_at` then `id` so reads stay deterministic if two
-      // positions ever collide (the index is non-unique by design — see
-      // the 2026-05 migration).
-      //
-      // `nullsFirst: false` makes the fallback explicit: views without
-      // a saved position (legacy rows, partial migration, or a future
-      // insert path that misses the explicit `position` write) fall to
-      // the END and the secondary `created_at` sort places them in
-      // creation order. The user can then drag them to reorder, which
-      // writes a real position.
-      .order('position', { ascending: true, nullsFirst: false })
-      .order('created_at', { ascending: true })
-      .order('id', { ascending: true })
+    const { data, error } = await this.viewsRepository.findPinnedWithValues(userId)
 
     if (error) throw new Error(error.message)
     const healed = await this.healOrphans(data ?? [], userId)
@@ -163,23 +100,13 @@ export class ViewsService {
   }
 
   async pinView(viewId: string, userId: string) {
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('views')
-      .update({ is_pinned: true })
-      .eq('id', viewId)
-      .eq('user_id', userId)
+    const { error } = await this.viewsRepository.updatePinned(viewId, userId, true)
 
     if (error) throw new Error(error.message)
   }
 
   async unpinView(viewId: string, userId: string) {
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('views')
-      .update({ is_pinned: false })
-      .eq('id', viewId)
-      .eq('user_id', userId)
+    const { error } = await this.viewsRepository.updatePinned(viewId, userId, false)
 
     if (error) throw new Error(error.message)
   }
@@ -222,21 +149,10 @@ export class ViewsService {
 
     if (orderedIds.length === 0) return
 
-    const client = this.supabaseService.getClient()
     const results = await Promise.all(
-      orderedIds.map((id, position) => {
-        let q = client
-          .from('views')
-          .update({ position })
-          .eq('id', id)
-          .eq('user_id', userId)
-          .eq('project_id', projectId)
-        // `folder_id` is nullable — `.eq('folder_id', null)` would
-        // generate `folder_id = NULL` which never matches; PostgREST
-        // needs `IS NULL` instead, which `.is(...)` produces.
-        q = folderId === null ? q.is('folder_id', null) : q.eq('folder_id', folderId)
-        return q
-      }),
+      orderedIds.map((id, position) =>
+        this.viewsRepository.updatePosition(id, userId, projectId, folderId, position),
+      ),
     )
 
     for (const r of results) {
@@ -263,17 +179,11 @@ export class ViewsService {
     projectId: string,
     folderId: string | null,
   ): Promise<number> {
-    const client = this.supabaseService.getClient()
-    let q = client
-      .from('views')
-      .select('position')
-      .eq('user_id', userId)
-      .eq('project_id', projectId)
-      .not('position', 'is', null)
-      .order('position', { ascending: false, nullsFirst: false })
-      .limit(1)
-    q = folderId === null ? q.is('folder_id', null) : q.eq('folder_id', folderId)
-    const { data, error } = await q.maybeSingle()
+    const { data, error } = await this.viewsRepository.findMaxPosition(
+      userId,
+      projectId,
+      folderId,
+    )
     if (error) throw new Error(`nextPositionFor failed: ${error.message}`)
     if (!data) return 0
     const current = data.position as number | null
@@ -313,12 +223,7 @@ export class ViewsService {
     if (dto.connectionType === 'posthog') {
       const eventName = (dto.config?.eventName as string) ?? dto.name
 
-      const { data: tempView, error: tempError } = await this.supabaseService
-        .getClient()
-        .from('views')
-        .insert(baseInsert)
-        .select()
-        .single()
+      const { data: tempView, error: tempError } = await this.viewsRepository.insert(baseInsert)
 
       if (tempError) {
         this.logger.error(`  ✗ createView failed\n  ${tempError.message}`)
@@ -347,11 +252,7 @@ export class ViewsService {
       }
 
       const finalConfig = { ...(dto.config ?? {}), hogFunctionId: hogFunctionId ?? null }
-      await this.supabaseService
-        .getClient()
-        .from('views')
-        .update({ config: finalConfig })
-        .eq('id', tempView.id)
+      await this.viewsRepository.updateConfig(tempView.id as string, finalConfig)
 
       this.logger.log(
         hogFunctionId
@@ -362,12 +263,7 @@ export class ViewsService {
     }
 
     // Non-PostHog views — create directly
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('views')
-      .insert(baseInsert)
-      .select()
-      .single()
+    const { data, error } = await this.viewsRepository.insert(baseInsert)
 
     if (error) {
       this.logger.error(`  ✗ createView failed\n  ${error.message}`)
@@ -396,21 +292,16 @@ export class ViewsService {
       if (dto.connectionId === null) {
         patch.connection_id = null
       } else {
-        const client = this.supabaseService.getClient()
-        const { data: view } = await client
-          .from('views')
-          .select('project_id, connection_type')
-          .eq('id', viewId)
-          .eq('user_id', userId)
-          .maybeSingle()
+        const { data: view } = await this.viewsRepository.findProjectAndConnectionType(
+          viewId,
+          userId,
+        )
         if (!view) throw new NotFoundException('View not found')
 
-        const { data: conn } = await client
-          .from('connections')
-          .select('id, type, project_id')
-          .eq('id', dto.connectionId)
-          .eq('user_id', userId)
-          .maybeSingle()
+        const { data: conn } = await this.connectionsRepository.findTypeAndProjectId(
+          dto.connectionId,
+          userId,
+        )
         if (!conn) throw new NotFoundException('Connection not found')
         if (conn.type !== view.connection_type) {
           throw new BadRequestException(
@@ -428,25 +319,12 @@ export class ViewsService {
 
     if (Object.keys(patch).length === 0) {
       // No-op — return current row
-      const { data } = await this.supabaseService
-        .getClient()
-        .from('views')
-        .select('*, views_values(value, created_at)')
-        .eq('id', viewId)
-        .eq('user_id', userId)
-        .single()
+      const { data } = await this.viewsRepository.findWithValues(viewId, userId)
       if (!data) throw new NotFoundException('View not found')
       return this.toCamel(data)
     }
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('views')
-      .update(patch)
-      .eq('id', viewId)
-      .eq('user_id', userId)
-      .select('*, views_values(value, created_at)')
-      .single()
+    const { data, error } = await this.viewsRepository.update(viewId, userId, patch)
 
     if (error || !data) throw new NotFoundException('View not found')
     this.logger.log(`  ✓ view updated  id: ${viewId}`)
@@ -456,20 +334,9 @@ export class ViewsService {
   async deleteView(viewId: string, userId: string) {
     this.logger.log(`\n  ► deleteView\n  viewId : ${viewId}\n  userId : ${userId}`)
 
-    const { data: view } = await this.supabaseService
-      .getClient()
-      .from('views')
-      .select('connection_id, connection_type, config')
-      .eq('id', viewId)
-      .eq('user_id', userId)
-      .single()
+    const { data: view } = await this.viewsRepository.findConnectionAndConfig(viewId, userId)
 
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('views')
-      .delete()
-      .eq('id', viewId)
-      .eq('user_id', userId)
+    const { error } = await this.viewsRepository.delete(viewId, userId)
 
     if (error) {
       this.logger.error(`  ✗ deleteView failed\n  ${error.message}`)
@@ -496,15 +363,12 @@ export class ViewsService {
   // Upserts the value for a view on the given date (defaults to today) and clears needs_sync.
   // Uses insert-then-update-on-conflict to be safe against concurrent calls.
   async upsertValue(connectionId: string, viewType: string, value: string, date?: string): Promise<void> {
-    const client = this.supabaseService.getClient()
     const targetDate = date ?? new Date().toISOString().split('T')[0]
 
-    const { data: view } = await client
-      .from('views')
-      .select('id')
-      .eq('connection_id', connectionId)
-      .eq('type', viewType)
-      .maybeSingle()
+    const { data: view } = await this.viewsRepository.findIdByConnectionAndType(
+      connectionId,
+      viewType,
+    )
 
     if (!view) {
       this.logger.warn(`  ⚠ No view found for connectionId=${connectionId} type=${viewType}`)
@@ -512,17 +376,15 @@ export class ViewsService {
     }
 
     const viewId = view.id as string
-    const { error } = await client
-      .from('views_values')
-      .insert({ view_id: viewId, value, created_at: targetDate, needs_sync: false })
+    const { error } = await this.viewsRepository.insertValue({
+      view_id: viewId,
+      value,
+      created_at: targetDate,
+      needs_sync: false,
+    })
 
     if (error?.code === '23505') {
-      // Row already exists — update value and clear the sync flag
-      await client
-        .from('views_values')
-        .update({ value, updated_at: new Date().toISOString(), needs_sync: false })
-        .eq('view_id', viewId)
-        .eq('created_at', targetDate)
+      await this.viewsRepository.updateValue(viewId, targetDate, value)
     }
   }
 
@@ -565,14 +427,7 @@ export class ViewsService {
     )
     if (candidates.length === 0) return rows
 
-    const client = this.supabaseService.getClient()
-
-    // One round-trip for the entire user's connections — cheap (small N) and
-    // simpler than per-view lookups.
-    const { data: connections } = await client
-      .from('connections')
-      .select('id, type, project_id')
-      .eq('user_id', userId)
+    const { data: connections } = await this.connectionsRepository.findAllByUserId(userId)
 
     const conns = (connections ?? []) as { id: string; type: string; project_id: string | null }[]
     const validIds = new Set(conns.map(c => c.id))
@@ -624,11 +479,7 @@ export class ViewsService {
       // and the orphan count is small in practice.
       await Promise.all(
         updates.map(u =>
-          client
-            .from('views')
-            .update({ connection_id: u.connectionId })
-            .eq('id', u.viewId)
-            .eq('user_id', userId),
+          this.viewsRepository.updateConnectionId(u.viewId, userId, u.connectionId),
         ),
       )
     }

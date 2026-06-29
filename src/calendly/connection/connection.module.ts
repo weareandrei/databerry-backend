@@ -1,11 +1,12 @@
 import { Module } from '@nestjs/common'
 import { CalendlyOAuthService } from './oauth'
 import { CalendlyConnectionController } from './connection.controller'
-import { SupabaseModule } from '../../supabase/supabase.module'
+import { CalendlyRepository } from './calendly.repository'
+import { ConnectionsModule } from '../../connections/connections.module'
 
 @Module({
-  imports: [SupabaseModule],
-  providers: [CalendlyOAuthService],
+  imports: [ConnectionsModule],
+  providers: [CalendlyRepository, CalendlyOAuthService],
   controllers: [CalendlyConnectionController],
   exports: [CalendlyOAuthService],
 })

@@ -2,11 +2,16 @@ import { Module } from '@nestjs/common'
 import { GoogleAnalyticsOAuthService } from './oauth'
 import { GoogleAnalyticsPropertiesService } from './properties'
 import { GoogleAnalyticsConnectionController } from './connection.controller'
-import { SupabaseModule } from '../../supabase/supabase.module'
+import { GoogleAnalyticsRepository } from './google-analytics.repository'
+import { ConnectionsModule } from '../../connections/connections.module'
 
 @Module({
-  imports: [SupabaseModule],
-  providers: [GoogleAnalyticsOAuthService, GoogleAnalyticsPropertiesService],
+  imports: [ConnectionsModule],
+  providers: [
+    GoogleAnalyticsRepository,
+    GoogleAnalyticsOAuthService,
+    GoogleAnalyticsPropertiesService,
+  ],
   controllers: [GoogleAnalyticsConnectionController],
   exports: [GoogleAnalyticsOAuthService],
 })

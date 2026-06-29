@@ -1,6 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { createHash, randomBytes } from 'crypto'
-import { SupabaseService } from '../../supabase/supabase.service'
+import { ConnectionsRepository } from '../../connections/connections.repository'
 import {
   ConnectionMissingException,
   IntegrationReauthRequiredException,
@@ -12,6 +12,10 @@ import {
   encryptForUser,
   isEncrypted,
 } from '../../common/crypto/encryption'
+import { fmtFailure } from '../../common/log-helpers'
+import { CalendlyRepository } from './calendly.repository'
+import { CalendlyApiClient } from '../calendly-api.client'
+import { CalendlyOAuthClient, CalendlyOAuthHttpError } from '../calendly-oauth.client'
 
 @Injectable()
 export class CalendlyOAuthService {
@@ -21,20 +25,23 @@ export class CalendlyOAuthService {
   readonly clientSecret = process.env.CALENDLY_CLIENT_SECRET!
   readonly redirectUri = `${process.env.WEBHOOK_BASE_URL ?? 'http://localhost:3001'}/calendly/oauth/callback`
   readonly frontendUrl = getPrimaryFrontendUrl()
-  readonly baseApi = 'https://api.calendly.com'
   readonly authBase = 'https://auth.calendly.com'
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly connectionsRepository: ConnectionsRepository,
+    private readonly calendlyRepository: CalendlyRepository,
+  ) {}
 
   async getOAuthUrl(userId: string): Promise<string> {
     const codeVerifier = randomBytes(32).toString('base64url')
     const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url')
     const state = randomBytes(16).toString('hex')
 
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('calendly_oauth_state')
-      .insert({ state, user_id: userId, code_verifier: codeVerifier })
+    const { error } = await this.calendlyRepository.insertOAuthState({
+      state,
+      user_id: userId,
+      code_verifier: codeVerifier,
+    })
 
     if (error) {
       this.logger.error(
@@ -55,8 +62,6 @@ export class CalendlyOAuthService {
   }
 
   async handleOAuthCallback(code: string, state: string): Promise<string> {
-    const client = this.supabaseService.getClient()
-
     // Tiny helper so each failure path stays a one-liner, and the
     // wire shape (`?calendly=error&reason=<code>`) is impossible to
     // get wrong by hand. Reason codes match
@@ -64,11 +69,7 @@ export class CalendlyOAuthService {
     const errorRedirect = (reason: string) =>
       `${this.frontendUrl}/hub/connections?calendly=error&reason=${reason}`
 
-    const { data: stateRow } = await client
-      .from('calendly_oauth_state')
-      .select('*')
-      .eq('state', state)
-      .maybeSingle()
+    const { data: stateRow } = await this.calendlyRepository.findOAuthStateByState(state)
 
     if (!stateRow) {
       this.logger.warn(`Calendly OAuth state not found (state=${state})`)
@@ -79,53 +80,37 @@ export class CalendlyOAuthService {
     const codeVerifier = stateRow.code_verifier as string
 
     try {
-      const tokenRes = await fetch(`${this.authBase}/oauth/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          grant_type: 'authorization_code',
-          code,
-          redirect_uri: this.redirectUri,
-          client_id: this.clientId,
-          client_secret: this.clientSecret,
-          code_verifier: codeVerifier,
-        }),
-      })
-
-      if (!tokenRes.ok) {
-        const body = await tokenRes.json().catch(() => ({}))
-        this.logger.error('Calendly token exchange failed', body)
+      const oauthClient = new CalendlyOAuthClient(this.clientId, this.clientSecret)
+      let tokens: { access_token: string; refresh_token: string; expires_in: number }
+      try {
+        tokens = await oauthClient.exchangeAuthorizationCode(code, codeVerifier, this.redirectUri)
+      } catch (err) {
+        if (err instanceof CalendlyOAuthHttpError) {
+          this.logger.error('Calendly token exchange failed', {
+            status: err.status,
+            body: err.body.slice(0, 200),
+          })
+        } else {
+          this.logger.error('Calendly token exchange failed', err)
+        }
         return errorRedirect('token_exchange')
-      }
-
-      const tokens = (await tokenRes.json()) as {
-        access_token: string
-        refresh_token: string
-        expires_in: number
       }
 
       const expiresAt = new Date(Date.now() + tokens.expires_in * 1000).toISOString()
 
-      const meRes = await fetch(`${this.baseApi}/users/me`, {
-        headers: { Authorization: `Bearer ${tokens.access_token}` },
-      })
-
-      if (!meRes.ok) {
-        const detail = await meRes.text().catch(() => '')
-        this.logger.error(
-          `Calendly /users/me failed (${meRes.status}): ${detail.slice(0, 200)}`,
-        )
+      let me: { uri: string; current_organization: string }
+      try {
+        me = await new CalendlyApiClient(tokens.access_token, 'oauth-callback').getMe()
+      } catch (err) {
+        this.logger.error(fmtFailure('Calendly /users/me', err, { userId }))
         return errorRedirect('account_resolve')
       }
-      const me = (await meRes.json()) as {
-        resource: { uri: string; current_organization: string }
-      }
 
-      const { data: conn, error: connErr } = await client
-        .from('connections')
-        .insert({ name: 'Calendly', type: 'calendly', user_id: userId })
-        .select()
-        .single()
+      const { data: conn, error: connErr } = await this.connectionsRepository.insert({
+        name: 'Calendly',
+        type: 'calendly',
+        user_id: userId,
+      })
 
       if (connErr) {
         this.logger.error(
@@ -137,13 +122,13 @@ export class CalendlyOAuthService {
       // Encrypt OAuth tokens with the per-user envelope before write —
       // see `common/crypto/encryption.ts` for the algorithm rationale.
       // `userId` is in scope from the OAuth state row above.
-      const { error: credErr } = await client.from('connections_calendly').insert({
+      const { error: credErr } = await this.calendlyRepository.insert({
         connection_id: conn.id,
         access_token: encryptForUser(tokens.access_token, userId),
         refresh_token: encryptForUser(tokens.refresh_token, userId),
         expires_at: expiresAt,
-        user_uri: me.resource.uri,
-        organization_uri: me.resource.current_organization,
+        user_uri: me.uri,
+        organization_uri: me.current_organization,
       })
 
       if (credErr) {
@@ -152,28 +137,22 @@ export class CalendlyOAuthService {
         )
         // Roll back the parent row so we don't leave an orphan
         // `connections` record with no creds.
-        await client.from('connections').delete().eq('id', conn.id)
+        await this.connectionsRepository.deleteById(conn.id)
         return errorRedirect('credentials_save')
       }
 
       this.logger.log(`Calendly connected for user ${userId}`)
       return `${this.frontendUrl}/hub/connections?calendly=connected`
     } finally {
-      await client.from('calendly_oauth_state').delete().eq('state', state)
+      await this.calendlyRepository.deleteOAuthStateByState(state)
     }
   }
 
   async ensureFreshToken(connectionId: string): Promise<string> {
-    const client = this.supabaseService.getClient()
-
     // Pull `user_id` alongside the credentials — needed to derive the
     // per-user decryption key. See GA `ensureFreshToken` for the same
     // pattern.
-    const { data, error } = await client
-      .from('connections_calendly')
-      .select('access_token, refresh_token, expires_at, connections!inner(user_id)')
-      .eq('connection_id', connectionId)
-      .maybeSingle()
+    const { data, error } = await this.calendlyRepository.findWithUserJoin(connectionId)
 
     if (error) {
       this.logger.error(
@@ -214,19 +193,29 @@ export class CalendlyOAuthService {
 
     this.logger.log(`Refreshing Calendly token for connection ${connectionId}`)
 
-    let tokenRes: Response
+    let tokens: { access_token: string; refresh_token: string; expires_in: number }
     try {
-      tokenRes = await fetch(`${this.authBase}/oauth/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          grant_type: 'refresh_token',
-          refresh_token: refreshToken,
-          client_id: this.clientId,
-          client_secret: this.clientSecret,
-        }),
-      })
+      tokens = await new CalendlyOAuthClient(this.clientId, this.clientSecret).refreshAccessToken(
+        refreshToken,
+      )
     } catch (err) {
+      if (err instanceof CalendlyOAuthHttpError) {
+        const detail = err.body
+        if (err.status >= 500) {
+          this.logger.warn(
+            `Calendly refresh upstream error (${err.status}) for ${connectionId}: ${detail.slice(0, 200)}`,
+          )
+          throw new IntegrationUpstreamException(
+            'calendly',
+            connectionId,
+            `Calendly token endpoint returned ${err.status}`,
+          )
+        }
+        this.logger.warn(
+          `Calendly refresh failed for connection ${connectionId} (${err.status}): ${detail.slice(0, 200)}`,
+        )
+        throw new IntegrationReauthRequiredException('calendly', connectionId)
+      }
       this.logger.warn(`Calendly refresh network error for ${connectionId}: ${String(err)}`)
       throw new IntegrationUpstreamException(
         'calendly',
@@ -235,74 +224,33 @@ export class CalendlyOAuthService {
       )
     }
 
-    if (!tokenRes.ok) {
-      const detail = await tokenRes.text().catch(() => '')
-
-      // 5xx = Calendly outage (transient); 4xx = refresh token is dead.
-      if (tokenRes.status >= 500) {
-        this.logger.warn(
-          `Calendly refresh upstream error (${tokenRes.status}) for ${connectionId}: ${detail.slice(0, 200)}`,
-        )
-        throw new IntegrationUpstreamException(
-          'calendly',
-          connectionId,
-          `Calendly token endpoint returned ${tokenRes.status}`,
-        )
-      }
-
-      this.logger.warn(
-        `Calendly refresh failed for connection ${connectionId} (${tokenRes.status}): ${detail.slice(0, 200)}`,
-      )
-      // Refresh token is dead. See the GA equivalent for the rationale on
-      // not persisting a status flag — every subsequent request re-attempts
-      // and 4xx's again, fine at our scale.
-      throw new IntegrationReauthRequiredException('calendly', connectionId)
-    }
-
-    const tokens = (await tokenRes.json()) as {
-      access_token: string
-      refresh_token: string
-      expires_in: number
-    }
-
     const newExpiresAt = new Date(Date.now() + tokens.expires_in * 1000).toISOString()
 
     // Calendly *rotates* refresh tokens on each successful refresh, so we
     // must persist the new one — unlike Google, which reuses the original.
     // Re-encrypt both with the per-user envelope. `userId` is in scope
     // from the join above.
-    await client
-      .from('connections_calendly')
-      .update({
-        access_token: encryptForUser(tokens.access_token, userId),
-        refresh_token: encryptForUser(tokens.refresh_token, userId),
-        expires_at: newExpiresAt,
-      })
-      .eq('connection_id', connectionId)
+    await this.calendlyRepository.updateTokens(connectionId, {
+      access_token: encryptForUser(tokens.access_token, userId),
+      refresh_token: encryptForUser(tokens.refresh_token, userId),
+      expires_at: newExpiresAt,
+    })
 
     return tokens.access_token
   }
 
   async getUserUri(connectionId: string): Promise<string> {
-    const { data } = await this.supabaseService
-      .getClient()
-      .from('connections_calendly')
-      .select('user_uri')
-      .eq('connection_id', connectionId)
-      .maybeSingle()
+    const { data } = await this.calendlyRepository.findUserUri(connectionId)
 
     if (!data) throw new NotFoundException('Calendly credentials not found')
     return data.user_uri as string
   }
 
   async verifyOwnership(connectionId: string, userId: string): Promise<void> {
-    const { data } = await this.supabaseService
-      .getClient()
-      .from('connections')
-      .select('id')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .maybeSingle()
+    const { data } = await this.connectionsRepository.findIdByConnectionAndUser(
+      connectionId,
+      userId,
+    )
 
     // 410 (not 404) so the per-view live-value tile renders the inline
     // reattach prompt. Mirrors the GA `verifyOwnership` change.

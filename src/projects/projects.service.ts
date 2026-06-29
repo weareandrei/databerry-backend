@@ -1,6 +1,7 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
-import { SupabaseService } from '../supabase/supabase.service'
+import { ConnectionsRepository } from '../connections/connections.repository'
 import { ViewsService } from '../views/views.service'
+import { ProjectsRepository } from './projects.repository'
 
 export interface CreateProjectDto {
   name: string
@@ -52,33 +53,24 @@ export class ProjectsService {
   private readonly logger = new Logger(ProjectsService.name)
 
   constructor(
-    private readonly supabaseService: SupabaseService,
+    private readonly projectsRepository: ProjectsRepository,
+    private readonly connectionsRepository: ConnectionsRepository,
     private readonly viewsService: ViewsService,
   ) {}
 
   async getProjects(userId: string) {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('projects')
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: true })
+    const { data, error } = await this.projectsRepository.findByUserId(userId)
 
     if (error) throw new Error(error.message)
     return data.map(this.toCamel)
   }
 
   async createProject(dto: CreateProjectDto, userId: string) {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('projects')
-      .insert({
-        name: dto.name,
-        user_id: userId,
-        website_url: normalizeWebsiteUrl(dto.websiteUrl),
-      })
-      .select()
-      .single()
+    const { data, error } = await this.projectsRepository.insert({
+      name: dto.name,
+      user_id: userId,
+      website_url: normalizeWebsiteUrl(dto.websiteUrl),
+    })
 
     if (error) throw new Error(error.message)
     const project = this.toCamel(data)
@@ -98,12 +90,10 @@ export class ProjectsService {
     let hasTraffic = false
     let hasStripe = false
     try {
-      const { data: connRows } = await this.supabaseService
-        .getClient()
-        .from('connections')
-        .select('type')
-        .eq('user_id', userId)
-        .in('type', ['google_analytics', 'posthog', 'stripe', 'stripe_manual'])
+      const { data: connRows } = await this.connectionsRepository.findTypesByUserId(
+        userId,
+        ['google_analytics', 'posthog', 'stripe', 'stripe_manual'],
+      )
       const types = new Set((connRows ?? []).map(r => (r as { type: string }).type))
       hasTraffic = types.has('google_analytics') || types.has('posthog')
       hasStripe = types.has('stripe') || types.has('stripe_manual')
@@ -168,26 +158,18 @@ export class ProjectsService {
       update.website_url = normalizeWebsiteUrl(dto.websiteUrl)
     }
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('projects')
-      .update(update)
-      .eq('id', projectId)
-      .eq('user_id', userId)
-      .select()
-      .single()
+    const { data, error } = await this.projectsRepository.update(
+      projectId,
+      userId,
+      update,
+    )
 
     if (error || !data) throw new NotFoundException('Project not found')
     return this.toCamel(data)
   }
 
   async deleteProject(projectId: string, userId: string) {
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('projects')
-      .delete()
-      .eq('id', projectId)
-      .eq('user_id', userId)
+    const { error } = await this.projectsRepository.delete(projectId, userId)
 
     if (error) throw new Error(error.message)
   }

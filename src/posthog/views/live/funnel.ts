@@ -5,7 +5,7 @@ import {
   tzDateBucket,
   tzWrappedTimestamp,
 } from './hogql-utils'
-import type { PosthogCredentials } from '../../connection/credentials'
+import { PosthogApiClient } from '../../posthog-api.client'
 
 export interface FunnelStepConfig {
   /** Event name as it appears in PostHog. Comes from the picker, which is
@@ -89,7 +89,7 @@ export function buildFunnelHogql(
  * the funnel card renders directly.
  */
 export async function fetchPosthogFunnel(
-  ph: PosthogCredentials,
+  client: PosthogApiClient,
   steps: FunnelStepConfig[],
   conversionWindowSeconds: number,
   dateFrom: string,
@@ -106,19 +106,13 @@ export async function fetchPosthogFunnel(
   const hogql = buildFunnelHogql(steps, conversionWindowSeconds, dateFrom, dateTo, tz)
   logger.log(`  → posthog funnel HogQL: ${hogql}`)
 
-  const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ph.apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogql } }),
-  })
-
-  if (!res.ok) {
-    const body = await res.text()
-    logger.error(`PostHog funnel query failed: ${body}`)
+  let json: { results?: [number, number][] }
+  try {
+    json = (await client.queryHogql(hogql)) as { results?: [number, number][] }
+  } catch (err) {
+    logger.error(`PostHog funnel query failed: ${String(err)}`)
     return { steps: [] }
   }
-
-  const json = (await res.json()) as { results?: [number, number][] }
 
   // `results` is a histogram of *deepest step reached*. Bucket into a fixed
   // array sized to `steps.length`, then cumulate from the right so each

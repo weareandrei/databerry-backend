@@ -1,5 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common'
-import { SupabaseService } from '../supabase/supabase.service'
+import { FoldersRepository } from './folders.repository'
 
 export interface CreateFolderDto {
   name: string
@@ -14,72 +14,43 @@ export interface UpdateFolderDto {
 
 @Injectable()
 export class FoldersService {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(private readonly foldersRepository: FoldersRepository) {}
 
   async getFolders(userId: string) {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('folders')
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: true })
-
+    const { data, error } = await this.foldersRepository.findByUserId(userId)
     if (error) throw new Error(error.message)
     return data.map(this.toCamel)
   }
 
   async getFolderById(folderId: string, userId: string) {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('folders')
-      .select('*')
-      .eq('id', folderId)
-      .eq('user_id', userId)
-      .single()
-
+    const { data, error } = await this.foldersRepository.findById(folderId, userId)
     if (error || !data) throw new NotFoundException('Folder not found')
     return this.toCamel(data)
   }
 
   async createFolder(dto: CreateFolderDto, userId: string) {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('folders')
-      .insert({
-        name: dto.name,
-        parent_id: dto.parentId ?? null,
-        project_id: dto.projectId,
-        user_id: userId,
-      })
-      .select()
-      .single()
-
+    const { data, error } = await this.foldersRepository.insert({
+      name: dto.name,
+      parent_id: dto.parentId ?? null,
+      project_id: dto.projectId,
+      user_id: userId,
+    })
     if (error) throw new Error(error.message)
     return this.toCamel(data)
   }
 
   async updateFolder(folderId: string, dto: UpdateFolderDto, userId: string) {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('folders')
-      .update({ name: dto.name, color: dto.color, updated_at: new Date().toISOString() })
-      .eq('id', folderId)
-      .eq('user_id', userId)
-      .select()
-      .single()
-
+    const { data, error } = await this.foldersRepository.update(folderId, userId, {
+      name: dto.name,
+      color: dto.color,
+      updated_at: new Date().toISOString(),
+    })
     if (error || !data) throw new NotFoundException('Folder not found')
     return this.toCamel(data)
   }
 
   async deleteFolder(folderId: string, userId: string) {
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('folders')
-      .delete()
-      .eq('id', folderId)
-      .eq('user_id', userId)
-
+    const { error } = await this.foldersRepository.delete(folderId, userId)
     if (error) throw new Error(error.message)
   }
 

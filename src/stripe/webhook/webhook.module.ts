@@ -1,9 +1,10 @@
 import { Module } from '@nestjs/common'
+import { ConnectionsRepositoriesModule } from '../../connections/connections-repositories.module'
 import { StripeWebhookService } from './handler'
-import { SupabaseModule } from '../../supabase/supabase.module'
+import { StripeRepositoriesModule } from '../stripe-repositories.module'
 
 @Module({
-  imports: [SupabaseModule],
+  imports: [StripeRepositoriesModule, ConnectionsRepositoriesModule],
   providers: [StripeWebhookService],
   exports: [StripeWebhookService],
 })

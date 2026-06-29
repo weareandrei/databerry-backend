@@ -1,11 +1,12 @@
 import { Module } from '@nestjs/common'
 import { SentryOAuthService } from './oauth'
 import { SentryConnectionController } from './connection.controller'
-import { SupabaseModule } from '../../supabase/supabase.module'
+import { SentryRepository } from './sentry.repository'
+import { ConnectionsModule } from '../../connections/connections.module'
 
 @Module({
-  imports: [SupabaseModule],
-  providers: [SentryOAuthService],
+  imports: [ConnectionsModule],
+  providers: [SentryRepository, SentryOAuthService],
   controllers: [SentryConnectionController],
   exports: [SentryOAuthService],
 })

@@ -1,26 +1,24 @@
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common'
 import { createHash } from 'crypto'
-import { SupabaseService } from '../supabase/supabase.service'
+import { ViewsRepository } from '../views/views.repository'
+import { WebhooksRepository } from './webhooks.repository'
 
 @Injectable()
 export class CustomWebhookService {
   private readonly logger = new Logger(CustomWebhookService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly webhooksRepository: WebhooksRepository,
+    private readonly viewsRepository: ViewsRepository,
+  ) {}
 
   async handleCustomWebhook(
     webhookId: string,
     apiKey: string,
     body: Record<string, unknown>,
   ): Promise<void> {
-    const client = this.supabaseService.getClient()
-
-    // 1. Look up connection by webhook_id
-    const { data: webhookRow, error: webhookError } = await client
-      .from('connections_webhook')
-      .select('connection_id')
-      .eq('webhook_id', webhookId)
-      .maybeSingle()
+    const { data: webhookRow, error: webhookError } =
+      await this.webhooksRepository.findByWebhookId(webhookId)
 
     if (webhookError || !webhookRow) {
       this.logger.warn(`  ⚠ No webhook connection found for webhookId: ${webhookId}`)
@@ -29,26 +27,18 @@ export class CustomWebhookService {
 
     const connectionId = webhookRow.connection_id as string
 
-    // 2. Verify API key
     const keyHash = createHash('sha256').update(apiKey).digest('hex')
-    const { data: keyRow } = await client
-      .from('connections_webhook_keys')
-      .select('id')
-      .eq('connection_id', connectionId)
-      .eq('key_hash', keyHash)
-      .is('revoked_at', null)
-      .maybeSingle()
+    const { data: keyRow } = await this.webhooksRepository.findValidKey(
+      connectionId,
+      keyHash,
+    )
 
     if (!keyRow) {
       this.logger.warn(`  ⚠ Invalid or revoked API key for connection: ${connectionId}`)
       throw new UnauthorizedException('Invalid API key')
     }
 
-    // 3. Get all views for this connection
-    const { data: views } = await client
-      .from('views')
-      .select('id, type, config')
-      .eq('connection_id', connectionId)
+    const { data: views } = await this.viewsRepository.findByConnectionId(connectionId)
 
     if (!views || views.length === 0) {
       this.logger.log(`  → No views found for custom webhook connection: ${connectionId}`)
@@ -63,8 +53,7 @@ export class CustomWebhookService {
 
     for (const view of views as { id: string; type: string; config: Record<string, unknown> }[]) {
       if (view.type === 'webhook_counter' || view.type === 'webhook_append') {
-        // webhook_append now uses the same single-row-per-day counter pattern as webhook_counter
-        await this.incrementDailyCounter(view.id, today, client)
+        await this.incrementDailyCounter(view.id, today)
       } else if (view.type === 'webhook_gauge') {
         const field = (view.config?.field as string) ?? 'value'
         const raw = body[field]
@@ -74,36 +63,28 @@ export class CustomWebhookService {
           )
           continue
         }
-        await this.storeGaugeValue(view.id, String(raw), today, client)
+        await this.storeGaugeValue(view.id, String(raw), today)
       }
     }
   }
 
-  private async incrementDailyCounter(
-    viewId: string,
-    today: string,
-    client: ReturnType<SupabaseService['getClient']>,
-  ): Promise<void> {
-    // Try to insert a new counter row. On conflict (row exists), increment instead.
-    const { error: insertError } = await client
-      .from('views_values')
-      .insert({ view_id: viewId, value: '1', created_at: today, needs_sync: false })
+  private async incrementDailyCounter(viewId: string, today: string): Promise<void> {
+    const { error: insertError } = await this.viewsRepository.insertValue({
+      view_id: viewId,
+      value: '1',
+      created_at: today,
+      needs_sync: false,
+    })
 
     if (insertError?.code === '23505') {
-      // Row exists — fetch current value and increment
-      const { data: existing } = await client
-        .from('views_values')
-        .select('id, value')
-        .eq('view_id', viewId)
-        .eq('created_at', today)
-        .maybeSingle()
+      const { data: existing } = await this.viewsRepository.findValueByViewAndDate(viewId, today)
 
       if (existing) {
         const newValue = (parseInt(existing.value as string, 10) || 0) + 1
-        await client
-          .from('views_values')
-          .update({ value: String(newValue), updated_at: new Date().toISOString() })
-          .eq('id', existing.id)
+        await this.viewsRepository.updateValueById(existing.id as string, {
+          value: String(newValue),
+          updated_at: new Date().toISOString(),
+        })
         this.logger.log(`  ✓ daily counter incremented → ${newValue}`)
       }
     } else if (insertError) {
@@ -113,22 +94,16 @@ export class CustomWebhookService {
     }
   }
 
-  private async storeGaugeValue(
-    viewId: string,
-    value: string,
-    today: string,
-    client: ReturnType<SupabaseService['getClient']>,
-  ): Promise<void> {
-    const { error: insertError } = await client
-      .from('views_values')
-      .insert({ view_id: viewId, value, created_at: today, needs_sync: false })
+  private async storeGaugeValue(viewId: string, value: string, today: string): Promise<void> {
+    const { error: insertError } = await this.viewsRepository.insertValue({
+      view_id: viewId,
+      value,
+      created_at: today,
+      needs_sync: false,
+    })
 
     if (insertError?.code === '23505') {
-      await client
-        .from('views_values')
-        .update({ value, updated_at: new Date().toISOString() })
-        .eq('view_id', viewId)
-        .eq('created_at', today)
+      await this.viewsRepository.updateGaugeValue(viewId, today, value)
       this.logger.log(`  ✓ gauge updated → ${value}`)
     } else if (insertError) {
       this.logger.error(`  ✗ Failed to store gauge value\n  ${insertError.message}`)

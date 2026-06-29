@@ -4,7 +4,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common'
-import { SupabaseService } from '../../supabase/supabase.service'
+import { ConnectionsRepository } from '../../connections/connections.repository'
 import { ConnectionMissingException } from '../../common/integration-errors'
 import { buildViewFetchContext } from '../../common/view-fetch-context'
 import {
@@ -13,7 +13,9 @@ import {
   tzDateBucket,
   tzWrappedTimestamp,
 } from './live/hogql-utils'
-import { getPosthogCredentials, type PosthogCredentials } from '../connection/credentials'
+import { getPosthogCredentials, PosthogCredentialsService } from '../connection/credentials'
+import { PosthogApiClient } from '../posthog-api.client'
+import { ViewsRepository } from '../../views/views.repository'
 import {
   fetchPosthogFunnel,
   type FunnelStepConfig,
@@ -34,7 +36,7 @@ import { hourlyBucketCount } from '../../common/tz'
 
 interface LoadedView {
   config: Record<string, unknown>
-  ph: PosthogCredentials
+  client: PosthogApiClient
 }
 
 /**
@@ -59,7 +61,11 @@ function enumerateDateKeys(from: string, to: string): string[] {
 export class PosthogViewsService {
   private readonly logger = new Logger(PosthogViewsService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly connectionsRepository: ConnectionsRepository,
+    private readonly viewsRepository: ViewsRepository,
+    private readonly posthogCredentialsService: PosthogCredentialsService,
+  ) {}
 
   /**
    * Shared preamble: ownership check + view config + PostHog credentials.
@@ -71,28 +77,22 @@ export class PosthogViewsService {
     viewId: string,
     userId: string,
   ): Promise<LoadedView> {
-    const client = this.supabaseService.getClient()
-
-    const { data: conn, error: connErr } = await client
-      .from('connections')
-      .select('id')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .single()
+    const { data: conn, error: connErr } = await this.connectionsRepository.findIdByConnectionAndUser(
+      connectionId,
+      userId,
+    )
     if (connErr || !conn) throw new ConnectionMissingException('posthog', connectionId)
 
-    const { data: view, error: viewErr } = await client
-      .from('views')
-      .select('config')
-      .eq('id', viewId)
-      .eq('user_id', userId)
-      .single()
+    const { data: view, error: viewErr } = await this.viewsRepository.findConfigById(
+      viewId,
+      userId,
+    )
     if (viewErr || !view) throw new NotFoundException('View not found')
 
-    const ph = await getPosthogCredentials(connectionId, this.supabaseService)
+    const ph = await getPosthogCredentials(connectionId, this.posthogCredentialsService)
     if (!ph) throw new NotFoundException('PostHog credentials not found')
 
-    return { config: (view.config ?? {}) as Record<string, unknown>, ph }
+    return { config: (view.config ?? {}) as Record<string, unknown>, client: new PosthogApiClient(ph) }
   }
 
   /**
@@ -109,19 +109,16 @@ export class PosthogViewsService {
   private async loadCredsForConnection(
     connectionId: string,
     userId: string,
-  ): Promise<PosthogCredentials> {
-    const client = this.supabaseService.getClient()
-    const { data: conn, error } = await client
-      .from('connections')
-      .select('id')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .single()
+  ): Promise<PosthogApiClient> {
+    const { data: conn, error } = await this.connectionsRepository.findIdByConnectionAndUser(
+      connectionId,
+      userId,
+    )
     if (error || !conn) throw new ConnectionMissingException('posthog', connectionId)
 
-    const ph = await getPosthogCredentials(connectionId, this.supabaseService)
+    const ph = await getPosthogCredentials(connectionId, this.posthogCredentialsService)
     if (!ph) throw new NotFoundException('PostHog credentials not found')
-    return ph
+    return new PosthogApiClient(ph)
   }
 
   /**
@@ -142,8 +139,8 @@ export class PosthogViewsService {
     connectionId: string,
     userId: string,
   ): Promise<string[]> {
-    const ph = await this.loadCredsForConnection(connectionId, userId)
-    return listPosthogEventNames(ph, this.logger)
+    const client = await this.loadCredsForConnection(connectionId, userId)
+    return listPosthogEventNames(client, this.logger)
   }
 
   /**
@@ -176,10 +173,10 @@ export class PosthogViewsService {
     dateTo: string | undefined,
     tz: string = 'UTC',
   ): Promise<{ total: number; buckets: { date: string; count: number }[] }> {
-    const ph = await this.loadCredsForConnection(connectionId, userId)
+    const client = await this.loadCredsForConnection(connectionId, userId)
     const { from, to, tz: tzLit } = buildViewFetchContext(dateFrom, dateTo, tz)
     const rows = await fetchPosthogEventCountByBucket(
-      ph,
+      client,
       eventName,
       from,
       to,
@@ -231,14 +228,14 @@ export class PosthogViewsService {
       throw new NotFoundException('eventName query param is required')
     }
 
-    const ph = await this.loadCredsForConnection(connectionId, userId)
+    const client = await this.loadCredsForConnection(connectionId, userId)
     // Daily mode → hourly buckets (matches what `useOverviewChartData`
     // gets from the project-overview backend). Anything else → daily.
     const granularity: 'hourly' | 'daily' =
       mode === 'daily' || (!mode && from === to) ? 'hourly' : 'daily'
 
     const rows = await fetchPosthogEventCountByBucket(
-      ph,
+      client,
       eventName,
       from,
       to,
@@ -286,8 +283,7 @@ export class PosthogViewsService {
       `fetchLiveValue (posthog)  connectionId=${connectionId}  viewId=${viewId}  ${from}→${to}  tz=${tzLit}`,
     )
 
-    const client = this.supabaseService.getClient()
-    const { config, ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
+    const { config, client } = await this.loadViewAndCreds(connectionId, viewId, userId)
     const eventName = (config.eventName as string | undefined) ?? ''
 
     if (!eventName) {
@@ -307,45 +303,25 @@ export class PosthogViewsService {
 
     this.logger.debug(`PostHog HogQL: ${hogqlQuery}`)
 
-    const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${ph.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogqlQuery } }),
-    })
+    try {
+      const json = (await client.queryHogql(hogqlQuery)) as { results?: [[number]] }
+      const count = json.results?.[0]?.[0] ?? 0
+      const value = String(count)
 
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      this.logger.error(`PostHog query API ${res.status}: ${JSON.stringify(body)}`)
+      this.logger.log(`fetchLiveValue → ${value}`)
+
+      // Only persist to views_values for single-day queries (daily table).
+      if (isSingleDay) {
+        await this.viewsRepository.upsertSingleDayValue(viewId, value, from)
+      }
+
+      return { value }
+    } catch (err) {
+      this.logger.error(`PostHog query API error: ${String(err)}`)
       // Surfaces as 500 to the frontend; the user-facing message is
       // generic ("Couldn't load this view.") via `viewErrorMessage`.
-      throw new InternalServerErrorException(`PostHog query API error ${res.status}`)
+      throw new InternalServerErrorException(`PostHog query API error`)
     }
-
-    const json = (await res.json()) as { results?: [[number]] }
-    const count = json.results?.[0]?.[0] ?? 0
-    const value = String(count)
-
-    this.logger.log(`fetchLiveValue → ${value}`)
-
-    // Only persist to views_values for single-day queries (daily table).
-    if (isSingleDay) {
-      const { error: insertErr } = await client
-        .from('views_values')
-        .insert({ view_id: viewId, value, created_at: from, needs_sync: false })
-
-      if (insertErr?.code === '23505') {
-        await client
-          .from('views_values')
-          .update({ value, updated_at: new Date().toISOString(), needs_sync: false })
-          .eq('view_id', viewId)
-          .eq('created_at', from)
-      }
-    }
-
-    return { value }
   }
 
   /**
@@ -378,7 +354,7 @@ export class PosthogViewsService {
       `fetchChartData (posthog daily_counter)  connectionId=${connectionId}  viewId=${viewId}  ${from}→${to}  tz=${tzLit}`,
     )
 
-    const { config, ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
+    const { config, client } = await this.loadViewAndCreds(connectionId, viewId, userId)
     const eventName = (config.eventName as string | undefined) ?? ''
     if (!eventName) {
       this.logger.warn('No eventName in view config — returning empty chart')
@@ -412,25 +388,17 @@ export class PosthogViewsService {
 
     this.logger.debug(`PostHog HogQL: ${hogqlQuery}`)
 
-    const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${ph.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogqlQuery } }),
-    })
-
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      this.logger.error(`PostHog query API ${res.status}: ${JSON.stringify(body)}`)
-      throw new InternalServerErrorException(`PostHog query API error ${res.status}`)
+    let json: { results?: [string | number, number][] }
+    try {
+      json = (await client.queryHogql(hogqlQuery)) as { results?: [string | number, number][] }
+    } catch (err) {
+      this.logger.error(`PostHog query API error: ${String(err)}`)
+      throw new InternalServerErrorException(`PostHog query API error`)
     }
 
     // Daily mode returns "YYYY-MM-DD" date strings; hourly mode returns
     // integer hour-of-day (0..23). Both come back as a single-row tuple
     // shape from PostHog: `[bucketKey, count]`.
-    const json = (await res.json()) as { results?: [string | number, number][] }
     const rows = json.results ?? []
 
     const points = isSingleDay
@@ -459,7 +427,7 @@ export class PosthogViewsService {
       `fetchFunnel (posthog)  connectionId=${connectionId}  viewId=${viewId}  ${from}→${to}  tz=${tzLit}`,
     )
 
-    const { config, ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
+    const { config, client } = await this.loadViewAndCreds(connectionId, viewId, userId)
     const steps = (config.steps as FunnelStepConfig[] | undefined) ?? []
     // 7 days is the same default we expose in the picker; if for some reason
     // a view persisted without one (older drafts, manual SQL edits), we fall
@@ -471,7 +439,7 @@ export class PosthogViewsService {
       return { steps: [] }
     }
 
-    return fetchPosthogFunnel(ph, steps, window, from, to, this.logger, tzLit)
+    return fetchPosthogFunnel(client, steps, window, from, to, this.logger, tzLit)
   }
 
   /**
@@ -498,7 +466,7 @@ export class PosthogViewsService {
       `fetchRetention (posthog)  connectionId=${connectionId}  viewId=${viewId}  dateTo=${to}  tz=${tzLit}`,
     )
 
-    const { config, ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
+    const { config, client } = await this.loadViewAndCreds(connectionId, viewId, userId)
     const retentionConfig: RetentionConfig = {
       startEvent: (config.startEvent as string | undefined) ?? '$pageview',
       returnEvent: (config.returnEvent as string | undefined) ?? '$pageview',
@@ -507,7 +475,7 @@ export class PosthogViewsService {
       retentionPeriods: (config.retentionPeriods as number | undefined) ?? 7,
     }
 
-    return fetchPosthogRetention(ph, retentionConfig, to, this.logger, tzLit)
+    return fetchPosthogRetention(client, retentionConfig, to, this.logger, tzLit)
   }
 
   /**
@@ -528,8 +496,8 @@ export class PosthogViewsService {
       `fetchUsers (posthog)  connectionId=${connectionId}  viewId=${viewId}  ${from}→${to}  tz=${tzLit}`,
     )
 
-    const { ph } = await this.loadViewAndCreds(connectionId, viewId, userId)
-    const users = await fetchPosthogUsersList(ph, from, to, 500, this.logger, tzLit)
+    const { client } = await this.loadViewAndCreds(connectionId, viewId, userId)
+    const users = await fetchPosthogUsersList(client, from, to, 500, this.logger, tzLit)
     return { users }
   }
 }

@@ -5,11 +5,11 @@ import {
   NotFoundException,
 } from '@nestjs/common'
 import { createHash, randomBytes } from 'crypto'
-import { SupabaseService } from '../supabase/supabase.service'
 import { PosthogCredentialsService } from '../posthog/connection/credentials'
 import { StripeBackfillService } from '../stripe/sync/backfill.service'
 import { encryptForUser } from '../common/crypto/encryption'
 import { validateMcpConnection } from '../mcp/mcp-validate'
+import { ConnectionsRepository } from './connections.repository'
 
 export interface CreateConnectionDto {
   name: string
@@ -40,18 +40,13 @@ export class ConnectionsService {
   private readonly logger = new Logger(ConnectionsService.name)
 
   constructor(
-    private readonly supabaseService: SupabaseService,
+    private readonly connectionsRepository: ConnectionsRepository,
     private readonly posthogCredentialsService: PosthogCredentialsService,
     private readonly stripeBackfillService: StripeBackfillService,
   ) {}
 
   async getConnections(userId: string) {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('connections')
-      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name), connections_vercel(project_name), connections_mcp(server_url, auth_type)')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: true })
+    const { data, error } = await this.connectionsRepository.findByUserIdWithJoins(userId)
 
     if (error) {
       this.logger.warn(`getConnections failed for user ${userId}: ${error.message}`)
@@ -61,33 +56,24 @@ export class ConnectionsService {
   }
 
   async getConnectionById(connectionId: string, userId: string) {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('connections')
-      .select('*, connections_webhook(webhook_id), connections_google_analytics(property_id, property_name), connections_vercel(project_name), connections_mcp(server_url, auth_type)')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .single()
+    const { data, error } = await this.connectionsRepository.findByIdWithJoins(
+      connectionId,
+      userId,
+    )
 
     if (error || !data) throw new NotFoundException('Connection not found')
     return this.toCamel(data)
   }
 
   async createConnection(dto: CreateConnectionDto, userId: string) {
-    const client = this.supabaseService.getClient()
-
     // 1. Insert base connection record
     // project_id: null ⇒ "Common" (shared across all projects).
-    const { data, error } = await client
-      .from('connections')
-      .insert({
-        name: dto.name,
-        type: dto.type,
-        user_id: userId,
-        project_id: dto.projectId ?? null,
-      })
-      .select()
-      .single()
+    const { data, error } = await this.connectionsRepository.insert({
+      name: dto.name,
+      type: dto.type,
+      user_id: userId,
+      project_id: dto.projectId ?? null,
+    })
 
     if (error) {
       this.logger.warn(
@@ -98,7 +84,7 @@ export class ConnectionsService {
 
     // 2. Insert type-specific config table
     if (dto.config || dto.type === 'webhook') {
-      await this.insertTypeConfig(dto.type, data.id, dto.config ?? {}, client, userId)
+      await this.insertTypeConfig(dto.type, data.id as string, dto.config ?? {}, userId)
     }
 
     // Re-fetch with join so webhookId is included in the response
@@ -106,14 +92,11 @@ export class ConnectionsService {
   }
 
   async updateConnection(connectionId: string, dto: UpdateConnectionDto, userId: string) {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('connections')
-      .update({ name: dto.name })
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .select()
-      .single()
+    const { data, error } = await this.connectionsRepository.updateName(
+      connectionId,
+      userId,
+      dto.name!,
+    )
 
     if (error || !data) throw new NotFoundException('Connection not found')
     return this.toCamel(data)
@@ -125,14 +108,11 @@ export class ConnectionsService {
     userId: string,
   ) {
     // projectId === null ⇒ move to "Common" (shared across projects).
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('connections')
-      .update({ project_id: dto.projectId })
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .select()
-      .single()
+    const { data, error } = await this.connectionsRepository.updateProjectId(
+      connectionId,
+      userId,
+      dto.projectId,
+    )
 
     if (error || !data) throw new NotFoundException('Connection not found')
     // Re-fetch with joins so the full shape (webhookId, gaPropertyName, …) is
@@ -141,12 +121,7 @@ export class ConnectionsService {
   }
 
   async deleteConnection(connectionId: string, userId: string) {
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('connections')
-      .delete()
-      .eq('id', connectionId)
-      .eq('user_id', userId)
+    const { error } = await this.connectionsRepository.delete(connectionId, userId)
 
     if (error) {
       this.logger.warn(
@@ -168,12 +143,12 @@ export class ConnectionsService {
     const keyHash = createHash('sha256').update(rawKey).digest('hex')
     const keyPrefix = rawKey.slice(0, 12)
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('connections_webhook_keys')
-      .insert({ connection_id: connectionId, name, key_hash: keyHash, key_prefix: keyPrefix })
-      .select()
-      .single()
+    const { data, error } = await this.connectionsRepository.insertWebhookKey({
+      connection_id: connectionId,
+      name,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+    })
 
     if (error) {
       this.logger.warn(
@@ -194,12 +169,8 @@ export class ConnectionsService {
   async getWebhookKeys(connectionId: string, userId: string) {
     await this.getConnectionById(connectionId, userId)
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('connections_webhook_keys')
-      .select('id, name, key_prefix, revoked_at, created_at')
-      .eq('connection_id', connectionId)
-      .order('created_at', { ascending: true })
+    const { data, error } =
+      await this.connectionsRepository.findWebhookKeysByConnectionId(connectionId)
 
     if (error) {
       this.logger.warn(
@@ -219,12 +190,11 @@ export class ConnectionsService {
   async revokeWebhookKey(connectionId: string, keyId: string, userId: string) {
     await this.getConnectionById(connectionId, userId)
 
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('connections_webhook_keys')
-      .update({ revoked_at: new Date().toISOString() })
-      .eq('id', keyId)
-      .eq('connection_id', connectionId)
+    const { error } = await this.connectionsRepository.revokeWebhookKey(
+      connectionId,
+      keyId,
+      new Date().toISOString(),
+    )
 
     if (error) {
       this.logger.warn(
@@ -238,17 +208,16 @@ export class ConnectionsService {
     type: string,
     connectionId: string,
     config: Record<string, unknown>,
-    client: ReturnType<SupabaseService['getClient']>,
     userId: string,
   ) {
     if (type === 'posthog') {
       // Encrypt the api_key with the per-user envelope before write.
       // See `common/crypto/encryption.ts` for the algorithm rationale.
-      const { error } = await client.from('connections_posthog').insert({
+      const { error } = await this.connectionsRepository.insertPosthog({
         connection_id: connectionId,
         api_key: encryptForUser(config.apiKey as string, userId),
         project_id: config.projectId,
-        host: config.host ?? 'https://app.posthog.com',
+        host: (config.host as string | undefined) ?? 'https://app.posthog.com',
       })
       if (error) {
         this.logger.warn(
@@ -257,9 +226,7 @@ export class ConnectionsService {
         throw new Error(error.message)
       }
     } else if (type === 'webhook') {
-      const { error } = await client.from('connections_webhook').insert({
-        connection_id: connectionId,
-      })
+      const { error } = await this.connectionsRepository.insertWebhook(connectionId)
       if (error) {
         this.logger.warn(
           `insertTypeConfig (webhook) failed (connection=${connectionId}): ${error.message}`,
@@ -335,7 +302,7 @@ export class ConnectionsService {
       // so the parent row must exist first — otherwise the insert below
       // explodes with `connections_stripe_manual_stripe_account_id_fkey`.
       // The upsert is awaited; the backfill itself is kicked AFTER the
-      // credential row is in place so `makeStripeGetterForAccount` can
+      // credential row is in place so `createStripeApiClientForAccount` can
       // find credentials when it runs.
       await this.stripeBackfillService.upsertAccountRow(accountRow)
 
@@ -343,7 +310,7 @@ export class ConnectionsService {
       // `apiKey` was just used above to validate against /v1/account
       // and resolve the account row, so we know it's good before
       // committing the encrypted form.
-      const { error } = await client.from('connections_stripe_manual').insert({
+      const { error } = await this.connectionsRepository.insertStripeManual({
         connection_id: connectionId,
         api_key: encryptForUser(apiKey, userId),
         stripe_account_id: accountRow.id,
@@ -367,7 +334,7 @@ export class ConnectionsService {
       // Credentials are inserted directly by CalendlyService.handleOAuthCallback — no-op here
     } else if (type === 'vercel') {
       // Encrypt the api_token with the per-user envelope before write.
-      const { error } = await client.from('connections_vercel').insert({
+      const { error } = await this.connectionsRepository.insertVercel({
         connection_id: connectionId,
         api_token: encryptForUser(config.apiToken as string, userId),
         project_id: config.projectId,
@@ -438,7 +405,7 @@ export class ConnectionsService {
         throw new BadRequestException(message)
       }
 
-      const { error } = await client.from('connections_mcp').insert({
+      const { error } = await this.connectionsRepository.insertMcp({
         connection_id: connectionId,
         server_url: serverUrl,
         auth_type: authType,

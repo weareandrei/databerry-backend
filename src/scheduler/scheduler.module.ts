@@ -1,9 +1,12 @@
 import { Module } from '@nestjs/common'
-import { SupabaseModule } from '../supabase/supabase.module'
+import { ViewsRepository } from '../views/views.repository'
+import { PosthogConnectionModule } from '../posthog/connection/connection.module'
+import { ConnectionsRepositoriesModule } from '../connections/connections-repositories.module'
+import { StripeRepositoriesModule } from '../stripe/stripe-repositories.module'
 import { SchedulerService } from './scheduler.service'
 
 @Module({
-  imports: [SupabaseModule],
-  providers: [SchedulerService],
+  imports: [PosthogConnectionModule, ConnectionsRepositoriesModule, StripeRepositoriesModule],
+  providers: [ViewsRepository, SchedulerService],
 })
 export class SchedulerModule {}

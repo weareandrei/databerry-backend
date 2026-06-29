@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common'
+import { ConnectionsModule } from '../connections/connections.module'
 import { McpService } from './mcp.service'
 import { McpToolsCacheService } from './mcp-tools-cache.service'
 
@@ -15,11 +16,9 @@ import { McpToolsCacheService } from './mcp-tools-cache.service'
  * connection validation helper (`mcp-validate.ts`) is a pure
  * function used directly by `ConnectionsService` — it doesn't need
  * to participate in DI, so it isn't a provider here.
- *
- * `SupabaseService` is globally available (SupabaseModule is
- * `@Global()`), so no explicit imports.
  */
 @Module({
+  imports: [ConnectionsModule],
   providers: [McpService, McpToolsCacheService],
   exports: [McpService, McpToolsCacheService],
 })

@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common'
-import { SupabaseModule } from '../../supabase/supabase.module'
+import { ConnectionsRepositoriesModule } from '../../connections/connections-repositories.module'
+import { StripeRepositoriesModule } from '../stripe-repositories.module'
 import { StripeBackfillService } from './backfill.service'
 import { StripeLiveSyncService } from './live-sync.service'
 import { StripeReconcileService } from './reconcile.service'
@@ -18,7 +19,7 @@ import { StripeSyncController } from './sync.controller'
  * above, all composed on top of `ensureSyncedThrough`.
  */
 @Module({
-  imports: [SupabaseModule],
+  imports: [StripeRepositoriesModule, ConnectionsRepositoriesModule],
   controllers: [StripeSyncController],
   providers: [
     StripeBackfillService,

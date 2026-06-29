@@ -1,5 +1,6 @@
-import { fetchChargesSince } from '../stripe-api.helpers'
-import type { StripeGetter, ChartPoint } from '../stripe-api.helpers'
+import { fetchChargesSince } from '../../stripe-api.client'
+import type { StripeApiClient } from '../../stripe-api.client'
+import type { ChartPoint } from '../stripe-api.helpers'
 import { dateStrInTz, hourInTz, hourlyBucketCount } from '../../../common/tz'
 
 const fmtHour = (h: number) => {
@@ -25,7 +26,7 @@ const fmtHour = (h: number) => {
  * truncation bug by copy-pasting.
  */
 export async function computeHourlyGross(
-  get: StripeGetter,
+  client: StripeApiClient,
   dateStr?: string,
   tz: string = 'UTC',
 ): Promise<ChartPoint[]> {
@@ -36,7 +37,7 @@ export async function computeHourlyGross(
   const dayEnd = dayStart + 86_400
   const isToday = resolvedDateStr === todayStr
 
-  const charges = await fetchChargesSince(get, dayStart, dayEnd)
+  const charges = await fetchChargesSince(client, dayStart, dayEnd)
 
   const hoursInBucket = isToday ? hourlyBucketCount(resolvedDateStr, tz, now) : 24
   const buckets: number[] = new Array(hoursInBucket).fill(0)
@@ -53,6 +54,9 @@ export async function computeHourlyGross(
 /**
  * stripe_gross_today — back-compat wrapper: hourly chart for today in `tz`.
  */
-export async function computeGrossToday(get: StripeGetter, tz: string = 'UTC'): Promise<ChartPoint[]> {
-  return computeHourlyGross(get, undefined, tz)
+export async function computeGrossToday(
+  client: StripeApiClient,
+  tz: string = 'UTC',
+): Promise<ChartPoint[]> {
+  return computeHourlyGross(client, undefined, tz)
 }

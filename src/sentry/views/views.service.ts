@@ -1,11 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { SentryOAuthService } from '../connection/oauth'
 import {
-  fetchIssuesList,
+  SentryApiClient,
   type SentryIssue,
   type IssuesPeriod,
   type IssuesSort,
-} from './live/issues-list'
+} from '../sentry-api.client'
 
 @Injectable()
 export class SentryViewsService {
@@ -36,6 +36,6 @@ export class SentryViewsService {
     const token = await this.oauthService.ensureFreshToken(connectionId)
     const orgSlug = await this.oauthService.getOrgSlug(connectionId)
 
-    return fetchIssuesList(token, connectionId, orgSlug, this.logger, period, sort)
+    return new SentryApiClient(token, connectionId).listIssues(orgSlug, period, sort)
   }
 }

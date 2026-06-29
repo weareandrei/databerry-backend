@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common'
-import { SupabaseService } from '../supabase/supabase.service'
+import { AccountsRepository } from './accounts.repository'
 
 /** Length of the free trial granted on first dashboard open. */
 const TRIAL_DAYS = 7
@@ -41,19 +41,10 @@ export interface Account {
 
 @Injectable()
 export class AccountsService {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(private readonly accountsRepository: AccountsRepository) {}
 
   async getOrCreateAccount(userId: string): Promise<Account> {
-    const client = this.supabaseService.getClient()
-
-    // Upsert — safe to call on every request, trigger handles signup but this
-    // acts as a fallback for users who existed before the trigger was added.
-    const { data, error } = await client
-      .from('accounts')
-      .upsert({ user_id: userId }, { onConflict: 'user_id' })
-      .select()
-      .single()
-
+    const { data, error } = await this.accountsRepository.upsertByUserId(userId)
     if (error) throw new Error(error.message)
     return this.toCamel(data)
   }
@@ -66,17 +57,9 @@ export class AccountsService {
    * zero rows.
    */
   async markOnboardingComplete(userId: string): Promise<Account> {
-    // Ensure the row exists (idempotent upsert), then set the flag.
     await this.getOrCreateAccount(userId)
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('accounts')
-      .update({ onboarding_complete: true })
-      .eq('user_id', userId)
-      .select()
-      .single()
-
+    const { data, error } = await this.accountsRepository.markOnboardingComplete(userId)
     if (error) throw new Error(error.message)
     return this.toCamel(data)
   }
@@ -109,20 +92,13 @@ export class AccountsService {
     const startedAt = new Date()
     const endsAt = new Date(startedAt.getTime() + TRIAL_DAYS * 24 * 60 * 60 * 1000)
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('accounts')
-      .update({
-        trial_started_at: startedAt.toISOString(),
-        trial_ends_at: endsAt.toISOString(),
-      })
-      .eq('user_id', userId)
-      .is('trial_started_at', null)
-      .select()
+    const { data, error } = await this.accountsRepository.startTrialIfUnset(
+      userId,
+      startedAt.toISOString(),
+      endsAt.toISOString(),
+    )
 
     if (error) throw new Error(error.message)
-    // 0 rows updated → another request won the race between our read
-    // and our update. Re-read for the winner's timestamps.
     if (!data || data.length === 0) return this.getOrCreateAccount(userId)
     return this.toCamel(data[0])
   }
@@ -131,10 +107,6 @@ export class AccountsService {
     const planId = (row.plan_id as string) ?? 'free'
     const trialEndsAt = (row.trial_ends_at as string | null) ?? null
 
-    // Effective plan: paid plan wins outright; otherwise an unexpired
-    // trial upgrades 'free' to 'starter'. Computed at read time (not
-    // stored) so expiry needs no cron — the moment `now` passes
-    // `trial_ends_at`, every subsequent read reports 'free' again.
     let effectivePlanId = planId
     if (planId === 'free' && trialEndsAt !== null) {
       const ends = Date.parse(trialEndsAt)
@@ -146,8 +118,6 @@ export class AccountsService {
       userId: row.user_id as string,
       planId,
       effectivePlanId,
-      // `=== true` so a missing column (migration not yet run) reads
-      // as FALSE for fresh rows but doesn't crash the mapper.
       onboardingComplete: row.onboarding_complete === true,
       trialStartedAt: (row.trial_started_at as string | null) ?? null,
       trialEndsAt,

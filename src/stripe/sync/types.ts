@@ -1,7 +1,7 @@
 // Stripe API row shapes we use during backfill / webhook handling. We keep
 // these locally typed (vs. importing the full `Stripe.Charge` from the
 // official SDK) because:
-//  - `makeStripeGetter` returns plain JSON, no SDK objects;
+//  - `StripeApiClient.get` returns plain JSON, no SDK objects;
 //  - we only persist a handful of fields, so a narrow shape avoids drift if
 //    Stripe adds new optional properties we don't care about.
 

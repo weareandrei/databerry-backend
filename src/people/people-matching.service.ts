@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common'
-import { SupabaseService } from '../supabase/supabase.service'
+import { PeopleRepository } from './people.repository'
 
 /**
  * A single identity signal observed about a person from one
@@ -65,7 +65,7 @@ export interface ObservedPerson {
 export class PeopleMatchingService {
   private readonly logger = new Logger(PeopleMatchingService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(private readonly peopleRepository: PeopleRepository) {}
 
   /**
    * Resolve an observed person to a canonical `people` row,
@@ -162,13 +162,11 @@ export class PeopleMatchingService {
       )
       .join(',')
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('people_identifiers')
-      .select('person_id')
-      .eq('user_id', userId)
-      .eq('project_id', projectId)
-      .or(orClause)
+    const { data, error } = await this.peopleRepository.findMatchingPersonIds(
+      userId,
+      projectId,
+      orClause,
+    )
 
     if (error) throw new Error(error.message)
     const ids = new Set<string>()
@@ -181,20 +179,15 @@ export class PeopleMatchingService {
     projectId: string,
     observed: ObservedPerson,
   ): Promise<string> {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('people')
-      .insert({
-        project_id: projectId,
-        user_id: userId,
-        display_name: observed.displayName ?? null,
-        primary_email: observed.email ? observed.email.trim().toLowerCase() : null,
-        country: observed.country ?? null,
-        initial_source: observed.initialSource ?? null,
-        last_seen_at: observed.lastSeenAt ?? null,
-      })
-      .select('id')
-      .single()
+    const { data, error } = await this.peopleRepository.insert({
+      project_id: projectId,
+      user_id: userId,
+      display_name: observed.displayName ?? null,
+      primary_email: observed.email ? observed.email.trim().toLowerCase() : null,
+      country: observed.country ?? null,
+      initial_source: observed.initialSource ?? null,
+      last_seen_at: observed.lastSeenAt ?? null,
+    })
 
     if (error) throw new Error(error.message)
     return (data as { id: string }).id
@@ -211,15 +204,10 @@ export class PeopleMatchingService {
    * can and the UNIQUE constraint absorbs the rest.
    */
   private async mergePeople(userId: string, personIds: string[]): Promise<string> {
-    const client = this.supabaseService.getClient()
-
-    // Resolve survivor = oldest.
-    const { data: rows, error } = await client
-      .from('people')
-      .select('id, created_at')
-      .eq('user_id', userId)
-      .in('id', personIds)
-      .order('created_at', { ascending: true })
+    const { data: rows, error } = await this.peopleRepository.findIdsForMerge(
+      userId,
+      personIds,
+    )
     if (error) throw new Error(error.message)
     if (!rows || rows.length === 0) throw new Error('mergePeople: no people found')
 
@@ -234,41 +222,36 @@ export class PeopleMatchingService {
     // Re-point events first (no UNIQUE collision risk — events keep
     // their own idempotency key). Then identifiers, tolerating the
     // rare pre-existing collision by deleting the loser's dup.
-    const { error: evErr } = await client
-      .from('people_events')
-      .update({ person_id: survivor })
-      .eq('user_id', userId)
-      .in('person_id', losers)
+    const { error: evErr } = await this.peopleRepository.updateEventPersonIdForLosers(
+      userId,
+      survivor,
+      losers,
+    )
     if (evErr) throw new Error(evErr.message)
 
     // Move identifiers. On UNIQUE conflict (survivor already has it)
     // the update would fail the whole statement, so we move per-row
     // and swallow conflicts by deleting the loser copy.
-    const { data: loserIds, error: liErr } = await client
-      .from('people_identifiers')
-      .select('id, source, external_id')
-      .eq('user_id', userId)
-      .in('person_id', losers)
+    const { data: loserIds, error: liErr } = await this.peopleRepository.findIdentifiersByPersonIds(
+      userId,
+      losers,
+    )
     if (liErr) throw new Error(liErr.message)
 
     for (const row of loserIds ?? []) {
       const r = row as { id: string; source: string; external_id: string }
-      const { error: upErr } = await client
-        .from('people_identifiers')
-        .update({ person_id: survivor })
-        .eq('id', r.id)
+      const { error: upErr } = await this.peopleRepository.updateIdentifierPersonId(
+        r.id,
+        survivor,
+      )
       if (upErr) {
         // Survivor already owns this identifier → drop the duplicate.
-        await client.from('people_identifiers').delete().eq('id', r.id)
+        await this.peopleRepository.deleteIdentifierById(r.id)
       }
     }
 
     // Delete the now-empty loser person rows.
-    const { error: delErr } = await client
-      .from('people')
-      .delete()
-      .eq('user_id', userId)
-      .in('id', losers)
+    const { error: delErr } = await this.peopleRepository.deleteByIds(userId, losers)
     if (delErr) throw new Error(delErr.message)
 
     return survivor
@@ -299,13 +282,7 @@ export class PeopleMatchingService {
       last_seen_at: nowIso,
     }))
 
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('people_identifiers')
-      .upsert(rows, {
-        onConflict: 'project_id,source,external_id',
-        ignoreDuplicates: false,
-      })
+    const { error } = await this.peopleRepository.upsertIdentifiers(rows)
     if (error) throw new Error(error.message)
   }
 
@@ -329,13 +306,10 @@ export class PeopleMatchingService {
     const lastSeenAt = observed.lastSeenAt ?? null
     if (!email && !name && !country && !initialSource && !lastSeenAt) return
 
-    const { data: current, error } = await this.supabaseService
-      .getClient()
-      .from('people')
-      .select('primary_email, display_name, country, initial_source, last_seen_at')
-      .eq('user_id', userId)
-      .eq('id', personId)
-      .maybeSingle()
+    const { data: current, error } = await this.peopleRepository.findEnrichmentFields(
+      userId,
+      personId,
+    )
     if (error) throw new Error(error.message)
     if (!current) return
 
@@ -364,12 +338,7 @@ export class PeopleMatchingService {
     }
     if (Object.keys(patch).length === 0) return
 
-    const { error: upErr } = await this.supabaseService
-      .getClient()
-      .from('people')
-      .update(patch)
-      .eq('user_id', userId)
-      .eq('id', personId)
+    const { error: upErr } = await this.peopleRepository.update(userId, personId, patch)
     if (upErr) throw new Error(upErr.message)
   }
 

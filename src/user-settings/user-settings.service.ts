@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common'
-import { SupabaseService } from '../supabase/supabase.service'
 import { safeTzLiteral } from '../common/tz'
+import { UserSettingsRepository } from './user-settings.repository'
 
 export interface UpdateUserSettingsDto {
   preferredTrafficConnectionId?: string | null
@@ -29,20 +29,13 @@ export interface UserSettings {
 export class UserSettingsService {
   private readonly logger = new Logger(UserSettingsService.name)
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(private readonly userSettingsRepository: UserSettingsRepository) {}
 
   async get(userId: string): Promise<UserSettings> {
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('user_settings')
-      .select('*')
-      .eq('user_id', userId)
-      .maybeSingle()
-
+    const { data, error } = await this.userSettingsRepository.findByUserId(userId)
     if (error) throw new Error(error.message)
 
     if (!data) {
-      // Return a defaults object without persisting — first write creates the row.
       return {
         userId,
         preferredTrafficConnectionId: null,
@@ -61,20 +54,11 @@ export class UserSettingsService {
     if (dto.preferredTrafficConnectionId !== undefined)
       patch.preferred_traffic_connection_id = dto.preferredTrafficConnectionId
     if (dto.timezone !== undefined) {
-      // Sanitize at the boundary. `null` is allowed (clears the field);
-      // anything else gets the safeTzLiteral pass — bogus input collapses
-      // to 'UTC' rather than persisting unsafe data.
       patch.timezone =
         dto.timezone === null ? null : safeTzLiteral(dto.timezone)
     }
 
-    const { data, error } = await this.supabaseService
-      .getClient()
-      .from('user_settings')
-      .upsert(patch, { onConflict: 'user_id' })
-      .select()
-      .single()
-
+    const { data, error } = await this.userSettingsRepository.upsert(patch)
     if (error) throw new Error(error.message)
     this.logger.log(`  ✓ user_settings upserted for ${userId}`)
     return this.toCamel(data)

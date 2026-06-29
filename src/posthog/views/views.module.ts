@@ -1,12 +1,17 @@
 import { Module } from '@nestjs/common'
+import { ConnectionsRepositoriesModule } from '../../connections/connections-repositories.module'
+import { ViewsRepository } from '../../views/views.repository'
+import { PosthogConnectionModule } from '../connection/connection.module'
 import { PosthogViewsController } from './views.controller'
 import { PosthogViewsService } from './views.service'
-import { SupabaseModule } from '../../supabase/supabase.module'
 
+// `ConnectionsRepositoriesModule` (not full `ConnectionsModule`) avoids the
+// `ConnectionsModule` → `PosthogModule` → `PosthogViewsModule` cycle;
+// `PosthogViewsService` only needs `ConnectionsRepository`.
 @Module({
-  imports: [SupabaseModule],
+  imports: [ConnectionsRepositoriesModule, PosthogConnectionModule],
   controllers: [PosthogViewsController],
-  providers: [PosthogViewsService],
+  providers: [ViewsRepository, PosthogViewsService],
   exports: [PosthogViewsService],
 })
 export class PosthogViewsModule {}

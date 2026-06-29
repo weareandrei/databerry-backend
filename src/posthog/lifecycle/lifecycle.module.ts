@@ -1,9 +1,9 @@
 import { Module } from '@nestjs/common'
 import { PosthogLifecycleService } from './hog-function'
-import { SupabaseModule } from '../../supabase/supabase.module'
+import { PosthogConnectionModule } from '../connection/connection.module'
 
 @Module({
-  imports: [SupabaseModule],
+  imports: [PosthogConnectionModule],
   providers: [PosthogLifecycleService],
   exports: [PosthogLifecycleService],
 })

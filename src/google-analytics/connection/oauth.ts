@@ -1,6 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { randomBytes } from 'crypto'
-import { SupabaseService } from '../../supabase/supabase.service'
+import { ConnectionsRepository } from '../../connections/connections.repository'
 import {
   ConnectionMissingException,
   IntegrationReauthRequiredException,
@@ -18,15 +18,15 @@ import {
   fmtUpstreamFailure,
   type LogContext,
 } from '../../common/log-helpers'
+import { GoogleAnalyticsRepository } from './google-analytics.repository'
+import {
+  GoogleAnalyticsAdminClient,
+  type GAProperty,
+} from '../google-analytics-admin.client'
+import { GoogleOAuthClient, GoogleOAuthHttpError } from '../google-oauth.client'
 
-export interface GAProperty {
-  id: string
-  name: string
-  displayName: string
-}
+export type { GAProperty }
 
-const ADMIN_BASE = 'https://analyticsadmin.googleapis.com/v1beta'
-const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
 
 @Injectable()
@@ -37,14 +37,14 @@ export class GoogleAnalyticsOAuthService {
   readonly clientSecret = process.env.GA_CLIENT_SECRET!
   readonly frontendUrl = getPrimaryFrontendUrl()
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly connectionsRepository: ConnectionsRepository,
+    private readonly gaRepository: GoogleAnalyticsRepository,
+  ) {}
 
   async getOAuthUrl(userId: string, redirectUri: string): Promise<string> {
     const state = randomBytes(16).toString('hex')
-    await this.supabaseService
-      .getClient()
-      .from('google_analytics_oauth_state')
-      .insert({ state, user_id: userId })
+    await this.gaRepository.insertOAuthState({ state, user_id: userId })
 
     const url = new URL(AUTH_URL)
     url.searchParams.set('client_id', this.clientId)
@@ -58,8 +58,6 @@ export class GoogleAnalyticsOAuthService {
   }
 
   async handleOAuthCallback(code: string, state: string, redirectUri: string): Promise<string> {
-    const client = this.supabaseService.getClient()
-
     // Tiny helper so each failure path stays a one-liner. Reason
     // codes match `OAuthFailureReason` from
     // `stripe/connection/oauth.ts`. Note we keep the existing
@@ -70,11 +68,7 @@ export class GoogleAnalyticsOAuthService {
     const errorRedirect = (reason: string) =>
       `${this.frontendUrl}/hub/connections?google_analytics=error&reason=${reason}`
 
-    const { data: stateRow } = await client
-      .from('google_analytics_oauth_state')
-      .select('*')
-      .eq('state', state)
-      .maybeSingle()
+    const { data: stateRow } = await this.gaRepository.findOAuthStateByState(state)
 
     if (!stateRow) {
       this.logger.warn(`GA OAuth state not found (state=${state})`)
@@ -84,46 +78,43 @@ export class GoogleAnalyticsOAuthService {
     const userId = stateRow.user_id as string
 
     try {
-      const tokenRes = await fetch(TOKEN_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          code,
-          client_id: this.clientId,
-          client_secret: this.clientSecret,
-          redirect_uri: redirectUri,
-          grant_type: 'authorization_code',
-        }),
-      })
-      if (!tokenRes.ok) {
-        const body = await tokenRes.text().catch(() => '')
-        this.logger.error(
-          fmtUpstreamFailure('GA token exchange', tokenRes.status, body, { userId }),
-        )
+      const oauthClient = new GoogleOAuthClient(this.clientId, this.clientSecret)
+      let tokens: { access_token: string; refresh_token?: string; expires_in: number }
+      try {
+        tokens = await oauthClient.exchangeAuthorizationCode(code, redirectUri)
+      } catch (err) {
+        if (err instanceof GoogleOAuthHttpError) {
+          this.logger.error(
+            fmtUpstreamFailure('GA token exchange', err.status, err.body, { userId }),
+          )
+        } else {
+          this.logger.error(fmtFailure('GA token exchange', err, { userId }))
+        }
         return errorRedirect('token_exchange')
       }
 
-      const tokens = (await tokenRes.json()) as {
-        access_token: string
-        refresh_token: string
-        expires_in: number
+      if (!tokens.refresh_token) {
+        this.logger.error('GA token exchange missing refresh_token')
+        return errorRedirect('token_exchange')
       }
 
       const tokenExpiry = new Date(Date.now() + tokens.expires_in * 1000).toISOString()
 
       let properties: GAProperty[]
       try {
-        properties = await this.listPropertiesWithToken(tokens.access_token, { userId })
+        properties = await new GoogleAnalyticsAdminClient(tokens.access_token).listProperties({
+          userId,
+        })
       } catch (err) {
         this.logger.error(fmtFailure('GA listProperties (post-OAuth)', err, { userId }))
         return errorRedirect('account_resolve')
       }
 
-      const { data: conn, error: connErr } = await client
-        .from('connections')
-        .insert({ name: 'Google Analytics', type: 'google_analytics', user_id: userId })
-        .select()
-        .single()
+      const { data: conn, error: connErr } = await this.connectionsRepository.insert({
+        name: 'Google Analytics',
+        type: 'google_analytics',
+        user_id: userId,
+      })
 
       if (connErr) {
         this.logger.error(
@@ -138,7 +129,7 @@ export class GoogleAnalyticsOAuthService {
       // See `common/crypto/encryption.ts` for the algorithm rationale.
       // We have `userId` in scope from the OAuth state row, which is
       // exactly what the per-user key derivation needs.
-      const { error: credErr } = await client.from('connections_google_analytics').insert({
+      const { error: credErr } = await this.gaRepository.insert({
         connection_id: conn.id,
         access_token: encryptForUser(tokens.access_token, userId),
         refresh_token: encryptForUser(tokens.refresh_token, userId),
@@ -155,7 +146,7 @@ export class GoogleAnalyticsOAuthService {
           }),
         )
         // Roll back the parent row so we don't leave an orphan.
-        await client.from('connections').delete().eq('id', conn.id)
+        await this.connectionsRepository.deleteById(conn.id)
         return errorRedirect('credentials_save')
       }
 
@@ -177,24 +168,18 @@ export class GoogleAnalyticsOAuthService {
 
       return `${this.frontendUrl}/hub/connections?google_analytics=connected`
     } finally {
-      await client.from('google_analytics_oauth_state').delete().eq('state', state)
+      await this.gaRepository.deleteOAuthStateByState(state)
     }
   }
 
   async ensureFreshToken(connectionId: string): Promise<string> {
-    const client = this.supabaseService.getClient()
-
     // Pull the parent connection's `user_id` alongside the credentials
     // — the per-user encryption envelope needs the UUID to derive the
     // decryption key. The `connections!inner(user_id)` syntax is
     // PostgREST's "embed-via-FK" notation; the `inner` flavour means
     // we get null instead of an empty array if the FK is dangling
     // (which we already special-case as `!data` below).
-    const { data, error } = await client
-      .from('connections_google_analytics')
-      .select('access_token, refresh_token, token_expiry, connections!inner(user_id)')
-      .eq('connection_id', connectionId)
-      .maybeSingle()
+    const { data, error } = await this.gaRepository.findWithUserJoin(connectionId)
 
     // Distinguish three cases that previously all looked like "row missing":
     //   1. Supabase returned an actual error (missing column, network blip,
@@ -248,23 +233,29 @@ export class GoogleAnalyticsOAuthService {
     }
 
     this.logger.log(`Refreshing GA token for connection ${connectionId}`)
-    let res: Response
+    let tokens: { access_token: string; expires_in: number }
     try {
-      res = await fetch(TOKEN_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          grant_type: 'refresh_token',
-          refresh_token: refreshToken,
-          client_id: this.clientId,
-          client_secret: this.clientSecret,
-        }),
-      })
+      tokens = await new GoogleOAuthClient(this.clientId, this.clientSecret).refreshAccessToken(
+        refreshToken,
+      )
     } catch (err) {
-      // Network failure reaching Google. Don't mark the row as
-      // needs_reauth — the refresh token might be perfectly fine; we
-      // just couldn't ask. Surface as upstream so the user sees a
-      // transient-error UX, not a misleading "reconnect" prompt.
+      if (err instanceof GoogleOAuthHttpError) {
+        const detail = err.body
+        if (err.status >= 500) {
+          this.logger.warn(
+            `GA refresh upstream error (${err.status}) for ${connectionId}: ${detail.slice(0, 200)}`,
+          )
+          throw new IntegrationUpstreamException(
+            'google_analytics',
+            connectionId,
+            `Google token endpoint returned ${err.status}`,
+          )
+        }
+        this.logger.warn(
+          `GA refresh failed for connection ${connectionId} (${err.status}): ${detail.slice(0, 200)}`,
+        )
+        throw new IntegrationReauthRequiredException('google_analytics', connectionId)
+      }
       this.logger.warn(`GA refresh network error for ${connectionId}: ${String(err)}`)
       throw new IntegrationUpstreamException(
         'google_analytics',
@@ -272,53 +263,16 @@ export class GoogleAnalyticsOAuthService {
         'Could not reach Google token endpoint',
       )
     }
-
-    if (!res.ok) {
-      const detail = await res.text().catch(() => '')
-
-      // Google returns 5xx for its own outages — those are transient. 4xx
-      // (typically `invalid_grant`) is the canonical "this refresh token
-      // is dead" signal: revoked by the user, scope changed, or — most
-      // commonly for us — the GA OAuth app is in "Testing" status and
-      // Google nuked the refresh token after 7 days.
-      if (res.status >= 500) {
-        this.logger.warn(
-          `GA refresh upstream error (${res.status}) for ${connectionId}: ${detail.slice(0, 200)}`,
-        )
-        throw new IntegrationUpstreamException(
-          'google_analytics',
-          connectionId,
-          `Google token endpoint returned ${res.status}`,
-        )
-      }
-
-      this.logger.warn(
-        `GA refresh failed for connection ${connectionId} (${res.status}): ${detail.slice(0, 200)}`,
-      )
-      // Refresh token is dead. Surface the structured error so the
-      // frontend renders the "Reconnect" banner. We don't mark anything
-      // in the DB — every subsequent request will re-attempt the refresh
-      // and 4xx again, which costs ~200ms and a Google API call, but
-      // saves a column and a migration. At our scale that trade is fine;
-      // revisit if a single broken connection ever generates enough
-      // refresh churn to matter.
-      throw new IntegrationReauthRequiredException('google_analytics', connectionId)
-    }
-
-    const tokens = (await res.json()) as { access_token: string; expires_in: number }
     const newExpiry = new Date(Date.now() + tokens.expires_in * 1000).toISOString()
 
     // Re-encrypt the rotated access_token before write — Google's
     // refresh response only returns a new access_token (refresh_token
     // is re-used), so we only update the one column. `userId` is
     // already in scope from the join above.
-    await client
-      .from('connections_google_analytics')
-      .update({
-        access_token: encryptForUser(tokens.access_token, userId),
-        token_expiry: newExpiry,
-      })
-      .eq('connection_id', connectionId)
+    await this.gaRepository.updateTokens(connectionId, {
+      access_token: encryptForUser(tokens.access_token, userId),
+      token_expiry: newExpiry,
+    })
 
     this.logger.log(
       `✓ Refreshed GA token for ${connectionId} (expires_in=${tokens.expires_in}s, new_expiry=${newExpiry})`,
@@ -327,12 +281,7 @@ export class GoogleAnalyticsOAuthService {
   }
 
   async getPropertyId(connectionId: string): Promise<string> {
-    const { data } = await this.supabaseService
-      .getClient()
-      .from('connections_google_analytics')
-      .select('property_id')
-      .eq('connection_id', connectionId)
-      .maybeSingle()
+    const { data } = await this.gaRepository.findPropertyId(connectionId)
 
     if (!data?.property_id) {
       throw new NotFoundException(
@@ -343,13 +292,10 @@ export class GoogleAnalyticsOAuthService {
   }
 
   async verifyOwnership(connectionId: string, userId: string): Promise<void> {
-    const { data } = await this.supabaseService
-      .getClient()
-      .from('connections')
-      .select('id')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .maybeSingle()
+    const { data } = await this.connectionsRepository.findIdByConnectionAndUser(
+      connectionId,
+      userId,
+    )
 
     // 410 (not 404) so the per-view live-value tile can render the inline
     // "Reconnect" → reassign-connection-dialog flow instead of a generic
@@ -358,71 +304,7 @@ export class GoogleAnalyticsOAuthService {
     if (!data) throw new ConnectionMissingException('google_analytics', connectionId)
   }
 
-  /**
-   * Lists every GA4 property the bearer token has access to.
-   * `ctx` is logging-only — pass whatever identifiers the caller
-   * has (typically `{ userId, connectionId }`) so failures aren't
-   * orphaned. The function never throws: any failure logs and
-   * returns the partial results collected so far (or `[]`).
-   */
-  async listPropertiesWithToken(
-    token: string,
-    ctx: LogContext = {},
-  ): Promise<GAProperty[]> {
-    const all: GAProperty[] = []
-    try {
-      const accRes = await fetch(`${ADMIN_BASE}/accounts`, {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      if (!accRes.ok) {
-        const body = await accRes.text().catch(() => '')
-        this.logger.warn(
-          fmtUpstreamFailure('list GA accounts', accRes.status, body, ctx),
-        )
-        // Special-case the "Admin API not enabled in this Cloud
-        // project" 403 — Google's error body has a stable
-        // `reason: SERVICE_DISABLED` + an `activationUrl`. Surface
-        // a one-line actionable hint so a user reading Railway
-        // logs doesn't have to parse the JSON to know the fix.
-        if (accRes.status === 403 && body.includes('SERVICE_DISABLED')) {
-          const activationUrl = body.match(/https:\/\/console\.developers\.google\.com\/apis\/api\/[^"\s]+/)?.[0]
-          this.logger.warn(
-            fmtOp('GA Admin API is disabled in the OAuth Cloud project', {
-              ...ctx,
-              ...(activationUrl ? { enableAt: activationUrl } : {}),
-            }),
-          )
-        }
-        return []
-      }
-      const accData = (await accRes.json()) as { accounts?: { name: string }[] }
-
-      for (const account of accData.accounts ?? []) {
-        const propRes = await fetch(
-          `${ADMIN_BASE}/properties?filter=ancestor:${account.name}&pageSize=200`,
-          { headers: { Authorization: `Bearer ${token}` } },
-        )
-        if (!propRes.ok) {
-          const body = await propRes.text().catch(() => '')
-          this.logger.warn(
-            fmtUpstreamFailure('list GA properties', propRes.status, body, {
-              ...ctx,
-              account: account.name,
-            }),
-          )
-          continue
-        }
-        const propData = (await propRes.json()) as {
-          properties?: { name: string; displayName: string }[]
-        }
-        for (const p of propData.properties ?? []) {
-          const id = p.name.split('/').pop()!
-          all.push({ id, name: p.name, displayName: p.displayName })
-        }
-      }
-    } catch (err) {
-      this.logger.error(fmtFailure('list GA properties', err, ctx))
-    }
-    return all
+  async listPropertiesWithToken(token: string, ctx: LogContext = {}): Promise<GAProperty[]> {
+    return new GoogleAnalyticsAdminClient(token).listProperties(ctx)
   }
 }

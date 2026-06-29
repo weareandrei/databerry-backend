@@ -40,7 +40,8 @@ stripe/
     views.module.ts
     views.controller.ts        ← GET /stripe/views/live-value, GET /stripe/views/chart-data
     views.service.ts           ← StripeViewsService
-    stripe-api.helpers.ts      ← getApiKey(), makeStripeGetter(), fetchChargesSince()
+    stripe-api.client.ts       ← StripeApiClient, sumCharges(), fetchChargesSince()
+    stripe-api.helpers.ts      ← getApiKey(), ChartPoint
     live/
       revenue-today.ts         ← computeRevenueToday()
       gross-today.ts           ← computeGrossToday()

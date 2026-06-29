@@ -2,8 +2,11 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { GoogleAnalyticsOAuthService } from '../connection/oauth'
 import { ViewsService } from '../../views/views.service'
 import { buildViewFetchContext } from '../../common/view-fetch-context'
-import { metricForViewType, fetchRealtimeActiveUsers, fetchTodayMetric } from './live/metrics'
-import { fetchMetricByBucket, type BucketGranularity } from './live/sources'
+import {
+  GoogleAnalyticsDataClient,
+  metricForViewType,
+  type BucketGranularity,
+} from '../google-analytics-data.client'
 import { hourlyBucketCount } from '../../common/tz'
 
 import type { ChartMode } from '../../common/types'
@@ -50,6 +53,7 @@ export class GoogleAnalyticsViewsService {
     await this.oauthService.verifyOwnership(connectionId, userId)
     const token = await this.oauthService.ensureFreshToken(connectionId)
     const propertyId = await this.oauthService.getPropertyId(connectionId)
+    const gaClient = new GoogleAnalyticsDataClient(token, connectionId)
 
     let value: string
 
@@ -60,7 +64,7 @@ export class GoogleAnalyticsViewsService {
         return { value: null, unavailable: true }
       }
       // Realtime is "right now" — no date range to align, no tz to thread.
-      value = await fetchRealtimeActiveUsers(token, connectionId, propertyId)
+      value = await gaClient.fetchRealtimeActiveUsers(propertyId)
     } else {
       // GA's runReport doesn't support a per-request `timeZone` — it
       // always evaluates `dateRanges` in the property's configured zone.
@@ -68,7 +72,7 @@ export class GoogleAnalyticsViewsService {
       // it on the floor here (project-overview's chart logs a warning
       // when GA's property tz disagrees with the user's tz).
       const metricName = metricForViewType(viewType)
-      value = await fetchTodayMetric(token, connectionId, propertyId, metricName, from, to)
+      value = await gaClient.fetchTodayMetric(propertyId, metricName, from, to)
     }
 
     // Only persist stored daily values for single-day queries.
@@ -121,14 +125,13 @@ export class GoogleAnalyticsViewsService {
     await this.oauthService.verifyOwnership(connectionId, userId)
     const token = await this.oauthService.ensureFreshToken(connectionId)
     const propertyId = await this.oauthService.getPropertyId(connectionId)
+    const gaClient = new GoogleAnalyticsDataClient(token, connectionId)
 
     const granularity: BucketGranularity =
       mode === 'daily' || (!mode && from === to) ? 'hourly' : 'daily'
 
     const metricName = metricForViewType(viewType)
-    const rows = await fetchMetricByBucket(
-      token,
-      connectionId,
+    const rows = await gaClient.fetchMetricByBucket(
       propertyId,
       metricName,
       from,

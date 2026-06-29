@@ -1,6 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { randomBytes } from 'crypto'
-import { SupabaseService } from '../../supabase/supabase.service'
+import { ConnectionsRepository } from '../../connections/connections.repository'
 import {
   ConnectionMissingException,
   IntegrationReauthRequiredException,
@@ -17,6 +17,8 @@ import {
   fmtOp,
   fmtUpstreamFailure,
 } from '../../common/log-helpers'
+import { SentryRepository } from './sentry.repository'
+import { SentryOAuthClient, SentryOAuthHttpError } from '../sentry-oauth.client'
 
 /**
  * Sentry's OAuth flow is shaped a bit differently from Calendly /
@@ -51,7 +53,6 @@ export class SentryOAuthService {
   readonly clientSecret = process.env.SENTRY_CLIENT_SECRET!
   readonly redirectUri = `${process.env.WEBHOOK_BASE_URL ?? 'http://localhost:3001'}/sentry/oauth/callback`
   readonly frontendUrl = getPrimaryFrontendUrl()
-  readonly baseApi = 'https://sentry.io/api/0'
   readonly authBase = 'https://sentry.io'
   // Sentry's integration slug — the lowercase-hyphenated identifier of
   // our Public Integration (e.g. `databerry`, not the long `client_id`
@@ -61,15 +62,19 @@ export class SentryOAuthService {
   // clear 404 from Sentry rather than a missing-env crash on startup.
   readonly slug = process.env.SENTRY_INTEGRATION_SLUG ?? process.env.SENTRY_CLIENT_ID!
 
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly connectionsRepository: ConnectionsRepository,
+    private readonly sentryRepository: SentryRepository,
+  ) {}
 
   async getOAuthUrl(userId: string, name?: string): Promise<string> {
     const state = randomBytes(16).toString('hex')
 
-    const { error } = await this.supabaseService
-      .getClient()
-      .from('sentry_oauth_state')
-      .insert({ state, user_id: userId, name: name ?? null })
+    const { error } = await this.sentryRepository.insertOAuthState({
+      state,
+      user_id: userId,
+      name: name ?? null,
+    })
 
     if (error) {
       this.logger.error(
@@ -101,16 +106,10 @@ export class SentryOAuthService {
     state: string,
     installationId: string,
   ): Promise<string> {
-    const client = this.supabaseService.getClient()
-
     const errorRedirect = (reason: string) =>
       `${this.frontendUrl}/hub/connections?sentry=error&reason=${reason}`
 
-    const { data: stateRow } = await client
-      .from('sentry_oauth_state')
-      .select('*')
-      .eq('state', state)
-      .maybeSingle()
+    const { data: stateRow } = await this.sentryRepository.findOAuthStateByState(state)
 
     if (!stateRow) {
       this.logger.warn(`Sentry OAuth state not found (state=${state})`)
@@ -121,91 +120,50 @@ export class SentryOAuthService {
     const connectionName = (stateRow.name as string | null) ?? 'Sentry'
 
     try {
-      // Step 4 — exchange code for tokens. Sentry's token endpoint
-      // lives under the installation, NOT under `/oauth/token` like
-      // most providers.
-      const tokenRes = await fetch(
-        `${this.baseApi}/sentry-app-installations/${installationId}/authorizations/`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            grant_type: 'authorization_code',
-            code,
-            client_id: this.clientId,
-            client_secret: this.clientSecret,
-          }),
-        },
-      )
-
-      if (!tokenRes.ok) {
-        const body = await tokenRes.text().catch(() => '')
-        this.logger.error(
-          fmtUpstreamFailure('Sentry token exchange', tokenRes.status, body, {
-            userId,
-            installationId,
-          }),
-        )
-        return errorRedirect('token_exchange')
-      }
-
-      const tokens = (await tokenRes.json()) as {
+      const oauthClient = new SentryOAuthClient(this.clientId, this.clientSecret)
+      let tokens: {
         token: string
         refreshToken: string
-        // Sentry returns `expires_at` as ISO timestamp (NOT
-        // `expires_in` seconds like most providers).
         expires_at?: string
         expiresAt?: string
       }
+      try {
+        tokens = await oauthClient.exchangeAuthorizationCode(installationId, code)
+      } catch (err) {
+        if (err instanceof SentryOAuthHttpError) {
+          this.logger.error(
+            fmtUpstreamFailure('Sentry token exchange', err.status, err.body, {
+              userId,
+              installationId,
+            }),
+          )
+        } else {
+          this.logger.error(fmtFailure('Sentry token exchange', err, { userId, installationId }))
+        }
+        return errorRedirect('token_exchange')
+      }
+
       const expiresAtIso = tokens.expires_at ?? tokens.expiresAt
       if (!expiresAtIso) {
         this.logger.error('Sentry token response missing expires_at field')
         return errorRedirect('token_exchange')
       }
 
-      // Step 4b — resolve the org slug via a plain GET on the
-      // install-details endpoint. Now that "Verify install" is
-      // unchecked in Sentry's integration settings, the install
-      // auto-completes during the OAuth code exchange and the
-      // access token's full scopes (`org:read`, `event:read`) are
-      // immediately available — so a GET with Bearer works.
-      //
-      // History — every other variant we tried, and WHY it didn't
-      // work, so the next person doesn't repeat any of them:
-      //   1. GET /sentry-app-installations/{id}/ + Bearer<user-token>
-      //      → 403 WHILE install was Pending. Install in Pending
-      //        clipped the token's permissions. Fixed by unchecking
-      //        "Verify install" in Sentry (NOT by code).
-      //   2. GET /organizations/ + Bearer<user-token>
-      //      → 403. `/organizations/` is a *user-context* listing;
-      //        an installation token has no user identity to
-      //        enumerate orgs from.
-      //   3. GET /sentry-app-installations/{id}/ + Basic<client_id:secret>
-      //      → 401. Sentry doesn't accept HTTP Basic on this
-      //        endpoint, regardless of install state.
-      //   4. PUT /sentry-app-installations/{id}/ {status:'installed'}
-      //      + Bearer<user-token>
-      //      → 401 ONCE the install is already 'installed'. The PUT
-      //        only succeeds when the install is in Pending state.
-      //        With "Verify install" off in Sentry's settings, every
-      //        install auto-completes — so this PUT is always against
-      //        an already-installed row.
-      const installRes = await fetch(
-        `${this.baseApi}/sentry-app-installations/${installationId}/`,
-        { headers: { Authorization: `Bearer ${tokens.token}` } },
-      )
-      if (!installRes.ok) {
-        const detail = await installRes.text().catch(() => '')
-        this.logger.error(
-          fmtUpstreamFailure('Sentry install lookup', installRes.status, detail, {
-            userId,
-            installationId,
-          }),
-        )
+      let installData: { organization?: { slug: string } }
+      try {
+        installData = await oauthClient.getInstallation(installationId, tokens.token)
+      } catch (err) {
+        if (err instanceof SentryOAuthHttpError) {
+          this.logger.error(
+            fmtUpstreamFailure('Sentry install lookup', err.status, err.body, {
+              userId,
+              installationId,
+            }),
+          )
+        } else {
+          this.logger.error(fmtFailure('Sentry install lookup', err, { userId, installationId }))
+        }
         return errorRedirect('account_resolve')
-      }
-      const installData = (await installRes.json()) as {
-        organization?: { slug: string }
       }
       const orgSlug = installData.organization?.slug
       if (!orgSlug) {
@@ -216,11 +174,11 @@ export class SentryOAuthService {
       }
 
       // Step 5 — persist. Same shape as `connections_calendly`.
-      const { data: conn, error: connErr } = await client
-        .from('connections')
-        .insert({ name: connectionName, type: 'sentry', user_id: userId })
-        .select()
-        .single()
+      const { data: conn, error: connErr } = await this.connectionsRepository.insert({
+        name: connectionName,
+        type: 'sentry',
+        user_id: userId,
+      })
 
       if (connErr) {
         this.logger.error(
@@ -229,7 +187,7 @@ export class SentryOAuthService {
         return errorRedirect('credentials_save')
       }
 
-      const { error: credErr } = await client.from('connections_sentry').insert({
+      const { error: credErr } = await this.sentryRepository.insert({
         connection_id: conn.id,
         access_token: encryptForUser(tokens.token, userId),
         refresh_token: encryptForUser(tokens.refreshToken, userId),
@@ -245,7 +203,7 @@ export class SentryOAuthService {
             connectionId: conn.id,
           }),
         )
-        await client.from('connections').delete().eq('id', conn.id)
+        await this.connectionsRepository.deleteById(conn.id)
         return errorRedirect('credentials_save')
       }
 
@@ -258,7 +216,7 @@ export class SentryOAuthService {
       )
       return `${this.frontendUrl}/hub/connections?sentry=connected`
     } finally {
-      await client.from('sentry_oauth_state').delete().eq('state', state)
+      await this.sentryRepository.deleteOAuthStateByState(state)
     }
   }
 
@@ -267,15 +225,7 @@ export class SentryOAuthService {
    * one is within 5 minutes of expiry. Mirrors Calendly's pattern.
    */
   async ensureFreshToken(connectionId: string): Promise<string> {
-    const client = this.supabaseService.getClient()
-
-    const { data, error } = await client
-      .from('connections_sentry')
-      .select(
-        'access_token, refresh_token, expires_at, installation_id, connections!inner(user_id)',
-      )
-      .eq('connection_id', connectionId)
-      .maybeSingle()
+    const { data, error } = await this.sentryRepository.findWithUserJoin(connectionId)
 
     if (error) {
       this.logger.error(
@@ -315,53 +265,41 @@ export class SentryOAuthService {
     this.logger.log(`Refreshing Sentry token for connection ${connectionId}`)
 
     const installationId = data.installation_id as string
-    let tokenRes: Response
+    let tokens: {
+      token: string
+      refreshToken: string
+      expires_at?: string
+      expiresAt?: string
+    }
     try {
-      tokenRes = await fetch(
-        `${this.baseApi}/sentry-app-installations/${installationId}/authorizations/`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            grant_type: 'refresh_token',
-            refresh_token: refreshToken,
-            client_id: this.clientId,
-            client_secret: this.clientSecret,
-          }),
-        },
+      tokens = await new SentryOAuthClient(this.clientId, this.clientSecret).refreshAccessToken(
+        installationId,
+        refreshToken,
       )
     } catch (err) {
+      if (err instanceof SentryOAuthHttpError) {
+        const detail = err.body
+        if (err.status >= 500) {
+          this.logger.warn(
+            `Sentry refresh upstream error (${err.status}) for ${connectionId}: ${detail.slice(0, 200)}`,
+          )
+          throw new IntegrationUpstreamException(
+            'sentry',
+            connectionId,
+            `Sentry token endpoint returned ${err.status}`,
+          )
+        }
+        this.logger.warn(
+          `Sentry refresh failed for connection ${connectionId} (${err.status}): ${detail.slice(0, 200)}`,
+        )
+        throw new IntegrationReauthRequiredException('sentry', connectionId)
+      }
       this.logger.warn(`Sentry refresh network error for ${connectionId}: ${String(err)}`)
       throw new IntegrationUpstreamException(
         'sentry',
         connectionId,
         'Could not reach Sentry token endpoint',
       )
-    }
-
-    if (!tokenRes.ok) {
-      const detail = await tokenRes.text().catch(() => '')
-      if (tokenRes.status >= 500) {
-        this.logger.warn(
-          `Sentry refresh upstream error (${tokenRes.status}) for ${connectionId}: ${detail.slice(0, 200)}`,
-        )
-        throw new IntegrationUpstreamException(
-          'sentry',
-          connectionId,
-          `Sentry token endpoint returned ${tokenRes.status}`,
-        )
-      }
-      this.logger.warn(
-        `Sentry refresh failed for connection ${connectionId} (${tokenRes.status}): ${detail.slice(0, 200)}`,
-      )
-      throw new IntegrationReauthRequiredException('sentry', connectionId)
-    }
-
-    const tokens = (await tokenRes.json()) as {
-      token: string
-      refreshToken: string
-      expires_at?: string
-      expiresAt?: string
     }
     const newExpiresAt = tokens.expires_at ?? tokens.expiresAt
     if (!newExpiresAt) {
@@ -373,38 +311,27 @@ export class SentryOAuthService {
     }
 
     // Re-encrypt — Sentry rotates the refresh token on every refresh.
-    await client
-      .from('connections_sentry')
-      .update({
-        access_token: encryptForUser(tokens.token, userId),
-        refresh_token: encryptForUser(tokens.refreshToken, userId),
-        expires_at: newExpiresAt,
-      })
-      .eq('connection_id', connectionId)
+    await this.sentryRepository.updateTokens(connectionId, {
+      access_token: encryptForUser(tokens.token, userId),
+      refresh_token: encryptForUser(tokens.refreshToken, userId),
+      expires_at: newExpiresAt,
+    })
 
     return tokens.token
   }
 
   async getOrgSlug(connectionId: string): Promise<string> {
-    const { data } = await this.supabaseService
-      .getClient()
-      .from('connections_sentry')
-      .select('org_slug')
-      .eq('connection_id', connectionId)
-      .maybeSingle()
+    const { data } = await this.sentryRepository.findOrgSlug(connectionId)
 
     if (!data) throw new NotFoundException('Sentry credentials not found')
     return data.org_slug as string
   }
 
   async verifyOwnership(connectionId: string, userId: string): Promise<void> {
-    const { data } = await this.supabaseService
-      .getClient()
-      .from('connections')
-      .select('id')
-      .eq('id', connectionId)
-      .eq('user_id', userId)
-      .maybeSingle()
+    const { data } = await this.connectionsRepository.findIdByConnectionAndUser(
+      connectionId,
+      userId,
+    )
 
     if (!data) throw new ConnectionMissingException('sentry', connectionId)
   }

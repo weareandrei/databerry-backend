@@ -1,4 +1,4 @@
-import type { SupabaseService } from '../../../supabase/supabase.service'
+import type { StripeRepository } from '../../stripe.repository'
 import {
   fetchAccountCharges,
   type ChargeRow,
@@ -6,8 +6,6 @@ import {
 
 import type { BucketGranularity } from '../../../common/types'
 export type { BucketGranularity }
-
-type Client = ReturnType<SupabaseService['getClient']>
 
 /**
  * Revenue (succeeded charges, in cents) for a Stripe account, grouped by
@@ -20,7 +18,7 @@ type Client = ReturnType<SupabaseService['getClient']>
  * Returns unix-second keys so callers can map into their bucket grid.
  */
 export async function fetchStripeRevenueByBucketFromStorage(
-  client: Client,
+  stripeRepo: StripeRepository,
   stripeAccountId: string,
   dateFrom: string,
   dateTo: string,
@@ -28,7 +26,7 @@ export async function fetchStripeRevenueByBucketFromStorage(
   productIds: string[] = [],
 ): Promise<{ bucketUnix: number; value: number }[]> {
   const rows = await fetchAccountCharges(
-    client,
+    stripeRepo,
     stripeAccountId,
     dateFrom,
     dateTo,

@@ -1,4 +1,4 @@
-import type { SupabaseService } from '../../supabase/supabase.service'
+import type { StripeRepository } from '../stripe.repository'
 import type { ResolvedLineItem } from './line-items.helper'
 import {
   computeMonthlyAmountCents,
@@ -12,29 +12,22 @@ import type {
   StripeSubscriptionRow,
 } from './types'
 
-type Client = ReturnType<SupabaseService['getClient']>
-
 /**
  * Upsert a stripe_accounts row. Does NOT touch backfill_status / last_synced_at —
  * those are managed by the backfill / reconcile services to avoid clobbering
  * their bookkeeping when this is called from the webhook fast-path.
  */
 export async function upsertAccount(
-  client: Client,
+  stripeRepo: StripeRepository,
   account: StripeAccountRow,
 ): Promise<void> {
   const displayName = account.business_profile?.name ?? null
 
-  const { error } = await client
-    .from('stripe_accounts')
-    .upsert(
-      {
-        id: account.id,
-        display_name: displayName,
-        livemode: account.livemode,
-      },
-      { onConflict: 'id', ignoreDuplicates: false },
-    )
+  const { error } = await stripeRepo.upsertAccount({
+    id: account.id,
+    display_name: displayName,
+    livemode: account.livemode,
+  })
 
   if (error) throw new Error(`stripe_accounts upsert: ${error.message}`)
 }
@@ -47,7 +40,7 @@ export async function upsertAccount(
  * on stubs).
  */
 export async function upsertCustomers(
-  client: Client,
+  stripeRepo: StripeRepository,
   stripeAccountId: string,
   customers: StripeCustomerRow[],
 ): Promise<void> {
@@ -70,9 +63,7 @@ export async function upsertCustomers(
 
   if (rows.length === 0) return
 
-  const { error } = await client
-    .from('stripe_customers')
-    .upsert(rows, { onConflict: 'id' })
+  const { error } = await stripeRepo.upsertCustomers(rows)
 
   if (error) throw new Error(`stripe_customers upsert: ${error.message}`)
 }
@@ -83,7 +74,7 @@ export async function upsertCustomers(
  * about Stripe's price expansion.
  */
 export async function upsertSubscriptions(
-  client: Client,
+  stripeRepo: StripeRepository,
   stripeAccountId: string,
   subs: StripeSubscriptionRow[],
 ): Promise<void> {
@@ -111,16 +102,14 @@ export async function upsertSubscriptions(
     }
   })
 
-  const { error } = await client
-    .from('stripe_subscriptions')
-    .upsert(rows, { onConflict: 'id' })
+  const { error } = await stripeRepo.upsertSubscriptions(rows)
 
   if (error) throw new Error(`stripe_subscriptions upsert: ${error.message}`)
 }
 
 /** Bulk upsert products for a given account. Empty array is a no-op. */
 export async function upsertProducts(
-  client: Client,
+  stripeRepo: StripeRepository,
   stripeAccountId: string,
   products: StripeProductRow[],
 ): Promise<void> {
@@ -133,39 +122,32 @@ export async function upsertProducts(
     active: p.active,
   }))
 
-  const { error } = await client
-    .from('stripe_products')
-    .upsert(rows, { onConflict: 'stripe_account_id,id' })
+  const { error } = await stripeRepo.upsertProducts(rows)
 
   if (error) throw new Error(`stripe_products upsert: ${error.message}`)
 }
 
 /** Upsert a single charge. Idempotent on `id`. */
 export async function upsertCharge(
-  client: Client,
+  stripeRepo: StripeRepository,
   stripeAccountId: string,
   charge: StripeChargeRow,
 ): Promise<void> {
-  const { error } = await client
-    .from('stripe_charges')
-    .upsert(
-      {
-        id: charge.id,
-        stripe_account_id: stripeAccountId,
-        amount: charge.amount,
-        amount_refunded: charge.amount_refunded ?? 0,
-        currency: charge.currency,
-        status: charge.status,
-        created: new Date(charge.created * 1000).toISOString(),
-        payment_intent_id: charge.payment_intent,
-        invoice_id:
-          typeof charge.invoice === 'string'
-            ? charge.invoice
-            : charge.invoice?.id ?? null,
-        customer_id: charge.customer,
-      },
-      { onConflict: 'id' },
-    )
+  const { error } = await stripeRepo.upsertCharge({
+    id: charge.id,
+    stripe_account_id: stripeAccountId,
+    amount: charge.amount,
+    amount_refunded: charge.amount_refunded ?? 0,
+    currency: charge.currency,
+    status: charge.status,
+    created: new Date(charge.created * 1000).toISOString(),
+    payment_intent_id: charge.payment_intent,
+    invoice_id:
+      typeof charge.invoice === 'string'
+        ? charge.invoice
+        : charge.invoice?.id ?? null,
+    customer_id: charge.customer,
+  })
 
   if (error) throw new Error(`stripe_charges upsert: ${error.message}`)
 }
@@ -176,17 +158,14 @@ export async function upsertCharge(
  * win — partial overlapping inserts via upsert wouldn't remove stale rows.
  */
 export async function replaceLineItems(
-  client: Client,
+  stripeRepo: StripeRepository,
   chargeId: string,
   stripeAccountId: string,
   lineItems: ResolvedLineItem[],
 ): Promise<void> {
   // Always clear existing rows first; if lineItems is empty, the charge ends
   // up with no attribution rows (= "unattributed"), which is the desired state.
-  const { error: delErr } = await client
-    .from('stripe_line_items')
-    .delete()
-    .eq('charge_id', chargeId)
+  const { error: delErr } = await stripeRepo.deleteLineItemsByChargeId(chargeId)
 
   if (delErr) throw new Error(`stripe_line_items delete: ${delErr.message}`)
 
@@ -202,9 +181,7 @@ export async function replaceLineItems(
     quantity: l.quantity,
   }))
 
-  const { error: insErr } = await client
-    .from('stripe_line_items')
-    .insert(rows)
+  const { error: insErr } = await stripeRepo.insertLineItems(rows)
 
   if (insErr) throw new Error(`stripe_line_items insert: ${insErr.message}`)
 }
@@ -226,7 +203,7 @@ export async function replaceLineItems(
  * from the data sync.
  */
 export async function setBackfillStatus(
-  client: Client,
+  stripeRepo: StripeRepository,
   stripeAccountId: string,
   status: 'pending' | 'in_progress' | 'complete' | 'error',
   errorMessage?: string,
@@ -247,10 +224,7 @@ export async function setBackfillStatus(
     update.backfill_started_at = new Date().toISOString()
   }
 
-  const { error } = await client
-    .from('stripe_accounts')
-    .update(update)
-    .eq('id', stripeAccountId)
+  const { error } = await stripeRepo.updateAccount(stripeAccountId, update)
 
   if (error) throw new Error(`stripe_accounts status update: ${error.message}`)
 }
@@ -259,13 +233,12 @@ export async function setBackfillStatus(
  * Sets `last_synced_at = NOW()` (not status — used by reconcile).
  */
 export async function bumpLastSyncedAt(
-  client: Client,
+  stripeRepo: StripeRepository,
   stripeAccountId: string,
 ): Promise<void> {
-  const { error } = await client
-    .from('stripe_accounts')
-    .update({ last_synced_at: new Date().toISOString() })
-    .eq('id', stripeAccountId)
+  const { error } = await stripeRepo.updateAccount(stripeAccountId, {
+    last_synced_at: new Date().toISOString(),
+  })
 
   if (error) throw new Error(`stripe_accounts last_synced_at: ${error.message}`)
 }

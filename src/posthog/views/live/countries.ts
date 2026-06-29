@@ -1,6 +1,6 @@
 import { Logger } from '@nestjs/common'
 import { escapeDateLiteral, tzDateBucket } from './hogql-utils'
-import type { PosthogCredentials } from '../../connection/credentials'
+import { PosthogApiClient } from '../../posthog-api.client'
 
 export interface PosthogCountryRow {
   /**
@@ -33,7 +33,7 @@ export interface PosthogCountryRow {
  * affected.
  */
 export async function fetchPosthogCountriesList(
-  ph: PosthogCredentials,
+  client: PosthogApiClient,
   dateFrom: string,
   dateTo: string,
   limit: number,
@@ -56,30 +56,23 @@ export async function fetchPosthogCountriesList(
   // definition as the chart, sources, and pages queries.
   const hogql = `SELECT properties.$geoip_country_code AS country_code, any(properties.$geoip_country_name) AS country_name, count(DISTINCT person_id) AS visitors FROM events WHERE event = '$pageview' AND properties.$geoip_country_code IS NOT NULL AND properties.$geoip_country_code != '' AND (${tzDate} BETWEEN toDate('${safeFrom}') AND toDate('${safeTo}')) GROUP BY properties.$geoip_country_code ORDER BY visitors DESC LIMIT ${safeLimit}`
 
-  const res = await fetch(`${ph.host}/api/projects/${ph.projectId}/query/`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ph.apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: { kind: 'HogQLQuery', query: hogql } }),
-  })
+  try {
+    const json = (await client.queryHogql(hogql)) as {
+      results?: [string | null, string | null, number | string][]
+    }
 
-  if (!res.ok) {
-    const body = await res.text()
-    logger.error(`PostHog countries query failed: ${body}`)
+    const rows: PosthogCountryRow[] = []
+    for (const [code, name, visitors] of json.results ?? []) {
+      if (!code) continue
+      rows.push({
+        countryCode: String(code).toUpperCase(),
+        countryName: String(name ?? ''),
+        visitors: Number(visitors) || 0,
+      })
+    }
+    return rows
+  } catch (err) {
+    logger.error(`PostHog countries query failed: ${String(err)}`)
     return []
   }
-
-  const json = (await res.json()) as {
-    results?: [string | null, string | null, number | string][]
-  }
-
-  const rows: PosthogCountryRow[] = []
-  for (const [code, name, visitors] of json.results ?? []) {
-    if (!code) continue
-    rows.push({
-      countryCode: String(code).toUpperCase(),
-      countryName: String(name ?? ''),
-      visitors: Number(visitors) || 0,
-    })
-  }
-  return rows
 }

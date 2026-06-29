@@ -1,6 +1,6 @@
 import type { Logger } from '@nestjs/common'
-import type { SupabaseService } from '../../supabase/supabase.service'
-import type { StripeGetter } from '../views/stripe-api.helpers'
+import type { StripeRepository } from '../stripe.repository'
+import type { StripeApiClient } from '../stripe-api.client'
 import { resolveChargeLineItems } from './line-items.helper'
 import {
   replaceLineItems,
@@ -17,32 +17,19 @@ import type {
   StripeSubscriptionRow,
 } from './types'
 
-type Client = ReturnType<SupabaseService['getClient']>
-
-/**
- * Fetch + upsert any customers referenced by recent charges that aren't
- * already in `stripe_customers`. The bulk `customers.list()` endpoint
- * silently omits customers attached to deleted test clocks (and likely
- * other lifecycle states), so charges can reference customer IDs that
- * the wide-sweep pass misses. Direct retrieval works regardless.
- *
- * Idempotent. No-op when every referenced customer is already in DB
- * (the typical steady-state case after the first run).
- */
 async function fillMissingCustomers(
-  client: Client,
+  dataRepo: StripeRepository,
   stripeAccountId: string,
-  get: StripeGetter,
+  client: StripeApiClient,
   ids: string[],
   logger?: Logger,
 ): Promise<number> {
   if (ids.length === 0) return 0
 
-  const { data: existing, error } = await client
-    .from('stripe_customers')
-    .select('id')
-    .eq('stripe_account_id', stripeAccountId)
-    .in('id', ids)
+  const { data: existing, error } = await dataRepo.findCustomerIdsByAccount(
+    stripeAccountId,
+    ids,
+  )
   if (error) {
     logger?.warn(
       `    ⚠ fillMissingCustomers existence check failed: ${error.message}`,
@@ -64,7 +51,7 @@ async function fillMissingCustomers(
   const fetched: StripeCustomerRow[] = []
   for (const id of missing) {
     try {
-      const c = (await get(`customers/${id}`)) as unknown as
+      const c = (await client.get(`customers/${id}`)) as unknown as
         StripeCustomerRow & { deleted?: boolean }
       // Stripe returns `{ id, deleted: true }` for tombstoned customers —
       // `upsertCustomers` already filters those by `c.deleted`, but skipping
@@ -79,7 +66,7 @@ async function fillMissingCustomers(
     }
   }
 
-  await upsertCustomers(client, stripeAccountId, fetched)
+  await upsertCustomers(dataRepo, stripeAccountId, fetched)
   return fetched.length
 }
 
@@ -111,9 +98,9 @@ async function fillMissingCustomers(
  * Returns the count of charges processed for logging.
  */
 export async function syncCharges(
-  client: Client,
+  dataRepo: StripeRepository,
   stripeAccountId: string,
-  get: StripeGetter,
+  client: StripeApiClient,
   createdGte: number,
   createdLt: number,
   logger?: Logger,
@@ -138,18 +125,18 @@ export async function syncCharges(
     }
     if (startingAfter) params['starting_after'] = startingAfter
 
-    const page = (await get('charges', params)) as unknown as StripeListPage<StripeChargeRow>
+    const page = (await client.get('charges', params)) as unknown as StripeListPage<StripeChargeRow>
     const charges = page.data ?? []
 
     for (const charge of charges) {
       // Persist charge row first (FK target for line items).
-      await upsertCharge(client, stripeAccountId, charge)
+      await upsertCharge(dataRepo, stripeAccountId, charge)
       if (charge.customer) referencedCustomerIds.add(charge.customer)
 
       // Only succeeded charges contribute to revenue tiles, but we still
       // resolve line items for refunded charges (so future refund support
       // has the attribution it needs).
-      const lineItems = await resolveChargeLineItems(get, charge, logger)
+      const lineItems = await resolveChargeLineItems(client, charge, logger)
 
       // Critical defence against "reconcile silently wipes everything".
       // `replaceLineItems` is DELETE-then-INSERT; if the resolver came up
@@ -170,7 +157,7 @@ export async function syncCharges(
       // genuine-empty case.
       if (lineItems.length > 0) {
         try {
-          await replaceLineItems(client, charge.id, stripeAccountId, lineItems)
+          await replaceLineItems(dataRepo, charge.id, stripeAccountId, lineItems)
           logger?.log(
             `    replaceLineItems  charge=${charge.id}  inserted=${lineItems.length}`,
           )
@@ -201,9 +188,9 @@ export async function syncCharges(
   // state case). The cost is bounded: 1 existence check + N retrieves
   // where N == count of newly-referenced customers in this sync window.
   await fillMissingCustomers(
-    client,
+    dataRepo,
     stripeAccountId,
-    get,
+    client,
     Array.from(referencedCustomerIds),
     logger,
   )
@@ -223,9 +210,9 @@ export async function syncCharges(
  * silently broke that case.
  */
 export async function syncProducts(
-  client: Client,
+  dataRepo: StripeRepository,
   stripeAccountId: string,
-  get: StripeGetter,
+  client: StripeApiClient,
   logger?: Logger,
 ): Promise<number> {
   let processed = 0
@@ -238,7 +225,7 @@ export async function syncProducts(
     const params: Record<string, string> = { limit: '100' }
     if (startingAfter) params['starting_after'] = startingAfter
 
-    const page = (await get('products', params)) as unknown as StripeListPage<StripeProductRow>
+    const page = (await client.get('products', params)) as unknown as StripeListPage<StripeProductRow>
     const products = page.data ?? []
 
     logger?.log(
@@ -246,7 +233,7 @@ export async function syncProducts(
     )
 
     if (products.length > 0) {
-      await upsertProducts(client, stripeAccountId, products)
+      await upsertProducts(dataRepo, stripeAccountId, products)
       processed += products.length
     }
 
@@ -276,9 +263,9 @@ export async function syncProducts(
  * underlying customer was removed. The persist layer drops those rows.
  */
 export async function syncCustomers(
-  client: Client,
+  dataRepo: StripeRepository,
   stripeAccountId: string,
-  get: StripeGetter,
+  client: StripeApiClient,
   logger?: Logger,
 ): Promise<number> {
   let processed = 0
@@ -291,7 +278,7 @@ export async function syncCustomers(
     const params: Record<string, string> = { limit: '100' }
     if (startingAfter) params['starting_after'] = startingAfter
 
-    const page = (await get('customers', params)) as unknown as StripeListPage<StripeCustomerRow>
+    const page = (await client.get('customers', params)) as unknown as StripeListPage<StripeCustomerRow>
     const customers = page.data ?? []
 
     logger?.log(
@@ -299,7 +286,7 @@ export async function syncCustomers(
     )
 
     if (customers.length > 0) {
-      await upsertCustomers(client, stripeAccountId, customers)
+      await upsertCustomers(dataRepo, stripeAccountId, customers)
       processed += customers.length
     }
 
@@ -325,9 +312,9 @@ export async function syncCustomers(
  * per-item round-trip to /v1/prices, multiplying the page cost by N.
  */
 export async function syncSubscriptions(
-  client: Client,
+  dataRepo: StripeRepository,
   stripeAccountId: string,
-  get: StripeGetter,
+  client: StripeApiClient,
   logger?: Logger,
 ): Promise<number> {
   let processed = 0
@@ -344,7 +331,7 @@ export async function syncSubscriptions(
     }
     if (startingAfter) params['starting_after'] = startingAfter
 
-    const page = (await get('subscriptions', params)) as unknown as StripeListPage<StripeSubscriptionRow>
+    const page = (await client.get('subscriptions', params)) as unknown as StripeListPage<StripeSubscriptionRow>
     const subs = page.data ?? []
 
     logger?.log(
@@ -352,7 +339,7 @@ export async function syncSubscriptions(
     )
 
     if (subs.length > 0) {
-      await upsertSubscriptions(client, stripeAccountId, subs)
+      await upsertSubscriptions(dataRepo, stripeAccountId, subs)
       processed += subs.length
     }
 
