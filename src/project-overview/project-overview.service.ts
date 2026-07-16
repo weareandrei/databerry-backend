@@ -79,6 +79,16 @@ export interface OverviewChartResponse {
 
 export interface OverviewSourcesResponse {
   sources: { source: string; label: string; color: string; visitors: number; share: number }[]
+  /**
+   * `null` when no traffic provider is connected for this project,
+   * otherwise the connected provider. Lets the frontend tell "connect
+   * an analytics tool" apart from "connected, but no traffic in this
+   * range" — mirrors the `provider` field the countries / pages / users
+   * responses already return. Without it the sources panel showed
+   * "No analytics tool connected yet." on any empty result, including
+   * a live connection with zero traffic for the day.
+   */
+  provider: 'google_analytics' | 'posthog' | null
 }
 
 export interface OverviewUser {
@@ -767,7 +777,7 @@ export class ProjectOverviewService {
     )
 
     const provider = await this.pickTrafficProvider(userId, projectId)
-    if (!provider) return { sources: [] }
+    if (!provider) return { sources: [], provider: null }
 
     // Reuse the per-bucket fetchers; aggregate across buckets to a single source list.
     const gran: BucketGranularity = 'daily'
@@ -806,7 +816,7 @@ export class ProjectOverviewService {
       }
     } catch (err) {
       this.logger.warn(`fetchSources provider error: ${String(err)}`)
-      return { sources: [] }
+      return { sources: [], provider: provider.type }
     }
 
     // Group + normalise.
@@ -847,7 +857,7 @@ export class ProjectOverviewService {
       .sort((a, b) => b.visitors - a.visitors)
       .slice(0, limit)
 
-    return { sources: sorted }
+    return { sources: sorted, provider: provider.type }
   }
 
   /**

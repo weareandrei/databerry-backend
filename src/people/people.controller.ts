@@ -82,7 +82,12 @@ export class PeopleController {
       ? await this.peopleSyncService.startResyncIfStale(req.authUser.id, projectId)
       : this.peopleSyncService.isResyncing(req.authUser.id, projectId)
 
-    return { people, isResyncing }
+    const lastSyncedAt = await this.peopleSyncService.getLastSyncedAtForProject(
+      req.authUser.id,
+      projectId,
+    )
+
+    return { people, isResyncing, lastSyncedAt }
   }
 
   @Get(':id')

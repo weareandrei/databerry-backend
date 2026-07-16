@@ -46,6 +46,30 @@ export class PeopleSyncService {
     private readonly posthogSync: PosthogSync,
   ) {}
 
+  /**
+   * Latest `connection_sync_state.last_synced_at` across the project's
+   * people-source connections. Used by the sidebar project selector's
+   * "Last synced … ago" line — null when nothing has synced yet.
+   */
+  async getLastSyncedAtForProject(
+    userId: string,
+    projectId: string,
+  ): Promise<string | null> {
+    const { data: stateRows, error } =
+      await this.peopleRepository.findSyncStateByProject(userId, projectId)
+    if (error) throw new Error(error.message)
+
+    let latest: string | null = null
+    for (const row of (stateRows ?? []) as { last_synced_at: string | null }[]) {
+      const syncedAt = row.last_synced_at
+      if (!syncedAt) continue
+      if (!latest || Date.parse(syncedAt) > Date.parse(latest)) {
+        latest = syncedAt
+      }
+    }
+    return latest
+  }
+
   /** True when a background resync is currently running for this project. */
   isResyncing(userId: string, projectId: string): boolean {
     return this.inFlightResyncs.has(this.resyncKey(userId, projectId))

@@ -27,6 +27,10 @@ import { PosthogApiClient } from '../../posthog/posthog-api.client'
  * bounded history, every run after only the delta, and a failure leaves
  * identity synced and retries the same window next time.
  *
+ * Ingest policy: PostHog `$…` system/autocapture events are dropped
+ * except `$pageview` and `$pageleave` (paired in the UI as dwell bars).
+ * Custom events (no `$` prefix) are always kept.
+ *
  * Re-runnable + idempotent, same as the Stripe sync.
  */
 @Injectable()
@@ -215,6 +219,7 @@ export class PosthogSync {
     const batch: (ObservedEvent & { personId: string })[] = []
     let maxIso = watermark
     for (const e of rawEvents) {
+      if (!shouldIngestPosthogEvent(e.eventKey)) continue
       const personId = personByDid.get(e.distinctId)
       if (!personId) continue // event for a distinct_id we haven't bridged → skip
       batch.push({
@@ -321,6 +326,7 @@ export class PosthogSync {
       'properties.$pathname, properties.$current_url, properties.$el_text, ' +
       'coalesce(properties.provider, properties.login_method, properties.method) ' +
       `FROM events WHERE ${since} ` +
+      "AND (event = '$pageview' OR event = '$pageleave' OR NOT startsWith(event, '$')) " +
       'ORDER BY timestamp ASC LIMIT 25000'
 
     let json: { results?: unknown[][] }
@@ -337,6 +343,7 @@ export class PosthogSync {
       const event = asString(row?.[2])
       const occurredAt = toIsoUtc(asString(row?.[3]))
       if (!distinctId || !id || !event || !occurredAt) continue
+      if (!shouldIngestPosthogEvent(event)) continue
       out.push({
         distinctId,
         eventKey: event,
@@ -405,6 +412,19 @@ export class PosthogSync {
       this.logger.warn(`Could not record sync state for ${connectionId}: ${error.message}`)
     }
   }
+}
+
+/**
+ * Person-timeline ingest policy for PostHog events.
+ *   - Custom events (no `$` prefix) → always keep.
+ *   - `$pageview` / `$pageleave` → keep (paired as dwell sessions in UI).
+ *   - All other `$…` system noise → drop.
+ */
+const POSTHOG_ALLOWED_SYSTEM_EVENTS = new Set(['$pageview', '$pageleave'])
+
+function shouldIngestPosthogEvent(eventKey: string): boolean {
+  if (!eventKey.startsWith('$')) return true
+  return POSTHOG_ALLOWED_SYSTEM_EVENTS.has(eventKey)
 }
 
 /**

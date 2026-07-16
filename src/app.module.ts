@@ -22,6 +22,7 @@ import { FeedbackModule } from './feedback/feedback.module'
 import { SuggestionsModule } from './suggestions/suggestions.module'
 import { PeopleModule } from './people/people.module'
 import { BillingModule } from './billing/billing.module'
+import { FoundersJoinedModule } from './founders-joined/founders-joined.module'
 
 @Module({
   imports: [
@@ -48,6 +49,7 @@ import { BillingModule } from './billing/billing.module'
     SuggestionsModule,
     PeopleModule,
     BillingModule,
+    FoundersJoinedModule,
   ],
 })
 export class AppModule {}
