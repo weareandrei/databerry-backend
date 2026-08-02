@@ -76,6 +76,25 @@ export class PeopleRepository {
       .in('id', personIds)
   }
 
+  /** Drop every person in a project (identifiers/events cascade). */
+  deleteByProject(userId: string, projectId: string) {
+    return this.supabaseService
+      .getClient()
+      .from('people')
+      .delete()
+      .eq('user_id', userId)
+      .eq('project_id', projectId)
+  }
+
+  countByProject(userId: string, projectId: string) {
+    return this.supabaseService
+      .getClient()
+      .from('people')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .eq('project_id', projectId)
+  }
+
   findEnrichmentFields(userId: string, personId: string) {
     return this.supabaseService
       .getClient()

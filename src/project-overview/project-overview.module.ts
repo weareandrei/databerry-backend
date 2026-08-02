@@ -7,6 +7,7 @@ import { GoogleAnalyticsModule } from '../google-analytics/google-analytics.modu
 import { GoogleAnalyticsConnectionModule } from '../google-analytics/connection/connection.module'
 import { PosthogModule } from '../posthog/posthog.module'
 import { StripeModule } from '../stripe/stripe.module'
+import { ProjectsModule } from '../projects/projects.module'
 import { ProjectOverviewController } from './project-overview.controller'
 import { ProjectOverviewService } from './project-overview.service'
 
@@ -20,6 +21,7 @@ import { ProjectOverviewService } from './project-overview.service'
     GoogleAnalyticsConnectionModule,
     PosthogModule,
     StripeModule,
+    ProjectsModule,
   ],
   controllers: [ProjectOverviewController],
   providers: [ProjectOverviewService],

@@ -133,10 +133,13 @@ export class PeopleSyncService {
    *     the connector wants poked again to continue, OR
    *   - is stale (`last_synced_at` older than the freshness window).
    *
+   * It also returns true when there are NO syncable (project-scoped)
+   * connections but orphan people rows still exist — so the sync pass
+   * can clear them.
+   *
    * It reads only the GENERIC sync-state columns (`last_synced_at`,
    * `last_status`) — never a connector's private `cursor` — so it stays
-   * decoupled from how each platform tracks resume position. Returns false
-   * when the project has no syncable connections (nothing to do).
+   * decoupled from how each platform tracks resume position.
    */
   private async projectNeedsResync(userId: string, projectId: string): Promise<boolean> {
     const { data: connections, error } = await this.connectionsRepository.findConnections({
@@ -147,7 +150,17 @@ export class PeopleSyncService {
     if (error) throw new Error(error.message)
 
     const syncableConnections = (connections ?? []) as unknown as UserConnection[]
-    if (syncableConnections.length === 0) return false
+    if (syncableConnections.length === 0) {
+      // No project-scoped people source — still run a pass when orphan
+      // people rows remain (e.g. from the old Common-connection leak, or
+      // after the last scoped connection was reassigned away).
+      const { count, error: countError } = await this.peopleRepository.countByProject(
+        userId,
+        projectId,
+      )
+      if (countError) throw new Error(countError.message)
+      return (count ?? 0) > 0
+    }
 
     const { data: stateRows, error: stateError } =
       await this.peopleRepository.findSyncStateByProject(userId, projectId)
@@ -183,7 +196,13 @@ export class PeopleSyncService {
 
   /**
    * Sync people for a WHOLE project — loads the user's connections
-   * (filtered by syncable types + project), then syncs each in parallel.
+   * scoped to THIS project (filtered by syncable types), then syncs
+   * each in parallel.
+   *
+   * Common (`project_id IS NULL`) connections are NOT auto-included:
+   * a shared PostHog/Stripe would otherwise dump the same people into
+   * every new project on first People-page load. Assign the connection
+   * to the project (or create one scoped to it) before people will sync.
    *
    * Connection types that don't provide people data (webhook,
    * sentry, vercel, calendly-not-yet, mcp, …) are skipped — only the
@@ -205,8 +224,23 @@ export class PeopleSyncService {
       })
     if (error) throw new Error(error.message)
 
+    const syncable = (connections ?? []) as unknown as UserConnection[]
+    if (syncable.length === 0) {
+      // Nothing to pull — clear any orphan people left behind by a
+      // prior Common-connection sync or a reassigned connection.
+      const { error: deleteError } = await this.peopleRepository.deleteByProject(
+        userId,
+        projectId,
+      )
+      if (deleteError) throw new Error(deleteError.message)
+      this.logger.log(
+        `syncProject done  project=${projectId} connections=0 people=0 (cleared orphans)`,
+      )
+      return { processed: 0, connections: [] }
+    }
+
     const syncResult = await this.syncPeopleFromConnections(
-      (connections ?? []) as unknown as UserConnection[],
+      syncable,
       userId,
       projectId,
     )

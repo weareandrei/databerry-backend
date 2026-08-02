@@ -13,6 +13,23 @@ import type { AuthenticatedRequest } from '../common/types'
 export class ProjectOverviewController {
   constructor(private readonly service: ProjectOverviewService) {}
 
+  @Get('workspace-totals')
+  async workspaceTotals(
+    @Query('dateFrom') dateFrom: string,
+    @Query('dateTo') dateTo: string,
+    @Query('tz') tz: string | undefined,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    const safeTz =
+      typeof tz === 'string' && /^[A-Za-z0-9_/+-]+$/.test(tz) ? tz : 'UTC'
+    return this.service.fetchWorkspaceTotals(
+      req.authUser.id,
+      dateFrom,
+      dateTo,
+      safeTz,
+    )
+  }
+
   @Get('chart')
   async chart(
     @Query('projectId') projectId: string,

@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common'
 import { SupabaseService } from '../supabase/supabase.service'
 import { ConnectionsRepository } from '../connections/connections.repository'
 import { StripeRepository } from '../stripe/stripe.repository'
+import { ProjectsRepository } from '../projects/projects.repository'
 import { UserSettingsService } from '../user-settings/user-settings.service'
 import {
   ProjectSettingsService,
@@ -282,6 +283,7 @@ export class ProjectOverviewService {
     private readonly supabaseService: SupabaseService,
     private readonly connectionsRepository: ConnectionsRepository,
     private readonly stripeRepository: StripeRepository,
+    private readonly projectsRepository: ProjectsRepository,
     private readonly posthogCredentialsService: PosthogCredentialsService,
     private readonly userSettingsService: UserSettingsService,
     private readonly projectSettingsService: ProjectSettingsService,
@@ -432,7 +434,7 @@ export class ProjectOverviewService {
     // `visitors`; pageviews/conversions/revenue sum correctly.
     const totalPrimaryOverride =
       primaryMetric === 'visitors' && !primaryUnavailable
-        ? await this.fetchVisitorsTotal(ctx)
+        ? await this.fetchVisitorsTotal(ctx.provider, dateFrom, dateTo, tz)
         : undefined
 
     return this.buildChartResponse({
@@ -446,6 +448,56 @@ export class ProjectOverviewService {
       secondaryUnavailable,
       provider,
     })
+  }
+
+  /**
+   * Workspace-level greeting totals for the hub home page: unique
+   * visitors + Stripe revenue across ALL of the user's projects for
+   * the selected date range.
+   *
+   * Dedup rules (so Common / preferred connections don't inflate the
+   * headline when the same connection powers multiple projects):
+   *   - Traffic: one visitors fetch per distinct traffic connection.
+   *   - Revenue: same Stripe-account / product-filter dedup as the
+   *     per-project chart, applied once across every Stripe connection
+   *     the user owns.
+   */
+  async fetchWorkspaceTotals(
+    userId: string,
+    dateFrom: string,
+    dateTo: string,
+    tz: string = 'UTC',
+  ): Promise<{ totalVisitors: number; totalRevenue: number }> {
+    this.logger.log(
+      `fetchWorkspaceTotals  ${dateFrom}→${dateTo} tz=${tz}`,
+    )
+
+    const { data: projects, error } = await this.projectsRepository.findByUserId(userId)
+    if (error) {
+      this.logger.warn(`workspace totals projects list failed: ${error.message}`)
+      return { totalVisitors: 0, totalRevenue: 0 }
+    }
+
+    const seenTrafficConnections = new Set<string>()
+    let totalVisitors = 0
+
+    for (const project of projects ?? []) {
+      const projectId = project.id as string
+      const provider = await this.pickTrafficProvider(userId, projectId)
+      if (!provider || seenTrafficConnections.has(provider.connectionId)) continue
+      seenTrafficConnections.add(provider.connectionId)
+
+      const n = await this.fetchVisitorsTotal(provider, dateFrom, dateTo, tz)
+      if (n != null) totalVisitors += n
+    }
+
+    const totalRevenue = await this.fetchStripeRevenueForWorkspace(
+      userId,
+      dateFrom,
+      dateTo,
+    )
+
+    return { totalVisitors, totalRevenue }
   }
 
   /**
@@ -706,8 +758,12 @@ export class ProjectOverviewService {
    * any upstream error so the caller falls back to the per-bucket sum
    * rather than wrongly showing "Total: 0" under populated bars.
    */
-  private async fetchVisitorsTotal(ctx: ChartFetchContext): Promise<number | null> {
-    const { provider, dateFrom, dateTo, tz } = ctx
+  private async fetchVisitorsTotal(
+    provider: TrafficProvider | null,
+    dateFrom: string,
+    dateTo: string,
+    tz: string,
+  ): Promise<number | null> {
     if (!provider) return null
     try {
       if (provider.type === 'google_analytics') {
@@ -1129,6 +1185,61 @@ export class ProjectOverviewService {
     return Array.from(merged.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([bucketUnix, value]) => ({ bucketUnix, value }))
+  }
+
+  /**
+   * Workspace-wide Stripe revenue in dollars for the date range.
+   * Same account / product-filter dedup as `fetchStripeRevenueForProject`,
+   * but across every Stripe connection the user owns (so Common accounts
+   * aren't counted once per project).
+   */
+  private async fetchStripeRevenueForWorkspace(
+    userId: string,
+    dateFrom: string,
+    dateTo: string,
+  ): Promise<number> {
+    const { data: conns } = await this.connectionsRepository.findStripeConnectionsForUser(userId)
+    if (!conns || conns.length === 0) return 0
+
+    // Daily buckets are enough — we only need the period sum, not the
+    // chart series. Using 'daily' keeps the storage query cheap.
+    const gran: BucketGranularity = 'daily'
+    let sumCents = 0
+    const accountsCoveredUnfiltered = new Set<string>()
+
+    for (const c of conns) {
+      try {
+        const accountId = await getStripeAccountIdForConnection(
+          this.connectionsRepository,
+          c.id as string,
+        )
+        if (!accountId) continue
+
+        const productFilter = await getConnectionProductFilter(
+          this.connectionsRepository,
+          c.id as string,
+        )
+
+        if (productFilter.length === 0) {
+          if (accountsCoveredUnfiltered.has(accountId)) continue
+          accountsCoveredUnfiltered.add(accountId)
+        }
+
+        const rows = await fetchStripeRevenueByBucketFromStorage(
+          this.stripeRepository,
+          accountId,
+          dateFrom,
+          dateTo,
+          gran,
+          productFilter,
+        )
+        for (const r of rows) sumCents += r.value
+      } catch (err) {
+        this.logger.warn(`Stripe connection ${c.id} failed (workspace): ${String(err)}`)
+      }
+    }
+
+    return sumCents / 100
   }
 
   /**

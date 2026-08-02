@@ -106,6 +106,15 @@ export class ConnectionsRepository {
       .in('type', types)
   }
 
+  /**
+   * List connections for a user, optionally filtered by type and/or
+   * project. When `projectId` is set the match is STRICT — only
+   * connections scoped to that project. Common (`project_id IS NULL`)
+   * is intentionally excluded: auto-including it silently leaked the
+   * same PostHog/Stripe people into every new project (mirrors the
+   * overview traffic fix in `pickTrafficProvider`). Assign a
+   * connection to the project explicitly if it should sync there.
+   */
   findConnections(
     opts: { userId?: string; types?: string[]; projectId?: string; select?: string } = {},
   ) {
@@ -123,7 +132,7 @@ export class ConnectionsRepository {
     }
 
     if (opts.projectId) {
-      query = query.or(`project_id.eq.${opts.projectId},project_id.is.null`)
+      query = query.eq('project_id', opts.projectId)
     }
 
     return query
@@ -242,6 +251,16 @@ export class ConnectionsRepository {
       .eq('user_id', userId)
       .in('type', ['stripe_manual', 'stripe'])
       .or(`project_id.eq.${projectId},project_id.is.null`)
+  }
+
+  /** Every Stripe connection for the user (project-scoped + Common). */
+  findStripeConnectionsForUser(userId: string) {
+    return this.supabaseService
+      .getClient()
+      .from('connections')
+      .select('id, type, project_id')
+      .eq('user_id', userId)
+      .in('type', ['stripe_manual', 'stripe'])
   }
 
   insertPosthog(row: {
