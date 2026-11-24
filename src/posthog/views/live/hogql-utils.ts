@@ -93,6 +93,13 @@ export function tzDateBucket(tz: string, column: string = 'timestamp'): string {
  *   3. `$initial_referring_domain` — first-touch HTTP referrer; the
  *      previous sole signal, still the fallback for untagged referrals.
  *
+ * Property path: `$initial_*` are PERSON properties. HogQL exposes them
+ * as `person.properties.$initial_*` (persons-on-events). We still
+ * coalesce the legacy `properties.$initial_*` path — some PostHog
+ * projects / query modes surface them there, and keeping both means
+ * PH `ref=` recovery works without breaking projects that already
+ * attributed google/reddit via the event-properties path.
+ *
  * `nullIf(x, '')` turns empties into NULL so `coalesce` skips them — an
  * untagged visit falls straight through to the referrer and behaves
  * exactly as before (no regression for existing sources).
@@ -102,6 +109,9 @@ export function tzDateBucket(tz: string, column: string = 'timestamp'): string {
  */
 export const POSTHOG_SOURCE_EXPR =
   `coalesce(` +
+  `nullIf(extractURLParameter(person.properties.$initial_current_url, 'ref'), ''), ` +
   `nullIf(extractURLParameter(properties.$initial_current_url, 'ref'), ''), ` +
+  `nullIf(person.properties.$initial_utm_source, ''), ` +
   `nullIf(properties.$initial_utm_source, ''), ` +
+  `nullIf(person.properties.$initial_referring_domain, ''), ` +
   `properties.$initial_referring_domain)`
