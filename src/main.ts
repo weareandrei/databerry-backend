@@ -1,19 +1,14 @@
 import 'dotenv/config'
-// Sentry / Better Stack Errors — must load before Nest bootstraps anything else.
-import './instrument'
 import { NestFactory } from '@nestjs/core'
 import { AppModule } from './app.module'
-import { BetterStackLogger } from './common/better-stack.logger'
+import { Logger } from '@nestjs/common'
 
 async function bootstrap() {
-  const logger = new BetterStackLogger()
+  const logger = new Logger('Bootstrap')
 
   const app = await NestFactory.create(AppModule, {
     rawBody: true,
-    bufferLogs: true,
-    logger,
   })
-  app.useLogger(logger)
   app.enableShutdownHooks()
 
   // FRONTEND_URL may be a single URL or a comma-separated list — lets us
@@ -36,29 +31,7 @@ async function bootstrap() {
   const port = process.env.PORT ?? 3001
   await app.listen(port)
 
-  logger.log(
-    `Backend running on port ${port}` +
-      (logger.enabled ? ' (Better Stack logs on)' : ' (Better Stack logs off)') +
-      (process.env.BETTER_STACK_ERRORS_DSN?.trim()
-        ? ' (Better Stack errors on)'
-        : ' (Better Stack errors off)'),
-    'Bootstrap',
-  )
-
-  // Drain the Better Stack batch on process exit so the last few lines
-  // aren't dropped when Railway / local Ctrl-C kills the process.
-  const flush = async () => {
-    await logger.flush()
-  }
-  process.once('beforeExit', () => {
-    void flush()
-  })
-  process.once('SIGTERM', () => {
-    void flush()
-  })
-  process.once('SIGINT', () => {
-    void flush()
-  })
+  logger.log(`Backend running on port ${port}`)
 }
 
 bootstrap()

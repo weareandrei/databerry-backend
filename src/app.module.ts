@@ -1,10 +1,5 @@
 import { Module } from '@nestjs/common'
-import { APP_FILTER } from '@nestjs/core'
 import { ScheduleModule } from '@nestjs/schedule'
-import {
-  SentryGlobalFilter,
-  SentryModule as SentryErrorsModule,
-} from '@sentry/nestjs/setup'
 import { SupabaseModule } from './supabase/supabase.module'
 import { ProjectsModule } from './projects/projects.module'
 import { FoldersModule } from './folders/folders.module'
@@ -15,7 +10,7 @@ import { WebhooksModule } from './webhooks/webhooks.module'
 import { StripeModule } from './stripe/stripe.module'
 import { CalendlyModule } from './calendly/calendly.module'
 import { GoogleAnalyticsModule } from './google-analytics/google-analytics.module'
-// Databerry's Sentry *integration* (OAuth + views) — not the error SDK.
+// Databerry's Sentry *integration* (OAuth + views).
 import { SentryModule } from './sentry/sentry.module'
 import { VercelModule } from './vercel/vercel.module'
 import { SchedulerModule } from './scheduler/scheduler.module'
@@ -32,7 +27,6 @@ import { FoundersJoinedModule } from './founders-joined/founders-joined.module'
 
 @Module({
   imports: [
-    SentryErrorsModule.forRoot(),
     ScheduleModule.forRoot(),
     SupabaseModule,
     ProjectsModule,
@@ -57,12 +51,6 @@ import { FoundersJoinedModule } from './founders-joined/founders-joined.module'
     PeopleModule,
     BillingModule,
     FoundersJoinedModule,
-  ],
-  providers: [
-    {
-      provide: APP_FILTER,
-      useClass: SentryGlobalFilter,
-    },
   ],
 })
 export class AppModule {}
