@@ -147,14 +147,20 @@ export class PosthogSync {
 
     // Display attributes for the Overview "People" table. PostHog sets
     // `$geoip_*` (when geoip is enabled) and `$initial_*` person
-    // properties.
+    // properties. Precedence MUST match `POSTHOG_SOURCE_EXPR` in
+    // hogql-utils.ts (ref → utm_source → referring_domain) — otherwise
+    // Product Hunt `?ref=producthunt` traffic (often no HTTP referrer)
+    // lands as "direct" here while the Sources panel shows ProductHunt.
     const country =
       typeof props.$geoip_country_code === 'string' ? props.$geoip_country_code : null
+    const initialUrl =
+      typeof props.$initial_current_url === 'string' ? props.$initial_current_url : null
     const initialSource = normalizeReferrer(
-      (typeof props.$initial_referring_domain === 'string'
-        ? props.$initial_referring_domain
-        : null) ??
-        (typeof props.$initial_utm_source === 'string' ? props.$initial_utm_source : null),
+      extractUrlParam(initialUrl, 'ref') ??
+        (typeof props.$initial_utm_source === 'string' ? props.$initial_utm_source : null) ??
+        (typeof props.$initial_referring_domain === 'string'
+          ? props.$initial_referring_domain
+          : null),
     )
 
     // LAST SEEN = the person's most recent event across any of their
@@ -428,7 +434,34 @@ function shouldIngestPosthogEvent(eventKey: string): boolean {
 }
 
 /**
- * Normalise a PostHog referrer/utm value into a clean source label:
+ * Pull a named query param from a URL string. Used to recover launch-
+ * platform tags (`?ref=producthunt`) that PostHog does not promote into
+ * `$initial_utm_source`. Returns null when the URL is missing/malformed
+ * or the param is absent/empty.
+ */
+function extractUrlParam(url: string | null, name: string): string | null {
+  if (!url) return null
+  try {
+    const value = new URL(url).searchParams.get(name)
+    const trimmed = value?.trim()
+    return trimmed ? trimmed : null
+  } catch {
+    // Relative / non-URL strings — fall back to a query-string scan so
+    // we still recover `ref` from values like `/pricing?ref=producthunt`.
+    const re = new RegExp(`[?&]${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=([^&#]*)`, 'i')
+    const m = url.match(re)
+    if (!m?.[1]) return null
+    try {
+      const decoded = decodeURIComponent(m[1].replace(/\+/g, ' ')).trim()
+      return decoded || null
+    } catch {
+      return m[1].trim() || null
+    }
+  }
+}
+
+/**
+ * Normalise a PostHog referrer/utm/ref value into a clean source label:
  * `$direct` / empty → `direct`; otherwise strip a `www.` prefix and
  * lower-case (so `www.Google.com` → `google.com`). NULL passes through.
  */

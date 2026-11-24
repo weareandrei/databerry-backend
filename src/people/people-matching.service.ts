@@ -288,8 +288,12 @@ export class PeopleMatchingService {
 
   /**
    * Backfill the person's display fields from this observation:
-   *   - name / email / country / initial_source → FILL nulls only
-   *     (first non-null wins; later pulls never clobber).
+   *   - name / email / country → FILL nulls only (first non-null wins;
+   *     later pulls never clobber).
+   *   - initial_source → fill nulls, AND upgrade a prior `"direct"`
+   *     placeholder when a later sync recovers a real source (e.g.
+   *     Product Hunt `?ref=producthunt` after we started reading
+   *     `$initial_current_url`). Never clobber a non-direct source.
    *   - last_seen_at → keep the LATEST (so re-syncs and multiple
    *     platforms advance it, never rewind it).
    * No-op when the observation adds nothing.
@@ -324,7 +328,16 @@ export class PeopleMatchingService {
     if (email && !cur.primary_email) patch.primary_email = email
     if (name && !cur.display_name) patch.display_name = name
     if (country && !cur.country) patch.country = country
-    if (initialSource && !cur.initial_source) patch.initial_source = initialSource
+    // Fill null, or upgrade a `"direct"` placeholder when a later sync
+    // recovers a real source (PH `?ref=` etc.). Never clobber a known
+    // non-direct source, and never write `"direct"` over an existing value.
+    if (
+      initialSource &&
+      (!cur.initial_source ||
+        (cur.initial_source === 'direct' && initialSource !== 'direct'))
+    ) {
+      patch.initial_source = initialSource
+    }
     // Advance last_seen_at to the most recent observed timestamp.
     // Compare by parsed epoch, NOT string: the observed value is
     // normalised ISO ("…Z") while the stored timestamptz comes back
